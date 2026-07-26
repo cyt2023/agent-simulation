@@ -170,7 +170,10 @@ onUnmounted(() => {
           @submit="submit('delegation_expectation', $event)"
         />
         <WaitingRoom v-else-if="phase === 'DELEGATION_EXPECTATION'" />
-        <ReviewPhase v-else-if="phase === 'REVIEW' && role === 'principal'" />
+        <ReviewPhase
+          v-else-if="phase === 'REVIEW' && role === 'principal'"
+          :session-id="identity.session_id"
+        />
         <WaitingRoom v-else-if="phase === 'REVIEW'" />
         <SurveyPhase
           v-else-if="phase === 'COMPREHENSION_MEASUREMENT' && role === 'principal'"

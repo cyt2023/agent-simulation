@@ -62,6 +62,7 @@ def create_study1_session():
             str(data.get("session_name") or ""),
             int(data.get("invite_ttl_seconds") or 86400),
             data.get("materials_by_role") or {},
+            int(data.get("minimum_review_seconds") or 0),
         )
         return jsonify(result), 201
     except Study1ServiceError as error:
@@ -199,3 +200,31 @@ def _json_submission(value):
             else None
         ),
     }
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/review")
+@require_study1_auth([Study1Role.PRINCIPAL])
+def get_study1_review(session_id: str):
+    try:
+        result = get_service().get_review(
+            session_id, g.study1_identity.as_actor()
+        )
+        return jsonify(result), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/ui-events")
+@require_study1_auth([Study1Role.PRINCIPAL])
+def create_study1_ui_event(session_id: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        event = get_service().log_review_ui_event(
+            session_id,
+            g.study1_identity.as_actor(),
+            str(data.get("event_type") or ""),
+            data.get("payload") or {},
+        )
+        return jsonify({"event_id": event["event_id"]}), 201
+    except Study1ServiceError as error:
+        return _service_error(error)

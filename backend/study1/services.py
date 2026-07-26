@@ -20,6 +20,7 @@ from services.db import ResearchSessionRow, get_session_factory, is_db_configure
 from .models import (
     HUMAN_ROLES,
     Study1EventRow,
+    Study1ArtifactRow,
     Study1InviteRow,
     Study1MaterialRow,
     Study1Phase,
@@ -91,6 +92,17 @@ SUBMISSION_RULES: dict[str, tuple[Study1Phase, tuple[Study1Role, ...]]] = {
     "post_survey": (Study1Phase.POST_SURVEY, HUMAN_ROLES),
 }
 
+REVIEW_UI_EVENTS = {
+    "review_page_enter",
+    "review_page_leave",
+    "summary_visible",
+    "transcript_expand",
+    "transcript_collapse",
+    "transcript_segment_view",
+    "scroll_depth",
+    "active_reading_time",
+}
+
 
 @dataclass
 class CreatedInvite:
@@ -122,6 +134,7 @@ class InMemoryStudy1Repository:
         self.events: list[dict[str, Any]] = []
         self.materials: list[dict[str, Any]] = []
         self.submissions: list[dict[str, Any]] = []
+        self.artifacts: list[dict[str, Any]] = []
         self._lock = threading.RLock()
 
     def create_session(
@@ -230,6 +243,46 @@ class InMemoryStudy1Repository:
             )
             self.submissions.append(revision)
             return copy.deepcopy(revision)
+
+    def add_artifact_for_testing(self, artifact: dict[str, Any]) -> None:
+        with self._lock:
+            self.artifacts.append(copy.deepcopy(artifact))
+
+    def open_review(
+        self, session_id: str, identity: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            _validate_review_access(session, identity)
+            now = utc_now()
+            if not session.get("review_opened_at"):
+                session["review_opened_at"] = utc_iso(now)
+            session["completion"]["review_opened:principal"] = True
+            event = _ui_event(session, identity, "review_page_enter", {}, now)
+            self.events.append(event)
+            artifacts = [
+                copy.deepcopy(item)
+                for item in self.artifacts
+                if item["session_id"] == session_id
+                and item["type"] in ("summary", "transcript")
+            ]
+            return _review_payload(artifacts)
+
+    def record_ui_event(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            _validate_review_access(session, identity)
+            event = _record_review_ui_event(
+                session, identity, event_type, payload, utc_now()
+            )
+            self.events.append(event)
+            return copy.deepcopy(event)
 
     def redeem_invite(
         self, token_hash: str, used_at: datetime
@@ -414,6 +467,65 @@ class SqlAlchemyStudy1Repository:
             db.commit()
             return revision
 
+    def open_review(
+        self, session_id: str, identity: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if not session_row:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            snapshot = copy.deepcopy(session_row.payload)
+            _validate_review_access(snapshot, identity)
+            now = utc_now()
+            if not snapshot.get("review_opened_at"):
+                snapshot["review_opened_at"] = utc_iso(now)
+            snapshot["completion"]["review_opened:principal"] = True
+            event = _ui_event(snapshot, identity, "review_page_enter", {}, now)
+            db.add(_event_orm(event))
+            session_row.payload = snapshot
+            session_row.updated_at = now
+            artifact_rows = db.scalars(
+                select(Study1ArtifactRow)
+                .where(
+                    Study1ArtifactRow.session_id == session_id,
+                    Study1ArtifactRow.type.in_(("summary", "transcript")),
+                )
+                .order_by(Study1ArtifactRow.created_at.asc())
+            ).all()
+            artifacts = [_artifact_row_dict(item) for item in artifact_rows]
+            db.commit()
+            return _review_payload(artifacts)
+
+    def record_ui_event(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if not session_row:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            snapshot = copy.deepcopy(session_row.payload)
+            _validate_review_access(snapshot, identity)
+            event = _record_review_ui_event(
+                snapshot, identity, event_type, payload, utc_now()
+            )
+            db.add(_event_orm(event))
+            session_row.payload = snapshot
+            session_row.updated_at = utc_now()
+            db.commit()
+            return event
+
     def redeem_invite(
         self, token_hash: str, used_at: datetime
     ) -> dict[str, Any] | None:
@@ -520,6 +632,21 @@ def _submission_row_dict(row: Study1SubmissionRow) -> dict[str, Any]:
         "previous_submission_id": row.previous_submission_id,
         "revision_operator": row.revision_operator,
         "revision_reason": row.revision_reason,
+    }
+
+
+def _artifact_row_dict(row: Study1ArtifactRow) -> dict[str, Any]:
+    return {
+        "artifact_id": row.artifact_id,
+        "session_id": row.session_id,
+        "type": row.type,
+        "version": row.version,
+        "content": row.content,
+        "storage_uri": row.storage_uri,
+        "checksum": row.checksum,
+        "created_at": utc_iso(row.created_at),
+        "generator_version": row.generator_version,
+        "metadata": dict(row.artifact_metadata or {}),
     }
 
 
@@ -704,6 +831,89 @@ def _revision_from(
     }
 
 
+def _validate_review_access(
+    session: dict[str, Any] | None, identity: dict[str, Any]
+) -> None:
+    if not session:
+        raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+    if identity.get("role") != Study1Role.PRINCIPAL.value:
+        raise Study1ServiceError(
+            "REVIEW_ACCESS_FORBIDDEN",
+            "Only the principal may access Study 1 review artifacts",
+            403,
+        )
+    if session["phase"] not in (
+        Study1Phase.REVIEW.value,
+        Study1Phase.COMPREHENSION_MEASUREMENT.value,
+    ):
+        raise ActionNotAllowedInPhase(session["phase"], Study1Phase.REVIEW.value)
+    if not session.get("completion", {}).get("delegation_expectation:principal"):
+        raise Study1ServiceError(
+            "DELEGATION_EXPECTATION_REQUIRED",
+            "Delegation expectation must be submitted before review",
+            409,
+        )
+
+
+def _ui_event(
+    session: dict[str, Any],
+    identity: dict[str, Any],
+    event_type: str,
+    payload: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    return {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session["session_id"],
+        "participant_id": identity["participant_id"],
+        "role": identity["role"],
+        "phase": session["phase"],
+        "phase_version": session["phase_version"],
+        "event_type": "ui_event",
+        "occurred_at": utc_iso(now),
+        "payload": {"ui_event_type": event_type, **copy.deepcopy(payload)},
+    }
+
+
+def _record_review_ui_event(
+    session: dict[str, Any],
+    identity: dict[str, Any],
+    event_type: str,
+    payload: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    if event_type not in REVIEW_UI_EVENTS:
+        raise Study1ServiceError("UNKNOWN_UI_EVENT", "Unknown review UI event", 400)
+    safe_payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
+    if event_type == "scroll_depth":
+        depth = float(safe_payload.get("max_depth", 0))
+        safe_payload["max_depth"] = max(0.0, min(1.0, depth))
+        segments = safe_payload.get("visible_segments") or []
+        safe_payload["visible_segments"] = [str(value)[:64] for value in segments[:100]]
+    if event_type == "transcript_segment_view":
+        safe_payload = {"segment_id": str(safe_payload.get("segment_id") or "")[:64]}
+    session["completion"]["review_reading_recorded:principal"] = True
+    opened = session.get("review_opened_at")
+    if opened:
+        opened_at = datetime.fromisoformat(opened.replace("Z", "+00:00"))
+        elapsed = max(0, int((now - opened_at).total_seconds()))
+        safe_payload["server_elapsed_since_review_open_seconds"] = elapsed
+        minimum = int(session.get("minimum_review_seconds") or 0)
+        if elapsed >= minimum:
+            session["completion"]["minimum_review_time_met:principal"] = True
+    return _ui_event(session, identity, event_type, safe_payload, now)
+
+
+def _review_payload(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    latest: dict[str, dict[str, Any]] = {}
+    for artifact in artifacts:
+        latest[artifact["type"]] = artifact
+    return {
+        "summary": latest.get("summary"),
+        "transcript": latest.get("transcript"),
+    }
+
+
 class Study1Service:
     def __init__(
         self,
@@ -718,6 +928,7 @@ class Study1Service:
         session_name: str,
         invite_ttl_seconds: int = 86400,
         materials_by_role: dict[str, list[dict[str, Any]]] | None = None,
+        minimum_review_seconds: int = 0,
     ) -> dict[str, Any]:
         clean_name = (session_name or "").strip()
         if not clean_name:
@@ -769,6 +980,7 @@ class Study1Service:
             "created_at": utc_iso(now),
             "protocol_version": "study1-a-1.0",
             "task_version": "1.0",
+            "minimum_review_seconds": max(0, int(minimum_review_seconds)),
         }
         expires_at = now + timedelta(seconds=max(60, int(invite_ttl_seconds)))
         created: list[CreatedInvite] = []
@@ -893,6 +1105,22 @@ class Study1Service:
             raise Study1ServiceError(
                 "INVALID_PHASE_TRANSITION", str(error), 409
             ) from error
+
+    def get_review(
+        self, session_id: str, identity: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.repository.open_review(session_id, identity)
+
+    def log_review_ui_event(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.repository.record_ui_event(
+            session_id, identity, event_type, payload
+        )
 
     def exchange_invite(self, raw_token: str) -> dict[str, Any]:
         if not raw_token:

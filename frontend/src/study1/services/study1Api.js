@@ -99,4 +99,18 @@ export function transitionPhase(sessionId, targetPhase, { override = false, reas
   })
 }
 
+export function fetchReview(sessionId) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/review`)
+}
+
+export function logReviewUiEvent(sessionId, eventType, payload = {}) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/ui-events`, {
+    method: 'POST',
+    body: JSON.stringify({
+      event_type: eventType,
+      payload,
+    }),
+  })
+}
+
 export { request as study1Request }
