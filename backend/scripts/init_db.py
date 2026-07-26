@@ -40,7 +40,7 @@ def main() -> int:
     print(
         'init_db: tables ready in schema',
         schema,
-        '(action_logs, in_session_annotations, post_session_annotations, research_sessions)',
+        '(legacy tables plus study1_invites/events/submissions/artifacts/incidents)',
     )
     return 0
 

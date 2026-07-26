@@ -226,6 +226,10 @@ def _ensure_in_session_elapsed_seconds_column(engine) -> None:
 
 def init_db() -> None:
     """Create application schema (if needed) and tables if they do not exist."""
+    # Import domain models before create_all so their tables share this metadata.
+    # Local import avoids a module cycle while Base is being defined.
+    import study1.models  # noqa: F401
+
     schema = get_app_schema()
     engine = get_engine()
     # Identifier is regex-validated; safe to interpolate as bare PostgreSQL identifier.
@@ -446,8 +450,15 @@ def delete_research_session(session_id: str) -> None:
             db.commit()
 
 
-def load_all_research_sessions() -> Dict[str, Dict[str, Any]]:
-    """Return all sessions keyed by session_id (matches in-memory ``sessions`` dict keys)."""
+def load_all_research_sessions(
+    include_study1: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    """Return legacy runtime sessions keyed by session_id.
+
+    Study 1 snapshots deliberately stay out of the legacy in-memory runtime:
+    legacy GET/PUT/start routes and agent automation are not authorized phase
+    control paths.  Study 1 services query its snapshot directly.
+    """
     if not is_db_configured():
         return {}
     SessionLocal = get_session_factory()
@@ -455,7 +466,9 @@ def load_all_research_sessions() -> Dict[str, Dict[str, Any]]:
         rows = db.scalars(select(ResearchSessionRow)).all()
         out: Dict[str, Dict[str, Any]] = {}
         for r in rows:
-            if r.payload:
+            if r.payload and (
+                include_study1 or r.payload.get("experiment_type") != "study1"
+            ):
                 out[r.session_id] = dict(r.payload)
         return out
 
