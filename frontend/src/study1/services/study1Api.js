@@ -88,6 +88,31 @@ export function createStudy1Session(payload) {
   })
 }
 
+export function listStudy1Sessions() {
+  return request('/api/study1/sessions')
+}
+
+export function fetchResearcherDashboard(sessionId) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/researcher`)
+}
+
+export function controlStudy1Session(sessionId, action, payload = {}) {
+  return request(
+    `/api/study1/sessions/${encodeURIComponent(sessionId)}/control/${encodeURIComponent(action)}`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  )
+}
+
+export function addStudy1Incident(sessionId, payload) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/incidents`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
 export function transitionPhase(sessionId, targetPhase, { override = false, reason = null } = {}) {
   return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/transition`, {
     method: 'POST',

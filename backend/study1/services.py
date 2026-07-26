@@ -22,6 +22,7 @@ from .models import (
     Study1EventRow,
     Study1ArtifactRow,
     Study1InviteRow,
+    Study1IncidentRow,
     Study1MaterialRow,
     Study1Phase,
     Study1Role,
@@ -135,6 +136,7 @@ class InMemoryStudy1Repository:
         self.materials: list[dict[str, Any]] = []
         self.submissions: list[dict[str, Any]] = []
         self.artifacts: list[dict[str, Any]] = []
+        self.incidents: list[dict[str, Any]] = []
         self._lock = threading.RLock()
 
     def create_session(
@@ -181,6 +183,8 @@ class InMemoryStudy1Repository:
             transition = transition_phase(
                 session, target_phase, actor, reason=reason, override=override
             )
+            if session["phase"] == Study1Phase.COMPLETED.value:
+                session["status"] = "completed"
             events = _transition_events(session_id, actor, transition)
             self.events.extend(copy.deepcopy(events))
             return copy.deepcopy(session), events
@@ -284,6 +288,71 @@ class InMemoryStudy1Repository:
             self.events.append(event)
             return copy.deepcopy(event)
 
+    def list_sessions(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [copy.deepcopy(value) for value in self.sessions.values()]
+
+    def control_session(
+        self,
+        session_id: str,
+        action: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            events = _apply_session_control(session, action, actor, payload)
+            self.events.extend(copy.deepcopy(events))
+            return copy.deepcopy(session), events
+
+    def add_incident(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        category: str,
+        severity: str,
+        description: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            incident = _new_incident(
+                session_id, actor, category, severity, description, metadata
+            )
+            self.incidents.append(copy.deepcopy(incident))
+            self.events.append(_incident_event(session, actor, incident))
+            return incident
+
+    def participant_status(
+        self, session_id: str, identity: dict[str, Any], online: bool
+    ) -> None:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                return
+            for participant in session["participants"]:
+                if participant["participant_id"] == identity["participant_id"]:
+                    participant["online"] = bool(online)
+                    break
+            self.events.append(
+                _participant_status_event(session, identity, bool(online))
+            )
+
+    def dashboard(self, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            return _dashboard_payload(
+                copy.deepcopy(session),
+                [a for a in self.artifacts if a["session_id"] == session_id],
+                [i for i in self.incidents if i["session_id"] == session_id],
+            )
+
     def redeem_invite(
         self, token_hash: str, used_at: datetime
     ) -> dict[str, Any] | None:
@@ -384,6 +453,8 @@ class SqlAlchemyStudy1Repository:
             transition = transition_phase(
                 snapshot, target_phase, actor, reason=reason, override=override
             )
+            if snapshot["phase"] == Study1Phase.COMPLETED.value:
+                snapshot["status"] = "completed"
             events = _transition_events(session_id, actor, transition)
             for event in events:
                 db.add(_event_orm(event))
@@ -525,6 +596,131 @@ class SqlAlchemyStudy1Repository:
             session_row.updated_at = utc_now()
             db.commit()
             return event
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        with self.SessionLocal() as db:
+            rows = db.scalars(select(ResearchSessionRow)).all()
+            return [
+                dict(row.payload)
+                for row in rows
+                if row.payload and row.payload.get("experiment_type") == "study1"
+            ]
+
+    def control_session(
+        self,
+        session_id: str,
+        action: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        with self.SessionLocal() as db:
+            row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if not row or row.payload.get("experiment_type") != "study1":
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            snapshot = copy.deepcopy(row.payload)
+            events = _apply_session_control(snapshot, action, actor, payload)
+            for event in events:
+                db.add(_event_orm(event))
+            row.payload = snapshot
+            row.updated_at = utc_now()
+            db.commit()
+            return snapshot, events
+
+    def add_incident(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        category: str,
+        severity: str,
+        description: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            incident = _new_incident(
+                session_id, actor, category, severity, description, metadata
+            )
+            db.add(
+                Study1IncidentRow(
+                    incident_id=incident["incident_id"],
+                    session_id=session_id,
+                    category=incident["category"],
+                    severity=incident["severity"],
+                    description=incident["description"],
+                    created_at=incident["created_at"],
+                    created_by=incident["created_by"],
+                    metadata_payload=incident["metadata"],
+                )
+            )
+            db.add(
+                _event_orm(
+                    _incident_event(session_row.payload, actor, incident)
+                )
+            )
+            db.commit()
+            return incident
+
+    def participant_status(
+        self, session_id: str, identity: dict[str, Any], online: bool
+    ) -> None:
+        with self.SessionLocal() as db:
+            row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if not row or row.payload.get("experiment_type") != "study1":
+                return
+            snapshot = copy.deepcopy(row.payload)
+            for participant in snapshot["participants"]:
+                if participant["participant_id"] == identity["participant_id"]:
+                    participant["online"] = bool(online)
+                    break
+            db.add(_event_orm(_participant_status_event(snapshot, identity, online)))
+            row.payload = snapshot
+            row.updated_at = utc_now()
+            db.commit()
+
+    def dashboard(self, session_id: str) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row or session_row.payload.get("experiment_type") != "study1":
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            artifacts = db.scalars(
+                select(Study1ArtifactRow).where(
+                    Study1ArtifactRow.session_id == session_id
+                )
+            ).all()
+            incidents = db.scalars(
+                select(Study1IncidentRow).where(
+                    Study1IncidentRow.session_id == session_id
+                )
+            ).all()
+            return _dashboard_payload(
+                dict(session_row.payload),
+                [_artifact_row_dict(item) for item in artifacts],
+                [
+                    {
+                        "incident_id": item.incident_id,
+                        "session_id": item.session_id,
+                    }
+                    for item in incidents
+                ],
+            )
 
     def redeem_invite(
         self, token_hash: str, used_at: datetime
@@ -914,6 +1110,197 @@ def _review_payload(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _status_event(
+    session: dict[str, Any],
+    actor: dict[str, Any],
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session["session_id"],
+        "participant_id": actor.get("participant_id"),
+        "role": actor.get("role"),
+        "phase": session["phase"],
+        "phase_version": session["phase_version"],
+        "event_type": event_type,
+        "occurred_at": utc_iso(),
+        "payload": copy.deepcopy(payload or {}),
+    }
+
+
+def _apply_session_control(
+    session: dict[str, Any],
+    action: str,
+    actor: dict[str, Any],
+    payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if actor.get("role") != Study1Role.RESEARCHER.value:
+        raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+    events: list[dict[str, Any]] = []
+    status = session["status"]
+    if action == "start":
+        if status != "waiting" or session["phase"] != Study1Phase.SETUP.value:
+            raise Study1ServiceError(
+                "SESSION_CANNOT_START", "Session must be waiting in SETUP", 409
+            )
+        session["status"] = "running"
+        events.append(_status_event(session, actor, "session_start"))
+        transition = transition_phase(
+            session,
+            Study1Phase.MATERIAL_READING,
+            actor,
+            reason="researcher_started_session",
+        )
+        events.extend(_transition_events(session["session_id"], actor, transition))
+    elif action == "pause":
+        if status != "running":
+            raise Study1ServiceError(
+                "SESSION_CANNOT_PAUSE", "Only a running session can be paused", 409
+            )
+        session["status"] = "paused"
+        events.append(_status_event(session, actor, "session_pause"))
+    elif action == "resume":
+        if status != "paused":
+            raise Study1ServiceError(
+                "SESSION_CANNOT_RESUME", "Only a paused session can be resumed", 409
+            )
+        session["status"] = "running"
+        events.append(_status_event(session, actor, "session_resume"))
+    elif action == "extend":
+        seconds = int(payload.get("seconds") or 0)
+        if seconds <= 0 or seconds > 86400:
+            raise Study1ServiceError(
+                "INVALID_EXTENSION", "seconds must be between 1 and 86400", 400
+            )
+        session["remaining_seconds"] = int(session.get("remaining_seconds") or 0) + seconds
+        events.append(
+            _status_event(
+                session,
+                actor,
+                "session_extend",
+                {"seconds": seconds, "remaining_seconds": session["remaining_seconds"]},
+            )
+        )
+    elif action == "terminate":
+        if status in ("terminated", "completed"):
+            raise Study1ServiceError(
+                "SESSION_CANNOT_TERMINATE", "Session is already terminal", 409
+            )
+        session["status"] = "terminated"
+        events.append(
+            _status_event(
+                session,
+                actor,
+                "session_terminate",
+                {"reason": str(payload.get("reason") or "").strip() or None},
+            )
+        )
+    else:
+        raise Study1ServiceError("UNKNOWN_CONTROL_ACTION", "Unknown control action", 400)
+    return events
+
+
+def _new_incident(
+    session_id: str,
+    actor: dict[str, Any],
+    category: str,
+    severity: str,
+    description: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    clean_description = (description or "").strip()
+    if not clean_description:
+        raise Study1ServiceError(
+            "INCIDENT_DESCRIPTION_REQUIRED", "Incident description is required", 400
+        )
+    allowed_severity = {"info", "warning", "critical"}
+    if severity not in allowed_severity:
+        raise Study1ServiceError("INVALID_INCIDENT_SEVERITY", "Invalid severity", 400)
+    return {
+        "incident_id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "category": (category or "other")[:64],
+        "severity": severity,
+        "description": clean_description,
+        "created_at": utc_now(),
+        "created_by": actor.get("participant_id") or "researcher",
+        "metadata": copy.deepcopy(metadata or {}),
+    }
+
+
+def _incident_event(
+    session: dict[str, Any],
+    actor: dict[str, Any],
+    incident: dict[str, Any],
+) -> dict[str, Any]:
+    return _status_event(
+        session,
+        actor,
+        "incident_created",
+        {
+            "incident_id": incident["incident_id"],
+            "category": incident["category"],
+            "severity": incident["severity"],
+        },
+    )
+
+
+def _participant_status_event(
+    session: dict[str, Any], identity: dict[str, Any], online: bool
+) -> dict[str, Any]:
+    return {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session["session_id"],
+        "participant_id": identity["participant_id"],
+        "role": identity["role"],
+        "phase": session["phase"],
+        "phase_version": session["phase_version"],
+        "event_type": "participant_status_updated",
+        "occurred_at": utc_iso(),
+        "payload": {"online": bool(online)},
+    }
+
+
+def _dashboard_payload(
+    session: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+    incidents: list[dict[str, Any]],
+) -> dict[str, Any]:
+    state = readiness(session)
+    completion = session.get("completion") or {}
+    participant_status = []
+    for participant in session.get("participants") or []:
+        role = participant["role"]
+        participant_status.append(
+            {
+                **participant,
+                "completed_actions": sorted(
+                    key for key, value in completion.items() if value and key.endswith(f":{role}")
+                ),
+            }
+        )
+    types = {item["type"] for item in artifacts}
+    return {
+        "session_id": session["session_id"],
+        "session_name": session["session_name"],
+        "phase": session["phase"],
+        "phase_version": session["phase_version"],
+        "phase_started_at": session["phase_started_at"],
+        "status": session["status"],
+        "participants": participant_status,
+        "not_submitted": state["missing_prerequisites"],
+        **state,
+        "media_service_status": session.get("media_service_status", "mock_idle"),
+        "artifacts": {
+            "summary": "ready" if "summary" in types else "pending",
+            "transcript": "ready" if "transcript" in types else "pending",
+        },
+        "incident_count": len(incidents),
+        "remaining_seconds": session.get("remaining_seconds"),
+    }
+
+
 class Study1Service:
     def __init__(
         self,
@@ -1106,6 +1493,51 @@ class Study1Service:
                 "INVALID_PHASE_TRANSITION", str(error), 409
             ) from error
 
+    def list_sessions(self) -> list[dict[str, Any]]:
+        return [
+            self.session_dto(snapshot)
+            | {"session_name": snapshot["session_name"]}
+            for snapshot in self.repository.list_sessions()
+        ]
+
+    def control(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        action: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        snapshot, events = self.repository.control_session(
+            session_id, action, actor, payload or {}
+        )
+        return {"session": self.session_dto(snapshot), "events": events}
+
+    def add_incident(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        category: str,
+        severity: str,
+        description: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.repository.add_incident(
+            session_id,
+            actor,
+            category,
+            severity,
+            description,
+            metadata or {},
+        )
+
+    def participant_status(
+        self, session_id: str, identity: dict[str, Any], online: bool
+    ) -> None:
+        self.repository.participant_status(session_id, identity, online)
+
+    def researcher_dashboard(self, session_id: str) -> dict[str, Any]:
+        return self.repository.dashboard(session_id)
+
     def get_review(
         self, session_id: str, identity: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1151,6 +1583,7 @@ class Study1Service:
             "phase": snapshot["phase"],
             "phase_version": snapshot["phase_version"],
             "phase_started_at": snapshot["phase_started_at"],
+            "remaining_seconds": snapshot.get("remaining_seconds"),
             **readiness(snapshot),
         }
         if role == Study1Role.PRINCIPAL.value and snapshot["phase"] == "PROXY_MEETING":

@@ -51,7 +51,15 @@ def register_handlers(socketio):
                     del active_connections[session_id]
                 break
         study1_identity = study1_socket_identities.pop(request.sid, None)
-        if study1_identity:
+        if study1_identity and study1_identity.get('role') != 'researcher':
+            try:
+                from study1.services import SqlAlchemyStudy1Repository, Study1Service
+
+                Study1Service(SqlAlchemyStudy1Repository()).participant_status(
+                    study1_identity['session_id'], study1_identity, False
+                )
+            except Exception as status_error:
+                print(f'[Study1 Socket] status persist failed: {status_error}')
             socketio.emit(
                 'study1_participant_status_updated',
                 {
@@ -72,7 +80,7 @@ def register_handlers(socketio):
             data = data or {}
             session_id = str(data.get('session_id') or '')
             identity = Study1TokenManager().verify(str(data.get('token') or ''))
-            if identity.session_id != session_id:
+            if identity.kind != 'researcher' and identity.session_id != session_id:
                 raise AuthenticationError(
                     'SESSION_MISMATCH', 'Token does not belong to this session', 403
                 )
@@ -87,16 +95,25 @@ def register_handlers(socketio):
                     'role': identity.role.value,
                 },
             )
-            socketio.emit(
-                'study1_participant_status_updated',
-                {
-                    'session_id': session_id,
-                    'participant_id': identity.participant_id,
-                    'role': identity.role.value,
-                    'online': True,
-                },
-                room=session_id,
-            )
+            if identity.kind == 'participant':
+                try:
+                    from study1.services import SqlAlchemyStudy1Repository, Study1Service
+
+                    Study1Service(SqlAlchemyStudy1Repository()).participant_status(
+                        session_id, identity.as_actor(), True
+                    )
+                except Exception as status_error:
+                    print(f'[Study1 Socket] status persist failed: {status_error}')
+                socketio.emit(
+                    'study1_participant_status_updated',
+                    {
+                        'session_id': session_id,
+                        'participant_id': identity.participant_id,
+                        'role': identity.role.value,
+                        'online': True,
+                    },
+                    room=session_id,
+                )
         except Exception as error:
             code = getattr(error, 'code', 'STUDY1_SOCKET_AUTH_FAILED')
             emit('study1_error', {'error': code, 'message': str(error)})

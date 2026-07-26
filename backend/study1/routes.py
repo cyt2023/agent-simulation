@@ -69,6 +69,15 @@ def create_study1_session():
         return _service_error(error)
 
 
+@study1_bp.get("/api/study1/sessions")
+@require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
+def list_study1_sessions():
+    try:
+        return jsonify({"sessions": get_service().list_sessions()}), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
 @study1_bp.post("/api/study1/invites/<token>/exchange")
 def exchange_study1_invite(token: str):
     try:
@@ -228,3 +237,87 @@ def create_study1_ui_event(session_id: str):
         return jsonify({"event_id": event["event_id"]}), 201
     except Study1ServiceError as error:
         return _service_error(error)
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/researcher")
+@require_study1_auth([Study1Role.RESEARCHER])
+def get_study1_researcher_dashboard(session_id: str):
+    try:
+        return jsonify(get_service().researcher_dashboard(session_id)), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/control/<action>")
+@require_study1_auth([Study1Role.RESEARCHER])
+def control_study1_session(session_id: str, action: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().control(
+            session_id, g.study1_identity.as_actor(), action, data
+        )
+        _emit_control_events(session_id, action, result["session"])
+        return jsonify(result), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/incidents")
+@require_study1_auth([Study1Role.RESEARCHER])
+def create_study1_incident(session_id: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        incident = get_service().add_incident(
+            session_id,
+            g.study1_identity.as_actor(),
+            str(data.get("category") or "other"),
+            str(data.get("severity") or "warning"),
+            str(data.get("description") or ""),
+            data.get("metadata") or {},
+        )
+        try:
+            from websocket.handlers import get_socketio
+
+            get_socketio().emit(
+                "study1_incident_created",
+                {
+                    "session_id": session_id,
+                    "incident_id": incident["incident_id"],
+                    "category": incident["category"],
+                    "severity": incident["severity"],
+                },
+                room=session_id,
+            )
+        except RuntimeError:
+            pass
+        return jsonify(
+            {
+                **incident,
+                "created_at": incident["created_at"].isoformat().replace(
+                    "+00:00", "Z"
+                ),
+            }
+        ), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+def _emit_control_events(session_id: str, action: str, session: dict):
+    try:
+        from websocket.handlers import get_socketio
+
+        event = (
+            "study1_session_terminated"
+            if action == "terminate"
+            else "study1_phase_updated"
+        )
+        get_socketio().emit(
+            event, {"session_id": session_id, **session}, room=session_id
+        )
+        get_socketio().emit(
+            "study1_readiness_updated",
+            {"session_id": session_id, **session},
+            room=session_id,
+        )
+    except RuntimeError:
+        pass
