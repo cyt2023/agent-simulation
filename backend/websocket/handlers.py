@@ -127,6 +127,25 @@ def register_handlers(socketio):
             return
         leave_room(identity['session_id'])
         study1_socket_identities.pop(request.sid, None)
+        if identity.get('role') != 'researcher':
+            try:
+                from study1.services import SqlAlchemyStudy1Repository, Study1Service
+
+                Study1Service(SqlAlchemyStudy1Repository()).participant_status(
+                    identity['session_id'], identity, False
+                )
+            except Exception as status_error:
+                print(f'[Study1 Socket] status persist failed: {status_error}')
+            socketio.emit(
+                'study1_participant_status_updated',
+                {
+                    'session_id': identity['session_id'],
+                    'participant_id': identity['participant_id'],
+                    'role': identity['role'],
+                    'online': False,
+                },
+                room=identity['session_id'],
+            )
 
     @socketio.on('join_session')
     def handle_join_session(data):

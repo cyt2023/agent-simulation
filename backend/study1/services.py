@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import copy
+import io
 import json
 import os
 import secrets
@@ -354,6 +355,30 @@ class InMemoryStudy1Repository:
                 [a for a in self.artifacts if a["session_id"] == session_id],
                 [i for i in self.incidents if i["session_id"] == session_id],
             )
+
+    def export_data(self, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            return {
+                "session": copy.deepcopy(session),
+                "events": copy.deepcopy(
+                    [item for item in self.events if item["session_id"] == session_id]
+                ),
+                "submissions": copy.deepcopy(
+                    [item for item in self.submissions if item["session_id"] == session_id]
+                ),
+                "artifacts": copy.deepcopy(
+                    [item for item in self.artifacts if item["session_id"] == session_id]
+                ),
+                "incidents": copy.deepcopy(
+                    [item for item in self.incidents if item["session_id"] == session_id]
+                ),
+                "materials": copy.deepcopy(
+                    [item for item in self.materials if item["session_id"] == session_id]
+                ),
+            }
 
     def record_media_command(
         self, session_id: str, envelope: dict[str, Any]
@@ -771,11 +796,87 @@ class SqlAlchemyStudy1Repository:
                 ],
             )
 
+    def export_data(self, session_id: str) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row or session_row.payload.get("experiment_type") != "study1":
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            event_rows = db.scalars(
+                select(Study1EventRow)
+                .where(Study1EventRow.session_id == session_id)
+                .order_by(Study1EventRow.occurred_at.asc())
+            ).all()
+            submission_rows = db.scalars(
+                select(Study1SubmissionRow)
+                .where(Study1SubmissionRow.session_id == session_id)
+                .order_by(Study1SubmissionRow.server_timestamp.asc())
+            ).all()
+            artifact_rows = db.scalars(
+                select(Study1ArtifactRow)
+                .where(Study1ArtifactRow.session_id == session_id)
+                .order_by(Study1ArtifactRow.created_at.asc())
+            ).all()
+            incident_rows = db.scalars(
+                select(Study1IncidentRow)
+                .where(Study1IncidentRow.session_id == session_id)
+                .order_by(Study1IncidentRow.created_at.asc())
+            ).all()
+            material_rows = db.scalars(
+                select(Study1MaterialRow)
+                .where(Study1MaterialRow.session_id == session_id)
+                .order_by(Study1MaterialRow.id.asc())
+            ).all()
+            return {
+                "session": dict(session_row.payload),
+                "events": [
+                    {
+                        "event_id": row.event_id,
+                        "session_id": row.session_id,
+                        "participant_id": row.participant_id,
+                        "role": row.role,
+                        "phase": row.phase,
+                        "phase_version": row.phase_version,
+                        "event_type": row.event_type,
+                        "occurred_at": row.occurred_at,
+                        "payload": dict(row.payload or {}),
+                        "idempotency_key": row.idempotency_key,
+                    }
+                    for row in event_rows
+                ],
+                "submissions": [_submission_row_dict(row) for row in submission_rows],
+                "artifacts": [_artifact_row_dict(row) for row in artifact_rows],
+                "incidents": [
+                    {
+                        "incident_id": row.incident_id,
+                        "session_id": row.session_id,
+                        "category": row.category,
+                        "severity": row.severity,
+                        "description": row.description,
+                        "created_at": row.created_at,
+                        "created_by": row.created_by,
+                        "metadata": dict(row.metadata_payload or {}),
+                    }
+                    for row in incident_rows
+                ],
+                "materials": [_material_row_dict(row) for row in material_rows],
+            }
+
     def record_media_command(
         self, session_id: str, envelope: dict[str, Any]
     ) -> bool:
         key = f"media-command:{envelope['command_id']}"
         with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if not session_row:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
             existing = db.scalar(
                 select(Study1EventRow).where(
                     Study1EventRow.idempotency_key == key
@@ -783,13 +884,6 @@ class SqlAlchemyStudy1Repository:
             )
             if existing:
                 return False
-            session_row = db.scalar(
-                select(ResearchSessionRow).where(
-                    ResearchSessionRow.session_id == session_id
-                )
-            )
-            if not session_row:
-                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
             db.add(_event_orm(_media_command_event(session_row.payload, envelope, key)))
             db.commit()
             return True
@@ -799,11 +893,6 @@ class SqlAlchemyStudy1Repository:
     ) -> tuple[bool, dict[str, Any]]:
         key = f"media-event:{envelope['event_id']}"
         with self.SessionLocal() as db:
-            existing = db.scalar(
-                select(Study1EventRow).where(
-                    Study1EventRow.idempotency_key == key
-                )
-            )
             session_row = db.scalar(
                 select(ResearchSessionRow)
                 .where(ResearchSessionRow.session_id == envelope["session_id"])
@@ -811,6 +900,11 @@ class SqlAlchemyStudy1Repository:
             )
             if not session_row:
                 raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            existing = db.scalar(
+                select(Study1EventRow).where(
+                    Study1EventRow.idempotency_key == key
+                )
+            )
             if existing:
                 return False, dict(session_row.payload)
             snapshot = copy.deepcopy(session_row.payload)
@@ -825,13 +919,6 @@ class SqlAlchemyStudy1Repository:
         self, session_id: str, artifact: dict[str, Any]
     ) -> tuple[bool, dict[str, Any]]:
         with self.SessionLocal() as db:
-            existing = db.scalar(
-                select(Study1ArtifactRow).where(
-                    Study1ArtifactRow.artifact_id == artifact["artifact_id"]
-                )
-            )
-            if existing:
-                return False, _artifact_row_dict(existing)
             session_row = db.scalar(
                 select(ResearchSessionRow)
                 .where(ResearchSessionRow.session_id == session_id)
@@ -839,6 +926,13 @@ class SqlAlchemyStudy1Repository:
             )
             if not session_row:
                 raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            existing = db.scalar(
+                select(Study1ArtifactRow).where(
+                    Study1ArtifactRow.artifact_id == artifact["artifact_id"]
+                )
+            )
+            if existing:
+                return False, _artifact_row_dict(existing)
             db.add(
                 Study1ArtifactRow(
                     artifact_id=artifact["artifact_id"],
@@ -1644,6 +1738,62 @@ class Study1Service:
         self.repository.add_materials(rows)
         return rows
 
+    def add_uploaded_materials(
+        self, session_id: str, role: Study1Role | str, files
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for index, upload in enumerate(files, start=1):
+            raw = upload.read()
+            if len(raw) > 20 * 1024 * 1024:
+                raise Study1ServiceError(
+                    "MATERIAL_TOO_LARGE", "Each material must be at most 20 MB", 413
+                )
+            filename = (upload.filename or "").lower()
+            if filename.endswith(".pdf"):
+                try:
+                    import pdfplumber
+
+                    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                        content = "\n\n".join(
+                            page.extract_text() or "" for page in pdf.pages
+                        ).strip()
+                        page_count = len(pdf.pages)
+                except Exception as error:
+                    raise Study1ServiceError(
+                        "MATERIAL_PARSE_FAILED", "Unable to extract PDF text", 422
+                    ) from error
+            elif filename.endswith((".txt", ".md")):
+                try:
+                    content = raw.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise Study1ServiceError(
+                        "MATERIAL_PARSE_FAILED", "Text material must be UTF-8", 422
+                    ) from error
+                page_count = None
+            else:
+                raise Study1ServiceError(
+                    "UNSUPPORTED_MATERIAL_TYPE",
+                    "Study 1 material uploads must be PDF, TXT, or Markdown",
+                    400,
+                )
+            if not content.strip():
+                raise Study1ServiceError(
+                    "EMPTY_MATERIAL", "Uploaded material contains no extractable text", 422
+                )
+            items.append(
+                {
+                    # Do not persist original filenames: they may contain real names.
+                    "title": f"Uploaded material {index}",
+                    "content": content,
+                    "metadata": {
+                        "content_type": upload.mimetype or "application/octet-stream",
+                        "page_count": page_count,
+                        "source": "researcher_upload",
+                    },
+                }
+            )
+        return self.add_materials(session_id, role, items)
+
     def submit(
         self,
         session_id: str,
@@ -1794,7 +1944,16 @@ class Study1Service:
             "payload": copy.deepcopy(payload or {}),
         }
         created = self.repository.record_media_command(session_id, envelope)
-        result = self.media_gateway.send_command(envelope)
+        result = (
+            self.media_gateway.send_command(envelope)
+            if created
+            else {
+                "accepted": True,
+                "duplicate": True,
+                "command_id": envelope["command_id"],
+                "mode": "idempotent-replay",
+            }
+        )
         return {"command": envelope, "duplicate": not created, "gateway": result}
 
     def receive_media_event(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -1812,6 +1971,11 @@ class Study1Service:
         artifact = _validate_artifact(session_id, data)
         created, value = self.repository.create_artifact(session_id, artifact)
         return {"created": created, "duplicate": not created, "artifact": value}
+
+    def export_bundle(self, session_id: str):
+        from .export_service import build_study1_export
+
+        return build_study1_export(self.repository.export_data(session_id))
 
     def get_review(
         self, session_id: str, identity: dict[str, Any]

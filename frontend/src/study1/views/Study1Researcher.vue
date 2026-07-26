@@ -11,7 +11,9 @@ import {
   researcherLogin,
   issueStudy1MediaCommand,
   completeMockMedia,
+  exportStudy1Data,
   transitionPhase,
+  uploadStudy1Materials,
 } from '../services/study1Api.js'
 import {
   joinStudy1Session,
@@ -21,10 +23,12 @@ import {
 } from '../services/study1Socket.js'
 
 const authenticated = ref(getStudy1Identity()?.role === 'researcher')
+const appOrigin = window.location.origin
 const researcherKey = ref('')
 const sessionName = ref('')
 const minimumReviewSeconds = ref(0)
 const materialText = ref({ principal: '', teammate_1: '', teammate_2: '' })
+const materialFiles = ref({ principal: [], teammate_1: [], teammate_2: [] })
 const sessionList = ref([])
 const selectedSessionId = ref('')
 const dashboard = ref(null)
@@ -72,6 +76,15 @@ async function createSession() {
     })
     invites.value = result.invites
     selectedSessionId.value = result.session.session_id
+    for (const role of ['principal', 'teammate_1', 'teammate_2']) {
+      if (materialFiles.value[role].length) {
+        await uploadStudy1Materials(
+          selectedSessionId.value,
+          role,
+          materialFiles.value[role],
+        )
+      }
+    }
     await loadSessions()
     await selectSession()
   } catch (reason) {
@@ -178,6 +191,20 @@ async function confirmMockComplete() {
   }
 }
 
+async function exportData() {
+  try {
+    const blob = await exportStudy1Data(selectedSessionId.value)
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `study1-${selectedSessionId.value}.zip`
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (reason) {
+    error.value = reason.message
+  }
+}
+
 function handleStudyEvent(event) {
   if (event?.session_id === selectedSessionId.value) refreshDashboard()
 }
@@ -229,6 +256,12 @@ onUnmounted(() => {
         <label v-for="role in ['principal', 'teammate_1', 'teammate_2']" :key="role">
           {{ role.replaceAll('_', ' ') }} private material
           <textarea v-model="materialText[role]" rows="3" />
+          <input
+            type="file"
+            accept=".pdf,.txt,.md"
+            multiple
+            @change="materialFiles[role] = Array.from($event.target.files || [])"
+          />
         </label>
         <button :disabled="busy || !sessionName.trim()" @click="createSession">Create session and invitations</button>
       </section>
@@ -238,7 +271,7 @@ onUnmounted(() => {
         <p>These raw tokens are shown once and are not stored in plaintext.</p>
         <div v-for="invite in invites" :key="invite.invite_id" class="invite">
           <strong>{{ invite.role }}</strong>
-          <code>{{ `${location.origin}${invite.join_path}` }}</code>
+          <code>{{ `${appOrigin}${invite.join_path}` }}</code>
         </div>
       </section>
 
@@ -303,7 +336,7 @@ onUnmounted(() => {
           >
             Confirm Mock Complete
           </button>
-          <button disabled title="Added with the export commit">Export Data</button>
+          <button :disabled="busy" @click="exportData">Export Data</button>
         </section>
       </template>
     </template>

@@ -59,6 +59,32 @@ def test_material_api_never_accepts_a_requested_role(memory_service, study1_clie
     assert teammate_response.get_json()["materials"][0]["content"] == "teammate one secret"
 
 
+def test_researcher_can_upload_utf8_material_without_storing_filename(
+    memory_service, study1_client
+):
+    researcher = study1_client.post(
+        "/api/study1/auth/researcher", json={"key": "researcher-test-key"}
+    ).get_json()["token"]
+    created = memory_service.create_session("uploads")
+    session_id = created["session"]["session_id"]
+    response = study1_client.post(
+        f"/api/study1/sessions/{session_id}/materials/principal",
+        headers={"Authorization": f"Bearer {researcher}"},
+        data={
+            "files": (
+                __import__("io").BytesIO(b"private evidence"),
+                "possible-real-name.txt",
+            )
+        },
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 201
+    material = response.get_json()["materials"][0]
+    assert material["content"] == "private evidence"
+    assert material["title"] == "Uploaded material 1"
+    assert "possible-real-name" not in str(material)
+
+
 def test_wrong_phase_submission_returns_protocol_409_details(
     memory_service, study1_client
 ):

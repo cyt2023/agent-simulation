@@ -28,6 +28,7 @@ def test_mock_gateway_command_is_idempotent(memory_service):
     assert first["command"]["phase_version"] == 5
     assert first["gateway"]["mode"] == "mock"
     assert second["duplicate"] is True
+    assert second["gateway"]["mode"] == "idempotent-replay"
     assert len(memory_service.media_gateway.commands) == 1
     assert (
         len(

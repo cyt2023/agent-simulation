@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import uuid
 
-from flask import Blueprint, g, jsonify, request
+from flask import Blueprint, g, jsonify, request, send_file
 
 from .models import HUMAN_ROLES, Study1Role
 from .permissions import (
@@ -120,10 +120,15 @@ def get_my_study1_materials(session_id: str):
 @require_study1_auth([Study1Role.RESEARCHER])
 def add_study1_materials(session_id: str, role: str):
     try:
-        data = request.get_json(silent=True) or {}
-        materials = get_service().add_materials(
-            session_id, role, data.get("materials") or []
-        )
+        if request.files:
+            materials = get_service().add_uploaded_materials(
+                session_id, role, request.files.getlist("files")
+            )
+        else:
+            data = request.get_json(silent=True) or {}
+            materials = get_service().add_materials(
+                session_id, role, data.get("materials") or []
+            )
         return jsonify({"materials": materials}), 201
     except (Study1ServiceError, ValueError) as error:
         if isinstance(error, Study1ServiceError):
@@ -449,3 +454,19 @@ def _emit_media_update(session_id: str, result: dict):
         )
     except (RuntimeError, ImportError):
         pass
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/export")
+@require_study1_auth([Study1Role.RESEARCHER])
+def export_study1_session(session_id: str):
+    try:
+        bundle = get_service().export_bundle(session_id)
+        return send_file(
+            bundle,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=f"study1-{session_id}.zip",
+            max_age=0,
+        )
+    except Study1ServiceError as error:
+        return _service_error(error)

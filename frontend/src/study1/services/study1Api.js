@@ -88,6 +88,15 @@ export function createStudy1Session(payload) {
   })
 }
 
+export function uploadStudy1Materials(sessionId, role, files) {
+  const form = new FormData()
+  for (const file of files) form.append('files', file)
+  return request(
+    `/api/study1/sessions/${encodeURIComponent(sessionId)}/materials/${encodeURIComponent(role)}`,
+    { method: 'POST', body: form },
+  )
+}
+
 export function listStudy1Sessions() {
   return request('/api/study1/sessions')
 }
@@ -125,6 +134,18 @@ export function completeMockMedia(sessionId) {
     method: 'POST',
     body: JSON.stringify({}),
   })
+}
+
+export async function exportStudy1Data(sessionId) {
+  const response = await fetch(`/api/study1/sessions/${encodeURIComponent(sessionId)}/export`, {
+    headers: { Authorization: `Bearer ${getStudy1Token()}` },
+  })
+  if (!response.ok) {
+    let data = null
+    try { data = await response.json() } catch {}
+    throw new Error(data?.message || data?.error || `Export failed (${response.status})`)
+  }
+  return response.blob()
 }
 
 export function transitionPhase(sessionId, targetPhase, { override = false, reason = null } = {}) {

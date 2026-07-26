@@ -184,6 +184,23 @@ If you enable S3-based uploads (screenshots, annotation assets, etc.), configure
 
 ## Key Features
 
+### Study 1 workflow, authorization, and data
+
+Study 1 is isolated from the legacy experiment runtime and is available at:
+
+- Participant invitation: `/study1/join/:token`
+- Participant workflow: `/study1/participant`
+- Researcher console: `/researcher/study1`
+
+It provides server-verified one-time role invitations, a researcher-controlled
+phase state machine, private materials by role, locked/revisioned submissions,
+gated Review artifacts, reading telemetry, incidents, Mock media boundary
+events, and a versioned ZIP export.
+
+Study 1 does **not** implement a live meeting, LiveKit, RTC/WebRTC, microphone
+access, ASR, TTS, a Proxy runtime, or audio recording. See
+`backend/study1/README.md` and `contracts/study1-media-contract.md`.
+
 - Multiple experiment paradigms managed through the researcher dashboard
 - Human-AI mixed collaboration within the same session
 - Real-time state updates via Socket.IO (participants, status, timers)
