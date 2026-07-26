@@ -168,6 +168,19 @@ def transition_study1_phase(session_id: str):
             reason=data.get("reason"),
             override=bool(data.get("override", False)),
         )
+        try:
+            from websocket.handlers import get_socketio
+
+            payload = {
+                "session_id": session_id,
+                **result["session"],
+            }
+            get_socketio().emit("study1_phase_updated", payload, room=session_id)
+            get_socketio().emit(
+                "study1_readiness_updated", payload, room=session_id
+            )
+        except RuntimeError:
+            pass
         return jsonify(result), 200
     except Study1ServiceError as error:
         return _service_error(error)

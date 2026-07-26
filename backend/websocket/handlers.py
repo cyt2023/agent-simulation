@@ -30,6 +30,7 @@ def register_handlers(socketio):
     global _socketio_instance
     _socketio_instance = socketio
     print('[WebSocket] Registering handlers with socketio instance')
+    study1_socket_identities = {}
 
     @socketio.on('connect')
     def handle_connect():
@@ -49,6 +50,66 @@ def register_handlers(socketio):
                 if not connections:
                     del active_connections[session_id]
                 break
+        study1_identity = study1_socket_identities.pop(request.sid, None)
+        if study1_identity:
+            socketio.emit(
+                'study1_participant_status_updated',
+                {
+                    'session_id': study1_identity['session_id'],
+                    'participant_id': study1_identity['participant_id'],
+                    'role': study1_identity['role'],
+                    'online': False,
+                },
+                room=study1_identity['session_id'],
+            )
+
+    @socketio.on('study1_join_session')
+    def handle_study1_join_session(data):
+        """Join a Study 1 room only after verifying the signed server token."""
+        try:
+            from study1.permissions import AuthenticationError, Study1TokenManager
+
+            data = data or {}
+            session_id = str(data.get('session_id') or '')
+            identity = Study1TokenManager().verify(str(data.get('token') or ''))
+            if identity.session_id != session_id:
+                raise AuthenticationError(
+                    'SESSION_MISMATCH', 'Token does not belong to this session', 403
+                )
+            join_room(session_id)
+            active_connections.setdefault(session_id, set()).add(request.sid)
+            study1_socket_identities[request.sid] = identity.as_actor()
+            emit(
+                'study1_joined_session',
+                {
+                    'session_id': session_id,
+                    'participant_id': identity.participant_id,
+                    'role': identity.role.value,
+                },
+            )
+            socketio.emit(
+                'study1_participant_status_updated',
+                {
+                    'session_id': session_id,
+                    'participant_id': identity.participant_id,
+                    'role': identity.role.value,
+                    'online': True,
+                },
+                room=session_id,
+            )
+        except Exception as error:
+            code = getattr(error, 'code', 'STUDY1_SOCKET_AUTH_FAILED')
+            emit('study1_error', {'error': code, 'message': str(error)})
+
+    @socketio.on('study1_leave_session')
+    def handle_study1_leave_session(data):
+        identity = study1_socket_identities.get(request.sid)
+        if not identity:
+            return
+        if str((data or {}).get('session_id') or '') != identity['session_id']:
+            return
+        leave_room(identity['session_id'])
+        study1_socket_identities.pop(request.sid, None)
 
     @socketio.on('join_session')
     def handle_join_session(data):

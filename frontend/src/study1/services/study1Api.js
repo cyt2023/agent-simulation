@@ -1,0 +1,102 @@
+const TOKEN_KEY = 'study1_auth_token'
+const IDENTITY_KEY = 'study1_identity'
+
+export function getStudy1Token() {
+  return sessionStorage.getItem(TOKEN_KEY) || ''
+}
+
+export function getStudy1Identity() {
+  try {
+    return JSON.parse(sessionStorage.getItem(IDENTITY_KEY) || 'null')
+  } catch {
+    return null
+  }
+}
+
+export function clearStudy1Auth() {
+  sessionStorage.removeItem(TOKEN_KEY)
+  sessionStorage.removeItem(IDENTITY_KEY)
+}
+
+async function request(path, options = {}) {
+  const headers = new Headers(options.headers || {})
+  const token = getStudy1Token()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  if (options.body && !(options.body instanceof FormData)) {
+    headers.set('Content-Type', 'application/json')
+  }
+  const response = await fetch(path, { ...options, headers })
+  const contentType = response.headers.get('content-type') || ''
+  const data = contentType.includes('application/json') ? await response.json() : null
+  if (!response.ok) {
+    const error = new Error(data?.message || data?.error || `Request failed (${response.status})`)
+    error.status = response.status
+    error.data = data
+    throw error
+  }
+  return data
+}
+
+export async function exchangeInvite(token) {
+  const result = await request(`/api/study1/invites/${encodeURIComponent(token)}/exchange`, {
+    method: 'POST',
+  })
+  sessionStorage.setItem(TOKEN_KEY, result.token)
+  sessionStorage.setItem(IDENTITY_KEY, JSON.stringify(result.identity))
+  return result
+}
+
+export function fetchMe(sessionId) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/me`)
+}
+
+export function fetchMyMaterials(sessionId) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/me/materials`)
+}
+
+export function createSubmission(sessionId, type, payload, instrumentVersion = '1.0') {
+  return request(
+    `/api/study1/sessions/${encodeURIComponent(sessionId)}/submissions/${encodeURIComponent(type)}`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        instrument_version: instrumentVersion,
+        payload,
+        client_timestamp: new Date().toISOString(),
+      }),
+    },
+  )
+}
+
+export async function researcherLogin(key) {
+  const result = await request('/api/study1/auth/researcher', {
+    method: 'POST',
+    body: JSON.stringify({ key }),
+  })
+  sessionStorage.setItem(TOKEN_KEY, result.token)
+  sessionStorage.setItem(
+    IDENTITY_KEY,
+    JSON.stringify({ participant_id: 'researcher', role: 'researcher', session_id: null }),
+  )
+  return result
+}
+
+export function createStudy1Session(payload) {
+  return request('/api/study1/sessions', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function transitionPhase(sessionId, targetPhase, { override = false, reason = null } = {}) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/transition`, {
+    method: 'POST',
+    body: JSON.stringify({
+      target_phase: targetPhase,
+      override,
+      reason,
+    }),
+  })
+}
+
+export { request as study1Request }
