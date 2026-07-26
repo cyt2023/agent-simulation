@@ -28,6 +28,7 @@ from .models import (
     Study1Role,
     Study1SubmissionRow,
 )
+from .media_gateway import COMMANDS, EVENT_TYPES, MediaGateway, MockMediaGateway
 from .permissions import Study1TokenManager
 from .state_machine import (
     InvalidTransition,
@@ -137,6 +138,7 @@ class InMemoryStudy1Repository:
         self.submissions: list[dict[str, Any]] = []
         self.artifacts: list[dict[str, Any]] = []
         self.incidents: list[dict[str, Any]] = []
+        self.idempotency_keys: set[str] = set()
         self._lock = threading.RLock()
 
     def create_session(
@@ -352,6 +354,53 @@ class InMemoryStudy1Repository:
                 [a for a in self.artifacts if a["session_id"] == session_id],
                 [i for i in self.incidents if i["session_id"] == session_id],
             )
+
+    def record_media_command(
+        self, session_id: str, envelope: dict[str, Any]
+    ) -> bool:
+        with self._lock:
+            key = f"media-command:{envelope['command_id']}"
+            if key in self.idempotency_keys:
+                return False
+            session = self.sessions.get(session_id)
+            if not session:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            self.idempotency_keys.add(key)
+            self.events.append(_media_command_event(session, envelope, key))
+            return True
+
+    def record_media_event(
+        self, envelope: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        with self._lock:
+            key = f"media-event:{envelope['event_id']}"
+            session = self.sessions.get(envelope["session_id"])
+            if not session:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            if key in self.idempotency_keys:
+                return False, copy.deepcopy(session)
+            _apply_media_event(session, envelope)
+            self.idempotency_keys.add(key)
+            self.events.append(_media_event_log(session, envelope, key))
+            return True, copy.deepcopy(session)
+
+    def create_artifact(
+        self, session_id: str, artifact: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            if any(item["artifact_id"] == artifact["artifact_id"] for item in self.artifacts):
+                existing = next(
+                    item for item in self.artifacts if item["artifact_id"] == artifact["artifact_id"]
+                )
+                return False, copy.deepcopy(existing)
+            self.artifacts.append(copy.deepcopy(artifact))
+            if artifact["type"] == "summary":
+                session["completion"]["summary_artifact_ready"] = True
+            self.events.append(_artifact_ready_event(session, artifact))
+            return True, copy.deepcopy(artifact)
 
     def redeem_invite(
         self, token_hash: str, used_at: datetime
@@ -721,6 +770,97 @@ class SqlAlchemyStudy1Repository:
                     for item in incidents
                 ],
             )
+
+    def record_media_command(
+        self, session_id: str, envelope: dict[str, Any]
+    ) -> bool:
+        key = f"media-command:{envelope['command_id']}"
+        with self.SessionLocal() as db:
+            existing = db.scalar(
+                select(Study1EventRow).where(
+                    Study1EventRow.idempotency_key == key
+                )
+            )
+            if existing:
+                return False
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            db.add(_event_orm(_media_command_event(session_row.payload, envelope, key)))
+            db.commit()
+            return True
+
+    def record_media_event(
+        self, envelope: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        key = f"media-event:{envelope['event_id']}"
+        with self.SessionLocal() as db:
+            existing = db.scalar(
+                select(Study1EventRow).where(
+                    Study1EventRow.idempotency_key == key
+                )
+            )
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == envelope["session_id"])
+                .with_for_update()
+            )
+            if not session_row:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            if existing:
+                return False, dict(session_row.payload)
+            snapshot = copy.deepcopy(session_row.payload)
+            _apply_media_event(snapshot, envelope)
+            db.add(_event_orm(_media_event_log(snapshot, envelope, key)))
+            session_row.payload = snapshot
+            session_row.updated_at = utc_now()
+            db.commit()
+            return True, snapshot
+
+    def create_artifact(
+        self, session_id: str, artifact: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        with self.SessionLocal() as db:
+            existing = db.scalar(
+                select(Study1ArtifactRow).where(
+                    Study1ArtifactRow.artifact_id == artifact["artifact_id"]
+                )
+            )
+            if existing:
+                return False, _artifact_row_dict(existing)
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if not session_row:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            db.add(
+                Study1ArtifactRow(
+                    artifact_id=artifact["artifact_id"],
+                    session_id=session_id,
+                    type=artifact["type"],
+                    version=artifact["version"],
+                    content=artifact.get("content"),
+                    storage_uri=artifact.get("storage_uri"),
+                    checksum=artifact["checksum"],
+                    created_at=artifact["created_at"],
+                    generator_version=artifact["generator_version"],
+                    artifact_metadata=artifact["metadata"],
+                )
+            )
+            snapshot = copy.deepcopy(session_row.payload)
+            if artifact["type"] == "summary":
+                snapshot["completion"]["summary_artifact_ready"] = True
+            db.add(_event_orm(_artifact_ready_event(snapshot, artifact)))
+            session_row.payload = snapshot
+            session_row.updated_at = utc_now()
+            db.commit()
+            return True, artifact
 
     def redeem_invite(
         self, token_hash: str, used_at: datetime
@@ -1301,14 +1441,99 @@ def _dashboard_payload(
     }
 
 
+def _media_command_event(
+    session: dict[str, Any], envelope: dict[str, Any], key: str
+) -> dict[str, Any]:
+    return {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session["session_id"],
+        "participant_id": "researcher",
+        "role": Study1Role.RESEARCHER.value,
+        "phase": session["phase"],
+        "phase_version": session["phase_version"],
+        "event_type": "media_command",
+        "occurred_at": envelope["issued_at"],
+        "payload": copy.deepcopy(envelope),
+        "idempotency_key": key,
+    }
+
+
+def _media_event_log(
+    session: dict[str, Any], envelope: dict[str, Any], key: str
+) -> dict[str, Any]:
+    return {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session["session_id"],
+        "participant_id": None,
+        "role": "proxy",
+        "phase": session["phase"],
+        "phase_version": session["phase_version"],
+        "event_type": "media_event",
+        "occurred_at": envelope["occurred_at"],
+        "payload": copy.deepcopy(envelope),
+        "idempotency_key": key,
+    }
+
+
+def _apply_media_event(session: dict[str, Any], envelope: dict[str, Any]) -> None:
+    if int(envelope["phase_version"]) != int(session["phase_version"]):
+        raise Study1ServiceError(
+            "STALE_MEDIA_EVENT", "Media event phase_version is stale", 409
+        )
+    event_type = envelope["event_type"]
+    if event_type not in EVENT_TYPES:
+        raise Study1ServiceError("UNKNOWN_MEDIA_EVENT", "Unknown media event type", 400)
+    if event_type == "MEDIA_READY":
+        session["media_service_status"] = "ready"
+    elif event_type == "MEDIA_ERROR":
+        session["media_service_status"] = "error"
+    elif event_type == "HANDOFF_COMPLETE":
+        if session["phase"] != Study1Phase.HANDOFF.value:
+            raise ActionNotAllowedInPhase(session["phase"], Study1Phase.HANDOFF.value)
+        session["completion"]["handoff_complete"] = True
+    elif event_type == "MEETING_ENDED":
+        if session["phase"] == Study1Phase.PROXY_MEETING.value:
+            session["completion"]["proxy_meeting_ended"] = True
+        elif session["phase"] == Study1Phase.SYNC_MEETING.value:
+            session["completion"]["sync_meeting_ended"] = True
+        else:
+            raise Study1ServiceError(
+                "MEETING_END_NOT_ALLOWED",
+                "MEETING_ENDED is valid only in a meeting phase",
+                409,
+            )
+
+
+def _artifact_ready_event(
+    session: dict[str, Any], artifact: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session["session_id"],
+        "participant_id": None,
+        "role": "proxy",
+        "phase": session["phase"],
+        "phase_version": session["phase_version"],
+        "event_type": "artifact_ready",
+        "occurred_at": utc_iso(artifact["created_at"]),
+        "payload": {
+            "artifact_id": artifact["artifact_id"],
+            "type": artifact["type"],
+            "version": artifact["version"],
+        },
+    }
+
+
 class Study1Service:
     def __init__(
         self,
         repository: InMemoryStudy1Repository | SqlAlchemyStudy1Repository,
         token_manager: Study1TokenManager | None = None,
+        media_gateway: MediaGateway | None = None,
     ):
         self.repository = repository
         self.tokens = token_manager or Study1TokenManager()
+        self.media_gateway = media_gateway or MockMediaGateway()
 
     def create_session(
         self,
@@ -1538,6 +1763,56 @@ class Study1Service:
     def researcher_dashboard(self, session_id: str) -> dict[str, Any]:
         return self.repository.dashboard(session_id)
 
+    def issue_media_command(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        command: str,
+        payload: dict[str, Any] | None = None,
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        if command not in COMMANDS:
+            raise Study1ServiceError("UNKNOWN_MEDIA_COMMAND", "Unknown command", 400)
+        session = self.repository.get_session(session_id)
+        if not session:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        required = {
+            "START_PROXY_MEETING": Study1Phase.PROXY_MEETING.value,
+            "BEGIN_HANDOFF": Study1Phase.HANDOFF.value,
+            "START_SYNC_MEETING": Study1Phase.SYNC_MEETING.value,
+        }.get(command)
+        if required and session["phase"] != required:
+            raise ActionNotAllowedInPhase(session["phase"], required)
+        envelope = {
+            "command_id": command_id or str(uuid.uuid4()),
+            "session_id": session_id,
+            "phase_version": session["phase_version"],
+            "command": command,
+            "issued_at": utc_iso(),
+            "payload": copy.deepcopy(payload or {}),
+        }
+        created = self.repository.record_media_command(session_id, envelope)
+        result = self.media_gateway.send_command(envelope)
+        return {"command": envelope, "duplicate": not created, "gateway": result}
+
+    def receive_media_event(self, data: dict[str, Any]) -> dict[str, Any]:
+        envelope = _validate_media_event_envelope(data)
+        processed, snapshot = self.repository.record_media_event(envelope)
+        return {
+            "processed": processed,
+            "duplicate": not processed,
+            "session": self.session_dto(snapshot),
+        }
+
+    def create_artifact(
+        self, session_id: str, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        artifact = _validate_artifact(session_id, data)
+        created, value = self.repository.create_artifact(session_id, artifact)
+        return {"created": created, "duplicate": not created, "artifact": value}
+
     def get_review(
         self, session_id: str, identity: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1644,3 +1919,72 @@ def _normalize_materials(
                 }
             )
     return rows
+
+
+def _validate_media_event_envelope(data: dict[str, Any]) -> dict[str, Any]:
+    required = (
+        "event_id",
+        "session_id",
+        "phase_version",
+        "event_type",
+        "occurred_at",
+    )
+    missing = [key for key in required if data.get(key) in (None, "")]
+    if missing:
+        raise Study1ServiceError(
+            "INVALID_MEDIA_EVENT", "Missing fields: " + ", ".join(missing), 400
+        )
+    if data["event_type"] not in EVENT_TYPES:
+        raise Study1ServiceError("UNKNOWN_MEDIA_EVENT", "Unknown media event type", 400)
+    return {
+        "event_id": str(data["event_id"]),
+        "session_id": str(data["session_id"]),
+        "phase_version": int(data["phase_version"]),
+        "event_type": str(data["event_type"]),
+        "occurred_at": str(data["occurred_at"]),
+        "payload": copy.deepcopy(data.get("payload") or {}),
+    }
+
+
+def _validate_artifact(session_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"transcript", "summary", "recording_manifest", "agent_log_manifest"}
+    artifact_type = str(data.get("type") or "")
+    if artifact_type not in allowed:
+        raise Study1ServiceError("INVALID_ARTIFACT_TYPE", "Invalid artifact type", 400)
+    content = data.get("content")
+    storage_uri = data.get("storage_uri")
+    if content is None and not storage_uri:
+        raise Study1ServiceError(
+            "INVALID_ARTIFACT", "content or storage_uri is required", 400
+        )
+    checksum_source = (
+        str(content).encode("utf-8")
+        if content is not None
+        else str(storage_uri).encode("utf-8")
+    )
+    computed = hashlib.sha256(checksum_source).hexdigest()
+    provided_checksum = str(data.get("checksum") or computed)
+    if content is not None and provided_checksum != computed:
+        raise Study1ServiceError("CHECKSUM_MISMATCH", "Artifact checksum mismatch", 422)
+    created_at = data.get("created_at")
+    if created_at:
+        try:
+            created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        except ValueError as error:
+            raise Study1ServiceError(
+                "INVALID_ARTIFACT_TIMESTAMP", "created_at must be ISO-8601", 400
+            ) from error
+    else:
+        created = utc_now()
+    return {
+        "artifact_id": str(data.get("artifact_id") or uuid.uuid4()),
+        "session_id": session_id,
+        "type": artifact_type,
+        "version": str(data.get("version") or "1"),
+        "content": str(content) if content is not None else None,
+        "storage_uri": str(storage_uri) if storage_uri else None,
+        "checksum": provided_checksum,
+        "created_at": created,
+        "generator_version": str(data.get("generator_version") or "unknown"),
+        "metadata": copy.deepcopy(data.get("metadata") or {}),
+    }

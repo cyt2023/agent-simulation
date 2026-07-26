@@ -9,6 +9,8 @@ import {
   getStudy1Identity,
   listStudy1Sessions,
   researcherLogin,
+  issueStudy1MediaCommand,
+  completeMockMedia,
   transitionPhase,
 } from '../services/study1Api.js'
 import {
@@ -151,6 +153,31 @@ async function addIncident() {
   }
 }
 
+async function startMockMedia() {
+  const commandByPhase = {
+    PROXY_MEETING: 'START_PROXY_MEETING',
+    HANDOFF: 'BEGIN_HANDOFF',
+    SYNC_MEETING: 'START_SYNC_MEETING',
+  }
+  const command = commandByPhase[dashboard.value?.phase]
+  if (!command) return
+  try {
+    await issueStudy1MediaCommand(selectedSessionId.value, command)
+    await refreshDashboard()
+  } catch (reason) {
+    error.value = reason.message
+  }
+}
+
+async function confirmMockComplete() {
+  try {
+    await completeMockMedia(selectedSessionId.value)
+    await refreshDashboard()
+  } catch (reason) {
+    error.value = reason.message
+  }
+}
+
 function handleStudyEvent(event) {
   if (event?.session_id === selectedSessionId.value) refreshDashboard()
 }
@@ -262,6 +289,20 @@ onUnmounted(() => {
           <button :disabled="busy || ['terminated','completed'].includes(dashboard.status)" @click="control('terminate', { reason: 'researcher action' })">Terminate</button>
           <button class="danger" :disabled="busy || !nextPhase" @click="advance(true)">Force Advance</button>
           <button :disabled="busy" @click="addIncident">Add Incident</button>
+          <button
+            v-if="['PROXY_MEETING','HANDOFF','SYNC_MEETING'].includes(dashboard.phase)"
+            :disabled="busy"
+            @click="startMockMedia"
+          >
+            Issue Mock Media Command
+          </button>
+          <button
+            v-if="['PROXY_MEETING','HANDOFF','SYNC_MEETING'].includes(dashboard.phase)"
+            :disabled="busy"
+            @click="confirmMockComplete"
+          >
+            Confirm Mock Complete
+          </button>
           <button disabled title="Added with the export commit">Export Data</button>
         </section>
       </template>

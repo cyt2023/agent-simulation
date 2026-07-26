@@ -113,6 +113,20 @@ export function addStudy1Incident(sessionId, payload) {
   })
 }
 
+export function issueStudy1MediaCommand(sessionId, command, payload = {}) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/media-commands`, {
+    method: 'POST',
+    body: JSON.stringify({ command, payload }),
+  })
+}
+
+export function completeMockMedia(sessionId) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/mock-media/complete`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+}
+
 export function transitionPhase(sessionId, targetPhase, { override = false, reason = null } = {}) {
   return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/transition`, {
     method: 'POST',

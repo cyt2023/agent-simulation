@@ -30,6 +30,7 @@ def study1_client(memory_service, monkeypatch):
 
     monkeypatch.setenv("STUDY1_TOKEN_SECRET", "test-only-secret")
     monkeypatch.setenv("STUDY1_RESEARCHER_KEY", "researcher-test-key")
+    monkeypatch.setenv("STUDY1_INTERNAL_API_KEY", "internal-test-key")
     app = Flask(__name__)
     app.register_blueprint(study1_bp)
     set_service_for_testing(memory_service)

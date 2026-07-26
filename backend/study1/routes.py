@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import uuid
+
 from flask import Blueprint, g, jsonify, request
 
 from .models import HUMAN_ROLES, Study1Role
@@ -9,6 +12,7 @@ from .permissions import (
     AuthenticationError,
     Study1TokenManager,
     require_study1_auth,
+    require_study1_internal,
     verify_researcher_key,
 )
 from .services import (
@@ -189,7 +193,7 @@ def transition_study1_phase(session_id: str):
             get_socketio().emit(
                 "study1_readiness_updated", payload, room=session_id
             )
-        except RuntimeError:
+        except (RuntimeError, ImportError):
             pass
         return jsonify(result), 200
     except Study1ServiceError as error:
@@ -288,7 +292,7 @@ def create_study1_incident(session_id: str):
                 },
                 room=session_id,
             )
-        except RuntimeError:
+        except (RuntimeError, ImportError):
             pass
         return jsonify(
             {
@@ -319,5 +323,129 @@ def _emit_control_events(session_id: str, action: str, session: dict):
             {"session_id": session_id, **session},
             room=session_id,
         )
-    except RuntimeError:
+    except (RuntimeError, ImportError):
+        pass
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/media-commands")
+@require_study1_auth([Study1Role.RESEARCHER])
+def create_study1_media_command(session_id: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().issue_media_command(
+            session_id,
+            g.study1_identity.as_actor(),
+            str(data.get("command") or ""),
+            data.get("payload") or {},
+            data.get("command_id"),
+        )
+        return jsonify(result), 202
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/mock-media/complete")
+@require_study1_auth([Study1Role.RESEARCHER])
+def complete_study1_mock_media(session_id: str):
+    """Researcher-only Mock gateway completion; never starts real media."""
+    try:
+        snapshot = get_service().repository.get_session(session_id)
+        if not snapshot:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        event_by_phase = {
+            "PROXY_MEETING": "MEETING_ENDED",
+            "HANDOFF": "HANDOFF_COMPLETE",
+            "SYNC_MEETING": "MEETING_ENDED",
+        }
+        event_type = event_by_phase.get(snapshot["phase"])
+        if not event_type:
+            raise Study1ServiceError(
+                "MOCK_COMPLETION_NOT_ALLOWED",
+                "Current phase has no Mock media completion",
+                409,
+            )
+        result = get_service().receive_media_event(
+            {
+                "event_id": str(uuid.uuid4()),
+                "session_id": session_id,
+                "phase_version": snapshot["phase_version"],
+                "event_type": event_type,
+                "occurred_at": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "payload": {"source": "researcher_mock_confirmation"},
+            }
+        )
+        _emit_media_update(session_id, result)
+        return jsonify(result), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/internal/study1/media-events")
+@require_study1_internal
+def receive_study1_media_event():
+    try:
+        result = get_service().receive_media_event(request.get_json(silent=True) or {})
+        _emit_media_update(result["session"]["session_id"], result)
+        return jsonify(result), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/internal/study1/sessions/<session_id>/artifacts")
+@require_study1_internal
+def receive_study1_artifact(session_id: str):
+    try:
+        result = get_service().create_artifact(
+            session_id, request.get_json(silent=True) or {}
+        )
+        artifact = result["artifact"]
+        try:
+            from websocket.handlers import get_socketio
+
+            get_socketio().emit(
+                "study1_artifact_ready",
+                {
+                    "session_id": session_id,
+                    "artifact_id": artifact["artifact_id"],
+                    "type": artifact["type"],
+                    "version": artifact["version"],
+                },
+                room=session_id,
+            )
+        except (RuntimeError, ImportError):
+            pass
+        return (
+            jsonify(
+                {
+                    **result,
+                    "artifact": {
+                        **artifact,
+                        "created_at": (
+                            artifact["created_at"]
+                            .isoformat()
+                            .replace("+00:00", "Z")
+                            if hasattr(artifact["created_at"], "isoformat")
+                            else artifact["created_at"]
+                        ),
+                    },
+                }
+            ),
+            201 if result["created"] else 200,
+        )
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+def _emit_media_update(session_id: str, result: dict):
+    try:
+        from websocket.handlers import get_socketio
+
+        get_socketio().emit(
+            "study1_readiness_updated",
+            {"session_id": session_id, **result["session"]},
+            room=session_id,
+        )
+    except (RuntimeError, ImportError):
         pass

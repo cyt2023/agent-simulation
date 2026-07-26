@@ -123,6 +123,34 @@ def verify_researcher_key(provided: str) -> None:
         raise AuthenticationError("INVALID_RESEARCHER_KEY", "Invalid researcher key")
 
 
+def verify_internal_key(provided: str) -> None:
+    configured = os.environ.get("STUDY1_INTERNAL_API_KEY", "")
+    if not configured:
+        raise AuthenticationError(
+            "INTERNAL_AUTH_NOT_CONFIGURED",
+            "Study 1 internal API authentication is not configured",
+            503,
+        )
+    if not hmac.compare_digest(configured, provided or ""):
+        raise AuthenticationError("INVALID_INTERNAL_API_KEY", "Invalid internal API key")
+
+
+def require_study1_internal(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            provided = request.headers.get("X-Study1-Internal-Key", "")
+            verify_internal_key(provided)
+            return function(*args, **kwargs)
+        except AuthenticationError as error:
+            return (
+                jsonify({"error": error.code, "message": str(error)}),
+                error.status,
+            )
+
+    return wrapped
+
+
 def bearer_token_from_request() -> str:
     value = request.headers.get("Authorization", "")
     scheme, _, token = value.partition(" ")
