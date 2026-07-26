@@ -14,11 +14,44 @@ let scrollTimer = null
 
 const transcriptSegments = computed(() => {
   const content = transcript.value?.content || ''
+  try {
+    const parsed = JSON.parse(content)
+    if (Array.isArray(parsed)) {
+      return parsed.map((segment, index) => {
+        const sourceId = String(segment.segment_id || index + 1)
+        return {
+          id: `segment-${sourceId.replace(/[^A-Za-z0-9_-]/g, '-')}`,
+          sourceId,
+          text: `[${formatTime(segment.start_ms)}] ${roleLabel(segment.speaker)}: ${segment.text || ''}`,
+        }
+      })
+    }
+  } catch {
+    // Older A artifacts stored one already-rendered segment per line.
+  }
   return content.split(/\r?\n/).filter(Boolean).map((text, index) => ({
     id: `segment-${index + 1}`,
+    sourceId: `legacy-${index + 1}`,
     text,
   }))
 })
+
+function formatTime(value) {
+  const milliseconds = Math.max(0, Number(value) || 0)
+  const minutes = Math.floor(milliseconds / 60000)
+  const seconds = Math.floor((milliseconds % 60000) / 1000)
+  const remainder = Math.floor(milliseconds % 1000)
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(remainder).padStart(3, '0')}`
+}
+
+function roleLabel(role) {
+  return {
+    principal: 'P',
+    teammate_1: 'T1',
+    teammate_2: 'T2',
+    proxy: 'X',
+  }[role] || role || 'Unknown'
+}
 
 function log(eventType, payload = {}) {
   return logReviewUiEvent(props.sessionId, eventType, payload).catch(() => {})
@@ -95,7 +128,7 @@ onUnmounted(() => {
           v-for="segment in transcriptSegments"
           :id="segment.id"
           :key="segment.id"
-          @mouseenter="log('transcript_segment_view', { segment_id: segment.id })"
+          @mouseenter="log('transcript_segment_view', { segment_id: segment.sourceId })"
         >
           {{ segment.text }}
         </p>

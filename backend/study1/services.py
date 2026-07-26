@@ -7,6 +7,7 @@ import copy
 import io
 import json
 import os
+import re
 import secrets
 import threading
 import uuid
@@ -29,7 +30,13 @@ from .models import (
     Study1Role,
     Study1SubmissionRow,
 )
-from .media_gateway import COMMANDS, EVENT_TYPES, MediaGateway, MockMediaGateway
+from .media_gateway import (
+    COMMANDS,
+    EVENT_TYPES,
+    MediaGateway,
+    MediaGatewayError,
+    create_media_gateway_from_env,
+)
 from .permissions import Study1TokenManager
 from .state_machine import (
     InvalidTransition,
@@ -1627,7 +1634,7 @@ class Study1Service:
     ):
         self.repository = repository
         self.tokens = token_manager or Study1TokenManager()
-        self.media_gateway = media_gateway or MockMediaGateway()
+        self.media_gateway = media_gateway or create_media_gateway_from_env()
 
     def create_session(
         self,
@@ -1803,6 +1810,10 @@ class Study1Service:
         payload: dict[str, Any],
         client_timestamp: str | None = None,
     ) -> dict[str, Any]:
+        if submission_type == "proxy_config":
+            self._validate_proxy_config_authorization(
+                session_id, identity, payload
+            )
         parsed_client_time = None
         if client_timestamp:
             try:
@@ -1823,6 +1834,48 @@ class Study1Service:
             payload,
             parsed_client_time,
         )
+
+    def _validate_proxy_config_authorization(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        if identity.get("role") != Study1Role.PRINCIPAL.value:
+            return
+        if not isinstance(payload, dict) or payload.get("authorization_confirmed") is not True:
+            raise Study1ServiceError(
+                "PROXY_AUTHORIZATION_REQUIRED",
+                "P must explicitly confirm the Proxy material authorization",
+                400,
+            )
+        material_ids = payload.get("authorized_material_ids")
+        if not isinstance(material_ids, list) or any(
+            not isinstance(item, str) or not item for item in material_ids
+        ):
+            raise Study1ServiceError(
+                "INVALID_PROXY_MATERIAL_AUTHORIZATION",
+                "authorized_material_ids must be a list of material IDs",
+                400,
+            )
+        if len(set(material_ids)) != len(material_ids):
+            raise Study1ServiceError(
+                "INVALID_PROXY_MATERIAL_AUTHORIZATION",
+                "authorized_material_ids must not contain duplicates",
+                400,
+            )
+        principal_material_ids = {
+            item["material_id"]
+            for item in self.repository.list_materials(
+                session_id, Study1Role.PRINCIPAL.value
+            )
+        }
+        if not set(material_ids) <= principal_material_ids:
+            raise Study1ServiceError(
+                "INVALID_PROXY_MATERIAL_AUTHORIZATION",
+                "P can authorize only P's own Hidden Profile materials",
+                400,
+            )
 
     def revise_submission(
         self,
@@ -1932,29 +1985,235 @@ class Study1Service:
             "START_PROXY_MEETING": Study1Phase.PROXY_MEETING.value,
             "BEGIN_HANDOFF": Study1Phase.HANDOFF.value,
             "START_SYNC_MEETING": Study1Phase.SYNC_MEETING.value,
+            "REGENERATE_SUMMARY": Study1Phase.REVIEW.value,
         }.get(command)
         if required and session["phase"] != required:
             raise ActionNotAllowedInPhase(session["phase"], required)
+        command_payload = copy.deepcopy(payload or {})
+        if command == "START_PROXY_MEETING":
+            command_payload = {
+                "authorized_context": self._proxy_authorized_context(session_id)
+            }
+        if command == "END_CURRENT_MEETING" and session["phase"] not in (
+            Study1Phase.PROXY_MEETING.value,
+            Study1Phase.SYNC_MEETING.value,
+        ):
+            raise Study1ServiceError(
+                "MEDIA_COMMAND_NOT_ALLOWED",
+                "END_CURRENT_MEETING requires an active meeting phase",
+                409,
+            )
         envelope = {
             "command_id": command_id or str(uuid.uuid4()),
             "session_id": session_id,
             "phase_version": session["phase_version"],
             "command": command,
             "issued_at": utc_iso(),
-            "payload": copy.deepcopy(payload or {}),
+            "payload": command_payload,
         }
         created = self.repository.record_media_command(session_id, envelope)
-        result = (
-            self.media_gateway.send_command(envelope)
-            if created
-            else {
-                "accepted": True,
-                "duplicate": True,
-                "command_id": envelope["command_id"],
-                "mode": "idempotent-replay",
-            }
-        )
+        try:
+            result = self.media_gateway.send_command(envelope)
+        except MediaGatewayError as error:
+            raise Study1ServiceError(
+                "MEDIA_SERVICE_UNAVAILABLE", str(error), 502
+            ) from error
         return {"command": envelope, "duplicate": not created, "gateway": result}
+
+    def _proxy_authorized_context(self, session_id: str) -> dict[str, Any]:
+        data = self.repository.export_data(session_id)
+        configs = [
+            item
+            for item in data.get("submissions") or []
+            if item.get("submission_type") == "proxy_config"
+            and item.get("role") == Study1Role.PRINCIPAL.value
+            and item.get("locked", True)
+        ]
+        config = configs[-1] if configs else None
+        if not config:
+            raise Study1ServiceError(
+                "PROXY_CONFIGURATION_REQUIRED",
+                "P must submit and lock Proxy configuration before the meeting",
+                409,
+            )
+        config_payload = copy.deepcopy(config.get("payload") or {})
+        if config_payload.get("authorization_confirmed") is not True:
+            raise Study1ServiceError(
+                "PROXY_AUTHORIZATION_REQUIRED",
+                "P must explicitly authorize Proxy materials before the meeting",
+                409,
+            )
+        authorized_ids = config_payload.get("authorized_material_ids")
+        if not isinstance(authorized_ids, list):
+            raise Study1ServiceError(
+                "INVALID_PROXY_MATERIAL_AUTHORIZATION",
+                "Proxy material authorization is invalid",
+                409,
+            )
+        authorized_id_set = set(authorized_ids)
+        materials = [
+            {
+                key: item.get(key)
+                for key in ("material_id", "title", "content", "storage_uri", "checksum")
+            }
+            for item in data.get("materials") or []
+            if item.get("role") == Study1Role.PRINCIPAL.value
+            and item.get("material_id") in authorized_id_set
+        ]
+        if {item["material_id"] for item in materials} != authorized_id_set:
+            raise Study1ServiceError(
+                "INVALID_PROXY_MATERIAL_AUTHORIZATION",
+                "Authorized Proxy material no longer belongs to P",
+                409,
+            )
+        config_id = config["submission_id"]
+        return {
+            "authorization_submission_id": config_id,
+            "proxy_config_submission_id": config_id,
+            "materials": materials,
+            "proxy_config": config_payload,
+        }
+
+    def issue_media_access(
+        self, session_id: str, identity: dict[str, Any]
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if not session:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        role = str(identity.get("role") or "")
+        allowed = {
+            Study1Phase.PROXY_MEETING.value: {
+                Study1Role.TEAMMATE_1.value,
+                Study1Role.TEAMMATE_2.value,
+            },
+            Study1Phase.SYNC_MEETING.value: {
+                Study1Role.PRINCIPAL.value,
+                Study1Role.TEAMMATE_1.value,
+                Study1Role.TEAMMATE_2.value,
+            },
+        }
+        if role not in allowed.get(session["phase"], set()):
+            raise Study1ServiceError(
+                "MEDIA_ACCESS_FORBIDDEN",
+                "Role is not allowed in the current media room",
+                403,
+            )
+        request_payload = {
+            "session_id": session_id,
+            "phase": session["phase"],
+            "phase_version": session["phase_version"],
+            "role": role,
+            "participant_id": identity["participant_id"],
+        }
+        try:
+            return self.media_gateway.issue_access(request_payload)
+        except MediaGatewayError as error:
+            raise Study1ServiceError(
+                "MEDIA_SERVICE_UNAVAILABLE", str(error), 502
+            ) from error
+
+    def media_status(self, session_id: str) -> dict[str, Any]:
+        if not self.repository.get_session(session_id):
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        try:
+            return self.media_gateway.get_status(session_id)
+        except MediaGatewayError as error:
+            raise Study1ServiceError(
+                "MEDIA_SERVICE_UNAVAILABLE", str(error), 502
+            ) from error
+
+    def get_recording(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        recording_id: str,
+        range_header: str | None,
+    ):
+        session = self.repository.get_session(session_id)
+        if not session:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        allowed_phases = (
+            Study1Phase.REVIEW.value,
+            Study1Phase.COMPREHENSION_MEASUREMENT.value,
+        )
+        if (
+            identity.get("role") != Study1Role.PRINCIPAL.value
+            or session["phase"] not in allowed_phases
+            or not session.get("completion", {}).get(
+                "delegation_expectation:principal"
+            )
+        ):
+            raise Study1ServiceError(
+                "MEDIA_REPLAY_FORBIDDEN",
+                "Recording replay is available only to P during Review",
+                403,
+            )
+        if not re.fullmatch(r"[A-Za-z0-9_-]+\.wav", recording_id):
+            raise Study1ServiceError(
+                "RECORDING_NOT_FOUND", "Recording not found", 404
+            )
+        if not range_header or not re.fullmatch(r"bytes=\d+-\d*", range_header):
+            raise Study1ServiceError(
+                "RECORDING_RANGE_REQUIRED",
+                "A bounded byte Range is required",
+                416,
+            )
+        start_text, end_text = range_header[6:].split("-", 1)
+        start = int(start_text)
+        end = int(end_text) if end_text else start + 1_048_575
+        if end < start or end - start + 1 > 1_048_576:
+            raise Study1ServiceError(
+                "RECORDING_RANGE_TOO_LARGE",
+                "Recording Range cannot exceed 1 MiB",
+                416,
+            )
+        bounded_range = f"bytes={start}-{end}"
+        try:
+            return self.media_gateway.get_recording(
+                session_id, recording_id, bounded_range
+            )
+        except MediaGatewayError as error:
+            raise Study1ServiceError(
+                "MEDIA_SERVICE_UNAVAILABLE", str(error), 502
+            ) from error
+
+    def report_media_device(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if not session:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        state = str(data.get("state") or "")
+        if state not in {"ready", "denied", "missing", "error"}:
+            raise Study1ServiceError(
+                "INVALID_DEVICE_STATE", "Invalid microphone device state", 400
+            )
+        device = data.get("device") or {}
+        if not isinstance(device, dict):
+            raise Study1ServiceError(
+                "INVALID_DEVICE", "device must be an object", 400
+            )
+        payload = {
+            "session_id": session_id,
+            "phase_version": session["phase_version"],
+            "participant_id": identity["participant_id"],
+            "role": identity["role"],
+            "state": state,
+            "device": {
+                key: str(device.get(key) or "")[:256]
+                for key in ("kind", "label")
+                if device.get(key)
+            },
+        }
+        try:
+            return self.media_gateway.report_device(payload)
+        except MediaGatewayError as error:
+            raise Study1ServiceError(
+                "MEDIA_SERVICE_UNAVAILABLE", str(error), 502
+            ) from error
 
     def receive_media_event(self, data: dict[str, Any]) -> dict[str, Any]:
         envelope = _validate_media_event_envelope(data)
@@ -1973,9 +2232,14 @@ class Study1Service:
         return {"created": created, "duplicate": not created, "artifact": value}
 
     def export_bundle(self, session_id: str):
-        from .export_service import build_study1_export
+        from .export_service import build_study1_export, merge_media_export
 
-        return build_study1_export(self.repository.export_data(session_id))
+        workflow = build_study1_export(self.repository.export_data(session_id))
+        try:
+            media = self.media_gateway.export_bundle(session_id)
+            return merge_media_export(workflow, media)
+        except MediaGatewayError as error:
+            return merge_media_export(workflow, None, str(error))
 
     def get_review(
         self, session_id: str, identity: dict[str, Any]

@@ -129,6 +129,24 @@ export function issueStudy1MediaCommand(sessionId, command, payload = {}) {
   })
 }
 
+export function fetchMediaAccess(sessionId) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/media-access`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+}
+
+export function fetchMediaStatus(sessionId) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/media-status`)
+}
+
+export function reportMediaDevice(sessionId, payload) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/media-device`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
 export function completeMockMedia(sessionId) {
   return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/mock-media/complete`, {
     method: 'POST',

@@ -47,7 +47,7 @@ A 仍然是 Session、角色、权限、实验阶段、问卷、投票、Review�
 - 私聊、交易面板或其他旧实验交互；
 - B 自主开始、暂停、推进或结束 A 的实验阶段；
 - B 直接查询 A 的 participant、material、submission 或 session 数据表；
-- 多副本 B 服务。v1 使用单 B 实例和 SQLite WAL；横向扩展时再将运行库迁移到独立 PostgreSQL。
+- 多副本 B 服务。v1 使用单 B 实例和独立 PostgreSQL schema；横向扩展时再引入租约协调或消息队列。
 
 ## 4. 总体实验流程
 
@@ -106,7 +106,7 @@ flowchart LR
     X["单一 Proxy Runtime"] -->|"一条 X 音频轨道"| LK
     B --> X
 
-    B --> DB["B SQLite WAL"]
+    B --> DB["B PostgreSQL：study1_media schema"]
     B --> FS["B 媒体持久卷"]
 ```
 
@@ -125,7 +125,7 @@ flowchart LR
 - LiveKit Server OSS：RTC 房间和媒体分发；
 - LiveKit Python RTC/Agents SDK：服务端订阅、X 音频发布和 room 管理；
 - Vue 3 + `livekit-client`：Study 1 纯语音界面；
-- SQLAlchemy + SQLite WAL：B 的幂等、运行状态和 outbox；
+- SQLAlchemy + PostgreSQL：B 的幂等、运行状态和 outbox。B 使用独立 `study1_media` schema/user，其凭据不能访问 A 的 `humanagent_collab` schema；
 - Pydantic：命令、事件、artifact 和内部响应校验；
 - HTTPX：B → A 回调和 A → B 内部调用；
 - PyAV/FFmpeg：音频解码、重采样和 FLAC 写入；
@@ -610,7 +610,7 @@ Researcher 控制台增加媒体状态区：
 
 ## 14. B 数据模型
 
-B 的 SQLite 使用 WAL 和挂载卷，至少包含以下表：
+B 使用 PostgreSQL 中独立的 `study1_media` schema 和专用数据库用户，至少包含以下表。它可以与 A 共用 PostgreSQL cluster，但 B 的凭据不得访问 `humanagent_collab`：
 
 ### `commands`
 
@@ -758,7 +758,7 @@ media/
 - token grant 禁止摄像头、屏幕、data message 和 room admin；
 - participant display name 使用角色或研究编号，不使用真实姓名；
 - B 日志采用 allowlist 字段，不记录 Authorization header、JWT、API key 或完整私有材料；
-- 媒体 volume 和 B SQLite 只挂载到 B；A 通过内部 export 接口读取 bundle；
+- 媒体 volume 只挂载到 B，B 的 PostgreSQL 凭据只允许访问 `study1_media`；A 通过内部 export 接口读取 bundle；
 - 回放音频必须由 A 逐次鉴权代理，B 拒绝目录遍历、跨 Session path 和未带 Range 上限的大文件读取；
 - Summary 不能读取 P 的 delegation expectation 或 comprehension response；
 - P 的隔离由房间级授权执行，不依赖 CSS、静音或隐藏播放器。

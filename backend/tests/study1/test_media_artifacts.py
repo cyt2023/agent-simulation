@@ -20,15 +20,15 @@ def test_mock_gateway_command_is_idempotent(memory_service):
     snapshot["phase_version"] = 5
     command_id = str(uuid.uuid4())
     first = memory_service.issue_media_command(
-        session_id, RESEARCHER, "START_PROXY_MEETING", command_id=command_id
+        session_id, RESEARCHER, "END_CURRENT_MEETING", command_id=command_id
     )
     second = memory_service.issue_media_command(
-        session_id, RESEARCHER, "START_PROXY_MEETING", command_id=command_id
+        session_id, RESEARCHER, "END_CURRENT_MEETING", command_id=command_id
     )
     assert first["command"]["phase_version"] == 5
     assert first["gateway"]["mode"] == "mock"
     assert second["duplicate"] is True
-    assert second["gateway"]["mode"] == "idempotent-replay"
+    assert second["gateway"]["duplicate"] is True
     assert len(memory_service.media_gateway.commands) == 1
     assert (
         len(

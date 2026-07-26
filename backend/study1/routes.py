@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import uuid
 
-from flask import Blueprint, g, jsonify, request, send_file
+from flask import Blueprint, Response, g, jsonify, request, send_file
 
 from .models import HUMAN_ROLES, Study1Role
 from .permissions import (
@@ -345,6 +345,71 @@ def create_study1_media_command(session_id: str):
             data.get("command_id"),
         )
         return jsonify(result), 202
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/media-access")
+@require_study1_auth(HUMAN_ROLES)
+def create_study1_media_access(session_id: str):
+    try:
+        return jsonify(
+            get_service().issue_media_access(
+                session_id, g.study1_identity.as_actor()
+            )
+        ), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/media-device")
+@require_study1_auth(HUMAN_ROLES)
+def report_study1_media_device(session_id: str):
+    try:
+        return jsonify(
+            get_service().report_media_device(
+                session_id,
+                g.study1_identity.as_actor(),
+                request.get_json(silent=True) or {},
+            )
+        ), 202
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/media-status")
+@require_study1_auth([Study1Role.RESEARCHER])
+def get_study1_media_status(session_id: str):
+    try:
+        return jsonify(get_service().media_status(session_id)), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.get(
+    "/api/study1/sessions/<session_id>/recordings/<recording_id>"
+)
+@require_study1_auth([Study1Role.PRINCIPAL])
+def replay_study1_recording(session_id: str, recording_id: str):
+    try:
+        upstream = get_service().get_recording(
+            session_id,
+            g.study1_identity.as_actor(),
+            recording_id,
+            request.headers.get("Range"),
+        )
+        headers = {
+            key: value
+            for key, value in upstream.headers.items()
+            if key.lower()
+            in {"content-type", "content-range", "accept-ranges", "content-length"}
+        }
+        return Response(
+            upstream.content,
+            status=upstream.status_code,
+            headers=headers,
+            direct_passthrough=False,
+        )
     except Study1ServiceError as error:
         return _service_error(error)
 
