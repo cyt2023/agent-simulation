@@ -162,3 +162,24 @@ class Study1IncidentRow(Base):
     metadata_payload: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSON_VALUE, nullable=False
     )
+
+
+class Study1MaterialRow(Base):
+    __tablename__ = "study1_materials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    material_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
+    session_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    storage_uri: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    checksum: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    metadata_payload: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON_VALUE, nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_study1_materials_session_role", "session_id", "role"),
+    )
