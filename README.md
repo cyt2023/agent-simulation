@@ -199,7 +199,8 @@ events, and a versioned ZIP export.
 
 Study 1 does **not** implement a live meeting, LiveKit, RTC/WebRTC, microphone
 access, ASR, TTS, a Proxy runtime, or audio recording. See
-`backend/study1/README.md` and `contracts/study1-media-contract.md`.
+`docs/study1-integration-guide.md`, `backend/study1/README.md`, and
+`contracts/study1-media-contract.md`.
 
 - Multiple experiment paradigms managed through the researcher dashboard
 - Human-AI mixed collaboration within the same session
