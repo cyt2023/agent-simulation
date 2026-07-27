@@ -27,6 +27,11 @@ def test_compose_wires_livekit_media_and_a_b_boundary():
     assert "7880" in livekit_ports
     assert "7881" in livekit_ports
     assert "50000-50100" in livekit_ports
+    assert services["livekit"]["healthcheck"]["test"] == [
+        "CMD",
+        "/livekit-server",
+        "--version",
+    ]
 
 
 def test_example_environment_names_every_media_secret_without_real_values():

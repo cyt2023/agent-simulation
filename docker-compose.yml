@@ -77,7 +77,7 @@ services:
     volumes:
       - ./livekit.yaml:/etc/livekit.yaml:ro
     healthcheck:
-      test: ["CMD", "livekit-server", "--version"]
+      test: ["CMD", "/livekit-server", "--version"]
       interval: 10s
       timeout: 5s
       retries: 5
