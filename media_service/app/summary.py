@@ -24,24 +24,34 @@ class SummaryResult:
 
 NEUTRAL_SUMMARY_PROMPT = """You create a factual meeting record from the supplied transcript only.
 Return exactly one JSON object shaped as {"items":[{"text":"...","segment_ids":["..."]}]}.
-Each item must copy factual wording closely from its cited final transcript segments. Do not put
+Each item must stay factual and closely grounded in its cited final transcript segments. Do not put
 speaker labels in text because the server adds attribution. Cite every claim with one or more
-supplied segment_ids. Do not recommend, rank, persuade, address the reader, infer motives, or
-introduce facts absent from the cited segments. Omit a claim when evidence is incomplete."""
+supplied segment_ids. Do not recommend, rank, persuade, address the reader, infer motives, declare
+a final decision, or introduce facts absent from the cited segments. When speakers use normative
+language, report it descriptively as a proposal, concern, or disagreement without repeating words
+such as should, must, best, or final. Omit a claim when evidence is incomplete."""
 
 _PROHIBITED_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"\byou\s+(?:should|must|ought\s+to|need\s+to)\b",
+        r"\b(?:you|we|the\s+team|participants?|t1|t2|p)\s+(?:should|must|ought\s+to|need\s+to)\b",
+        r"\b(?:should|must|ought\s+to|need\s+to)\s+(?:choose|select|adopt|use|go\s+with|decide|vote|support)\b",
         r"\b(?:we\s+)?recommend(?:ed|ation)?\b",
+        r"\b(?:advise|advises|advised|persuade|persuades|persuaded|convince|convinces|convinced)\b",
         r"\b(?:best|better|preferable|advisable|optimal)\b",
         r"\b(?:clearly|definitely|obviously)\s+(?:choose|select|prefer)\b",
-        r"\b(?:choose|select|go\s+with)\b",
+        r"\b(?:choose|select|go\s+with|adopt)\b",
+        r"\bfinal\s+(?:decision|choice|answer)\b",
+        r"\b(?:overall|therefore|thus|in\s+conclusion|on\s+balance)\b.*\b(?:decision|choice|answer|choose|select|adopt|go\s+with)\b",
         "\u4f60\u5e94\u8be5",
         "\u4f60\u5fc5\u987b",
         "\u5efa\u8bae(?:\u9009\u62e9)?",
+        "\u8bf4\u670d",
         "\u6700\u4f73\u9009\u62e9",
         "\u66f4\u597d\u7684?\u9009\u62e9",
+        "\u6700\u7ec8(?:\u51b3\u5b9a|\u9009\u62e9|\u7b54\u6848)",
+        "(?:\u5e94\u8be5|\u5e94\u5f53|\u5fc5\u987b|\u9700\u8981)\\s*(?:\u9009\u62e9|\u91c7\u7eb3|\u91c7\u7528|\u51b3\u5b9a|\u652f\u6301)",
+        "(?:\u7efc\u5408\u6765\u770b|\u56e0\u6b64|\u6240\u4ee5|\u7ed3\u8bba\u662f).*(?:\u9009\u62e9|\u91c7\u7eb3|\u91c7\u7528|\u51b3\u5b9a|\u7b54\u6848)",
     )
 )
 
@@ -91,6 +101,17 @@ def _speaker_label(speaker: str) -> str:
         "teammate_2": "T2",
         "proxy": "X",
     }.get(speaker, speaker)
+
+
+def validate_neutral_language(text: str, *, surface: str) -> None:
+    violation = next(
+        (pattern.pattern for pattern in _PROHIBITED_PATTERNS if pattern.search(text)),
+        None,
+    )
+    if violation:
+        raise NeutralityError(
+            f"{surface} failed neutral-language validation: {violation}"
+        )
 
 
 class SummaryService:
@@ -153,14 +174,7 @@ class SummaryService:
             segment_ids = item.get("segment_ids")
             if not text or not isinstance(segment_ids, list) or not segment_ids:
                 raise NeutralityError("Summary item requires text and segment_ids")
-            violation = next(
-                (pattern.pattern for pattern in _PROHIBITED_PATTERNS if pattern.search(text)),
-                None,
-            )
-            if violation:
-                raise NeutralityError(
-                    f"Summary failed neutral-language validation: {violation}"
-                )
+            validate_neutral_language(text, surface="Summary")
             unknown = [segment_id for segment_id in segment_ids if segment_id not in by_id]
             if unknown:
                 raise NeutralityError(

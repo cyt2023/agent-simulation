@@ -112,6 +112,48 @@ async def test_summary_rejects_recommendations():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The team should use the north route.",
+        "Overall, the final decision is the north route.",
+        "\u7efc\u5408\u6765\u770b\uff0c\u5e94\u8be5\u91c7\u7eb3\u5317\u7ebf\u65b9\u6848\u3002",
+    ],
+)
+async def test_summary_rejects_normative_or_conclusive_framing(text):
+    llm = FakeLlm(
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "text": text,
+                        "segment_ids": ["seg-1"],
+                    }
+                ]
+            }
+        )
+    )
+    service = SummaryService(llm, prompt_version="neutral-summary-v1")
+    segment = TranscriptSegment(
+        segment_id="seg-1",
+        session_id="session-1",
+        runtime_id="runtime-1",
+        speaker="teammate_1",
+        start_ms=0,
+        end_ms=1000,
+        text=text,
+        confidence=0.9,
+        is_final=True,
+        provider_version="mock-asr-v1",
+    )
+
+    with pytest.raises(NeutralityError, match="neutral-language"):
+        await service.generate([segment])
+
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_summary_rejects_unknown_segments_and_outside_facts_after_one_retry():
     llm = FakeLlm(
         json.dumps(

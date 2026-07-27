@@ -7,7 +7,7 @@ import zipfile
 
 import pytest
 
-from media_service.app.pipeline import ProxyMediaPipeline
+from media_service.app.pipeline import PROXY_PROMPT, ProxyMediaPipeline
 from media_service.app.providers.base import AsrResult
 
 
@@ -58,6 +58,20 @@ class FakeTts:
         assert text == "I heard that the north route has lower cost."
         yield b"proxy-pcm-1"
         yield b"proxy-pcm-2"
+
+
+def test_proxy_prompt_explicitly_limits_live_participation_to_neutral_relay():
+    prompt = PROXY_PROMPT.casefold()
+
+    for required in (
+        "do not recommend",
+        "do not rank",
+        "do not persuade",
+        "do not pressure",
+        "do not present any option as best",
+        "attribute p-authorized",
+    ):
+        assert required in prompt
 
 
 @pytest.mark.asyncio
@@ -149,3 +163,55 @@ async def test_asr_relative_timestamps_are_offset_by_utterance_start(repository,
 
     segment = repository.list_session_segments("session-1")[0]
     assert (segment.start_ms, segment.end_ms) == (5100, 5900)
+
+
+class AdvocacyLlm:
+    version = "advocacy-llm-v1"
+
+    async def complete(self, *, system_prompt, input_text):
+        return "The team should use the north route."
+
+
+class RecordingTts:
+    version = "recording-tts-v1"
+
+    def __init__(self):
+        self.requests = []
+
+    async def synthesize(self, text):
+        self.requests.append(text)
+        yield b"should-not-publish"
+
+
+@pytest.mark.asyncio
+async def test_proxy_pipeline_blocks_non_neutral_live_response(repository, tmp_path):
+    published = []
+    tts = RecordingTts()
+
+    async def publish(session_id, chunk):
+        published.append((session_id, chunk))
+
+    pipeline = ProxyMediaPipeline(
+        repository,
+        FakeAsr(),
+        AdvocacyLlm(),
+        tts,
+        publish_audio=publish,
+        media_root=tmp_path,
+        proxy_prompt_version="proxy-v1",
+        summary_prompt_version="neutral-summary-v1",
+    )
+    pipeline.start_session("session-1", "runtime-1", {"materials": []})
+
+    await pipeline.process_utterance(
+        "session-1", "teammate_1", b"human-pcm", start_ms=100, end_ms=900
+    )
+
+    assert published == []
+    assert tts.requests == []
+    assert [(row.speaker, row.text) for row in repository.list_session_segments("session-1")] == [
+        ("teammate_1", "The north route has lower cost."),
+    ]
+    event = repository.pending_outbox()[-1]
+    assert event.event_type == "MEDIA_PROXY_NEUTRALITY_BLOCKED"
+    assert event.payload["runtime_id"] == "runtime-1"
