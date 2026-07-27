@@ -53,7 +53,8 @@ describe('Study1VoiceRoom', () => {
           getTracks: () => [{ stop: vi.fn() }],
         })),
         enumerateDevices: vi.fn(async () => [
-          { kind: 'audioinput', deviceId: 'mic-1', label: 'USB microphone' },
+          { kind: 'audioinput', deviceId: 'mic-1', label: '默认 - 麦克风阵列' },
+          { kind: 'audioinput', deviceId: 'mic-2', label: 'USB microphone' },
         ]),
       },
     })
@@ -71,7 +72,9 @@ describe('Study1VoiceRoom', () => {
     await flushPromises()
 
     expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith({ audio: true })
+    expect(wrapper.get('select').text()).toContain('Microphone 1')
     expect(wrapper.get('select').text()).toContain('USB microphone')
+    expect(wrapper.get('select').text()).not.toContain('默认')
     expect(wrapper.get('[data-test="join-audio"]').attributes('disabled')).toBeUndefined()
     expect(wrapper.text()).not.toContain('Camera')
     expect(wrapper.text()).not.toContain('Screen')

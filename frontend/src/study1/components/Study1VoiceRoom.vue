@@ -4,6 +4,7 @@ import { Headphones, Mic, MicOff, PhoneOff, RefreshCw } from '@lucide/vue'
 import { Room, RoomEvent } from 'livekit-client'
 
 import { fetchMediaAccess } from '../services/study1Api.js'
+import { displayMicrophoneLabel } from '../services/uiLabels.js'
 
 const props = defineProps({
   sessionId: { type: String, required: true },
@@ -205,8 +206,8 @@ onUnmounted(() => {
       <label for="study1-microphone">Microphone</label>
       <select id="study1-microphone" v-model="selectedDeviceId" :disabled="connectionState !== 'disconnected'">
         <option v-if="!devices.length" value="">No microphone available</option>
-        <option v-for="device in devices" :key="device.deviceId" :value="device.deviceId">
-          {{ device.label || 'Microphone' }}
+        <option v-for="(device, index) in devices" :key="device.deviceId" :value="device.deviceId">
+          {{ displayMicrophoneLabel(device.label, index) }}
         </option>
       </select>
       <button class="icon-button secondary" type="button" title="Check microphone" @click="checkMicrophone">

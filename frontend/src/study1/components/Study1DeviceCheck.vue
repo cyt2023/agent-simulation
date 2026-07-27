@@ -3,6 +3,7 @@ import { onMounted, ref } from 'vue'
 import { AlertCircle, CheckCircle2, RefreshCw } from '@lucide/vue'
 
 import { reportMediaDevice } from '../services/study1Api.js'
+import { displayMicrophoneLabel } from '../services/uiLabels.js'
 
 const props = defineProps({
   sessionId: { type: String, required: true },
@@ -58,7 +59,7 @@ onMounted(checkDevice)
     <div>
       <h2 id="device-check-title">Microphone check</h2>
       <p v-if="state === 'checking'">Checking microphone access…</p>
-      <p v-else-if="state === 'ready'"><strong>{{ deviceLabel }}</strong> is ready.</p>
+      <p v-else-if="state === 'ready'"><strong>{{ displayMicrophoneLabel(deviceLabel, 0) }}</strong> is ready.</p>
       <p v-else>{{ error }}</p>
     </div>
     <button type="button" :disabled="state === 'checking'" @click="checkDevice">
