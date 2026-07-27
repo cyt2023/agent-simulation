@@ -426,7 +426,7 @@ onUnmounted(() => {
 .researcher-shell { width:min(1080px, calc(100% - 2rem)); margin:2rem auto; color:#263746; font-family:Inter,ui-sans-serif,system-ui,sans-serif; }
 .panel { background:#f9fbfc; border:1px solid #dce3e9; border-radius:12px; padding:1.25rem; margin:1.25rem 0; }
 .login { max-width:460px; }
-.login-centered { width:min(460px,100%); margin:1.25rem auto; }
+.login-centered { box-sizing:border-box; width:min(460px,100%); margin:1.25rem auto; }
 .grid,.metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:1rem; }
 label { display:grid; gap:.4rem; margin:.8rem 0; font-weight:650; }
 input,textarea,select { padding:.65rem; border:1px solid #bac6d0; border-radius:7px; font:inherit; }
