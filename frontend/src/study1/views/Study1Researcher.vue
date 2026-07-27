@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import PhaseHeader from '../components/PhaseHeader.vue'
+import Study1FilePicker from '../components/Study1FilePicker.vue'
 import {
   addStudy1Incident,
   controlStudy1Session,
@@ -21,6 +22,7 @@ import {
   canEndMeeting,
   startCommandForPhase,
 } from '../services/mediaControls.js'
+import { displayMicrophoneLabel } from '../services/uiLabels.js'
 import {
   joinStudy1Session,
   leaveStudy1Session,
@@ -275,7 +277,7 @@ onUnmounted(() => {
     <h1 v-if="!dashboard">Study 1 researcher console</h1>
     <p v-if="error" class="error">{{ error }}</p>
 
-    <section v-if="!authenticated" class="panel login">
+    <section v-if="!authenticated" class="panel login login-centered">
       <h2>Researcher sign in</h2>
       <label>Researcher key<input v-model="researcherKey" type="password" @keyup.enter="login" /></label>
       <button :disabled="busy || !researcherKey" @click="login">Sign in</button>
@@ -291,11 +293,9 @@ onUnmounted(() => {
         <label v-for="role in ['principal', 'teammate_1', 'teammate_2']" :key="role">
           {{ role.replaceAll('_', ' ') }} private material
           <textarea v-model="materialText[role]" rows="3" />
-          <input
-            type="file"
-            accept=".pdf,.txt,.md"
-            multiple
-            @change="materialFiles[role] = Array.from($event.target.files || [])"
+          <Study1FilePicker
+            :input-id="`study1-material-${role}`"
+            @files-change="materialFiles[role] = $event"
           />
         </label>
         <button :disabled="busy || !sessionName.trim()" @click="createSession">Create session and invitations</button>
@@ -367,11 +367,11 @@ onUnmounted(() => {
           <table v-if="mediaStatus?.connections?.length">
             <thead><tr><th>Media participant</th><th>Role</th><th>Connection</th><th>Device</th></tr></thead>
             <tbody>
-              <tr v-for="connection in mediaStatus.connections" :key="connection.participant_id">
+              <tr v-for="(connection, index) in mediaStatus.connections" :key="connection.participant_id">
                 <td>{{ connection.participant_id }}</td>
                 <td>{{ connection.role }}</td>
                 <td>{{ connection.state }}</td>
-                <td>{{ connection.device?.label || 'not reported' }}</td>
+                <td>{{ displayMicrophoneLabel(connection.device?.label, index) }}</td>
               </tr>
             </tbody>
           </table>
@@ -426,6 +426,7 @@ onUnmounted(() => {
 .researcher-shell { width:min(1080px, calc(100% - 2rem)); margin:2rem auto; color:#263746; font-family:Inter,ui-sans-serif,system-ui,sans-serif; }
 .panel { background:#f9fbfc; border:1px solid #dce3e9; border-radius:12px; padding:1.25rem; margin:1.25rem 0; }
 .login { max-width:460px; }
+.login-centered { width:min(460px,100%); margin:1.25rem auto; }
 .grid,.metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:1rem; }
 label { display:grid; gap:.4rem; margin:.8rem 0; font-weight:650; }
 input,textarea,select { padding:.65rem; border:1px solid #bac6d0; border-radius:7px; font:inherit; }
