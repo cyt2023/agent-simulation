@@ -114,7 +114,9 @@ async function joinAudio() {
       .on(RoomEvent.TrackUnsubscribed, detachTrack)
       .on(RoomEvent.ActiveSpeakersChanged, speakers => {
         activeIdentities.value = new Set(
-          speakers.map(participant => participant.name || participant.identity),
+          speakers
+            .map(participant => participant.name || participant.identity)
+            .filter(identity => !(muted.value && identity === props.role)),
         )
       })
       .on(RoomEvent.ConnectionStateChanged, state => {
@@ -146,11 +148,22 @@ async function joinAudio() {
 
 async function toggleMute() {
   if (!room || connectionState.value !== 'connected') return
-  muted.value = !muted.value
-  await room.localParticipant.setMicrophoneEnabled(
-    !muted.value,
-    { deviceId: selectedDeviceId.value },
-  )
+  const nextMuted = !muted.value
+  error.value = ''
+  try {
+    await room.localParticipant.setMicrophoneEnabled(
+      !nextMuted,
+      { deviceId: selectedDeviceId.value },
+    )
+    muted.value = nextMuted
+    if (nextMuted) {
+      const nextActive = new Set(activeIdentities.value)
+      nextActive.delete(props.role)
+      activeIdentities.value = nextActive
+    }
+  } catch (reason) {
+    reportError(reason, 'Unable to change the microphone state.')
+  }
 }
 
 async function disconnectRoom() {
@@ -193,11 +206,15 @@ onUnmounted(() => {
         :key="participantRole"
         class="participant"
         :class="{ active: activeIdentities.has(participantRole) }"
+        :data-role="participantRole"
       >
         <span class="avatar" aria-hidden="true">{{ readableRole(participantRole) }}</span>
         <div>
-          <strong>{{ readableRole(participantRole) }}</strong>
-          <span>{{ participantRole === role ? 'you' : (remoteIdentities.has(participantRole) ? 'connected' : 'waiting') }}</span>
+          <strong>{{ participantRole === 'proxy' ? 'X (Proxy)' : readableRole(participantRole) }}</strong>
+          <span v-if="participantRole === 'proxy'">
+            {{ remoteIdentities.has('proxy') ? 'Proxy is connected' : 'Proxy is joining the room' }}
+          </span>
+          <span v-else>{{ participantRole === role ? 'you' : (remoteIdentities.has(participantRole) ? 'connected' : 'waiting') }}</span>
         </div>
       </div>
     </div>
@@ -231,7 +248,7 @@ onUnmounted(() => {
         Join audio
       </button>
       <template v-else>
-        <button class="icon-button" type="button" :title="muted ? 'Unmute microphone' : 'Mute microphone'" @click="toggleMute">
+        <button data-test="toggle-mute" class="icon-button" type="button" :title="muted ? 'Unmute microphone' : 'Mute microphone'" @click="toggleMute">
           <MicOff v-if="!muted" :size="20" aria-hidden="true" />
           <Mic v-else :size="20" aria-hidden="true" />
           <span class="sr-only">{{ muted ? 'Unmute microphone' : 'Mute microphone' }}</span>
@@ -242,6 +259,9 @@ onUnmounted(() => {
         </button>
       </template>
     </div>
+    <p v-if="connectionState === 'connected'" data-test="microphone-status" class="microphone-status">
+      Microphone {{ muted ? 'muted' : 'live' }}
+    </p>
     <div ref="audioHost" hidden />
   </section>
 </template>
@@ -264,6 +284,7 @@ h2 { font-size:1.35rem; letter-spacing:0; }
 .device-row { display:grid; grid-template-columns:auto minmax(0,1fr) 40px; align-items:center; gap:.75rem; }
 select { min-width:0; width:100%; padding:.62rem; border:1px solid #bac6d0; border-radius:6px; background:#fff; color:#263746; font:inherit; }
 .room-controls { min-height:44px; display:flex; justify-content:center; gap:.65rem; }
+.microphone-status { margin:0; color:#52616d; font-size:.78rem; text-align:center; }
 button { display:inline-flex; align-items:center; justify-content:center; gap:.5rem; min-height:40px; border:0; border-radius:7px; padding:.65rem .9rem; background:#245f8e; color:#fff; font:inherit; font-weight:700; cursor:pointer; }
 button:disabled { opacity:.45; cursor:not-allowed; }
 .icon-button { width:42px; padding:0; }

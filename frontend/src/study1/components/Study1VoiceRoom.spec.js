@@ -7,14 +7,16 @@ import { fetchMediaAccess } from '../services/study1Api.js'
 const connect = vi.fn()
 const disconnect = vi.fn()
 const setMicrophoneEnabled = vi.fn()
+let roomHandlers
 
 vi.mock('livekit-client', () => ({
   Room: class {
     constructor() {
       this.localParticipant = { setMicrophoneEnabled }
       this.remoteParticipants = new Map()
+      roomHandlers = {}
     }
-    on() { return this }
+    on(event, handler) { roomHandlers[event] = handler; return this }
     connect(...args) { return connect(...args) }
     disconnect(...args) { return disconnect(...args) }
   },
@@ -60,6 +62,18 @@ describe('Study1VoiceRoom', () => {
     })
   })
 
+  it('shows the proxy as a named meeting participant', async () => {
+    const wrapper = mount(Study1VoiceRoom, {
+      props: {
+        sessionId: 'session-1', phase: 'PROXY_MEETING', phaseVersion: 5, role: 'teammate_1',
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('X (Proxy)')
+    expect(wrapper.text()).toContain('Proxy is joining the room')
+  })
+
   it('checks a microphone before offering the join command', async () => {
     const wrapper = mount(Study1VoiceRoom, {
       props: {
@@ -96,6 +110,46 @@ describe('Study1VoiceRoom', () => {
 
     expect(connect).toHaveBeenCalledWith('ws://livekit', 'short-lived-token')
     expect(setMicrophoneEnabled).toHaveBeenCalledWith(true, { deviceId: 'mic-1' })
+  })
+
+  it('clears the local speaking indicator after the microphone is muted', async () => {
+    const wrapper = mount(Study1VoiceRoom, {
+      props: {
+        sessionId: 'session-1', phase: 'PROXY_MEETING', phaseVersion: 5, role: 'teammate_1',
+      },
+    })
+    await flushPromises()
+    await wrapper.get('[data-test="join-audio"]').trigger('click')
+    await flushPromises()
+    roomHandlers.activeSpeakersChanged([{ name: 'teammate_1' }])
+    await flushPromises()
+    expect(wrapper.get('[data-role="teammate_1"]').classes()).toContain('active')
+
+    await wrapper.get('[data-test="toggle-mute"]').trigger('click')
+    await flushPromises()
+
+    expect(setMicrophoneEnabled).toHaveBeenLastCalledWith(false, { deviceId: 'mic-1' })
+    expect(wrapper.get('[data-role="teammate_1"]').classes()).not.toContain('active')
+    expect(wrapper.get('[data-test="microphone-status"]').text()).toContain('muted')
+  })
+
+  it('reports a mute failure without falsely showing the microphone as muted', async () => {
+    setMicrophoneEnabled
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('device failure'))
+    const wrapper = mount(Study1VoiceRoom, {
+      props: {
+        sessionId: 'session-1', phase: 'PROXY_MEETING', phaseVersion: 5, role: 'teammate_1',
+      },
+    })
+    await flushPromises()
+    await wrapper.get('[data-test="join-audio"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-test="toggle-mute"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-test="microphone-status"]').text()).toContain('live')
+    expect(wrapper.text()).toContain('device failure')
   })
 
   it('disconnects when the authoritative phase version changes', async () => {
