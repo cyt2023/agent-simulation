@@ -84,7 +84,7 @@ class MediaAccessService:
             can_subscribe=True,
             can_publish=can_publish,
             can_publish_data=False,
-            can_publish_sources=["MICROPHONE"] if can_publish else [],
+            can_publish_sources=["microphone"] if can_publish else [],
         )
         token = (
             api.AccessToken(

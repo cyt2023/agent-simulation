@@ -45,7 +45,7 @@ def test_access_matrix(access_service, phase, role, allowed):
     assert result.captions_enabled is False
     assert result.token
     claims = jwt.decode(result.token, options={"verify_signature": False})
-    assert claims["video"]["canPublishSources"] == ["MICROPHONE"]
+    assert claims["video"]["canPublishSources"] == ["microphone"]
     assert claims["video"]["canPublishData"] is False
 
 
