@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import PhaseHeader from '../components/PhaseHeader.vue'
+import Study1FilePicker from '../components/Study1FilePicker.vue'
 import {
   addStudy1Incident,
   controlStudy1Session,
@@ -12,9 +13,16 @@ import {
   issueStudy1MediaCommand,
   completeMockMedia,
   exportStudy1Data,
+  fetchMediaStatus,
   transitionPhase,
   uploadStudy1Materials,
 } from '../services/study1Api.js'
+import {
+  buildSummaryRetryPayload,
+  canEndMeeting,
+  startCommandForPhase,
+} from '../services/mediaControls.js'
+import { displayMicrophoneLabel } from '../services/uiLabels.js'
 import {
   joinStudy1Session,
   leaveStudy1Session,
@@ -32,6 +40,7 @@ const materialFiles = ref({ principal: [], teammate_1: [], teammate_2: [] })
 const sessionList = ref([])
 const selectedSessionId = ref('')
 const dashboard = ref(null)
+const mediaStatus = ref(null)
 const invites = ref([])
 const busy = ref(false)
 const error = ref('')
@@ -106,7 +115,15 @@ async function selectSession() {
 async function refreshDashboard() {
   if (!selectedSessionId.value) return
   try {
-    dashboard.value = await fetchResearcherDashboard(selectedSessionId.value)
+    const [dashboardResult, mediaResult] = await Promise.all([
+      fetchResearcherDashboard(selectedSessionId.value),
+      fetchMediaStatus(selectedSessionId.value).catch(reason => ({
+        service_status: 'unavailable',
+        error: reason.message,
+      })),
+    ])
+    dashboard.value = dashboardResult
+    mediaStatus.value = mediaResult
   } catch (reason) {
     error.value = reason.message
   }
@@ -166,19 +183,39 @@ async function addIncident() {
   }
 }
 
-async function startMockMedia() {
-  const commandByPhase = {
-    PROXY_MEETING: 'START_PROXY_MEETING',
-    HANDOFF: 'BEGIN_HANDOFF',
-    SYNC_MEETING: 'START_SYNC_MEETING',
-  }
-  const command = commandByPhase[dashboard.value?.phase]
+async function startMedia() {
+  const command = startCommandForPhase(dashboard.value?.phase)
   if (!command) return
+  await runMediaCommand(command)
+}
+
+async function runMediaCommand(command, payload = {}) {
+  busy.value = true
+  error.value = ''
   try {
-    await issueStudy1MediaCommand(selectedSessionId.value, command)
+    await issueStudy1MediaCommand(selectedSessionId.value, command, payload)
     await refreshDashboard()
   } catch (reason) {
     error.value = reason.message
+  } finally {
+    busy.value = false
+  }
+}
+
+function endMeeting() {
+  runMediaCommand('END_CURRENT_MEETING')
+}
+
+function regenerateSummary() {
+  const reason = window.prompt('Reason for summary regeneration (required):')
+  if (reason == null) return
+  try {
+    runMediaCommand(
+      'REGENERATE_SUMMARY',
+      buildSummaryRetryPayload(reason, mediaStatus.value),
+    )
+  } catch (failure) {
+    error.value = failure.message
   }
 }
 
@@ -240,7 +277,7 @@ onUnmounted(() => {
     <h1 v-if="!dashboard">Study 1 researcher console</h1>
     <p v-if="error" class="error">{{ error }}</p>
 
-    <section v-if="!authenticated" class="panel login">
+    <section v-if="!authenticated" class="panel login login-centered">
       <h2>Researcher sign in</h2>
       <label>Researcher key<input v-model="researcherKey" type="password" @keyup.enter="login" /></label>
       <button :disabled="busy || !researcherKey" @click="login">Sign in</button>
@@ -256,11 +293,9 @@ onUnmounted(() => {
         <label v-for="role in ['principal', 'teammate_1', 'teammate_2']" :key="role">
           {{ role.replaceAll('_', ' ') }} private material
           <textarea v-model="materialText[role]" rows="3" />
-          <input
-            type="file"
-            accept=".pdf,.txt,.md"
-            multiple
-            @change="materialFiles[role] = Array.from($event.target.files || [])"
+          <Study1FilePicker
+            :input-id="`study1-material-${role}`"
+            @files-change="materialFiles[role] = $event"
           />
         </label>
         <button :disabled="busy || !sessionName.trim()" @click="createSession">Create session and invitations</button>
@@ -313,6 +348,35 @@ onUnmounted(() => {
           </table>
           <p><strong>Not submitted:</strong> {{ dashboard.not_submitted.join(', ') || 'none' }}</p>
         </section>
+        <section class="panel media-operations">
+          <div class="panel-heading">
+            <div>
+              <h2>Meeting and Proxy service</h2>
+              <p>{{ mediaStatus?.service_status || 'checking' }}</p>
+            </div>
+            <span class="service-state" :data-state="mediaStatus?.service_status">
+              {{ mediaStatus?.runtime_state || 'IDLE' }}
+            </span>
+          </div>
+          <dl class="media-grid">
+            <div><dt>Room</dt><dd>{{ mediaStatus?.room_kind || 'none' }}<small>{{ mediaStatus?.room_name || '—' }}</small></dd></div>
+            <div><dt>ASR</dt><dd>{{ mediaStatus?.asr?.status || '—' }}<small>{{ mediaStatus?.asr?.provider || '—' }}</small></dd></div>
+            <div><dt>Proxy</dt><dd>{{ mediaStatus?.proxy?.active ? 'active' : 'inactive' }}<small>{{ mediaStatus?.proxy?.prompt_version || '—' }}</small></dd></div>
+            <div><dt>Recording</dt><dd>{{ mediaStatus?.recording?.status || '—' }}<small>{{ mediaStatus?.pending_callback_count || 0 }} callbacks pending</small></dd></div>
+          </dl>
+          <table v-if="mediaStatus?.connections?.length">
+            <thead><tr><th>Media participant</th><th>Role</th><th>Connection</th><th>Device</th></tr></thead>
+            <tbody>
+              <tr v-for="(connection, index) in mediaStatus.connections" :key="connection.participant_id">
+                <td>{{ connection.participant_id }}</td>
+                <td>{{ connection.role }}</td>
+                <td>{{ connection.state }}</td>
+                <td>{{ displayMicrophoneLabel(connection.device?.label, index) }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <p v-if="mediaStatus?.error" class="error">{{ mediaStatus.error }}</p>
+        </section>
         <section class="controls">
           <button :disabled="busy || dashboard.status !== 'waiting'" @click="control('start')">Start Session</button>
           <button :disabled="busy || !nextPhase || !dashboard.ready_to_advance" @click="advance(false)">Advance Phase</button>
@@ -325,16 +389,31 @@ onUnmounted(() => {
           <button
             v-if="['PROXY_MEETING','HANDOFF','SYNC_MEETING'].includes(dashboard.phase)"
             :disabled="busy"
-            @click="startMockMedia"
+            @click="startMedia"
           >
-            Issue Mock Media Command
+            {{ mediaStatus?.mode === 'mock' ? 'Issue Mock Media Command' : 'Start Media Operation' }}
           </button>
           <button
             v-if="['PROXY_MEETING','HANDOFF','SYNC_MEETING'].includes(dashboard.phase)"
-            :disabled="busy"
+            v-show="mediaStatus?.mode === 'mock'"
+            :disabled="busy || mediaStatus?.mode !== 'mock'"
             @click="confirmMockComplete"
           >
             Confirm Mock Complete
+          </button>
+          <button
+            v-if="canEndMeeting(dashboard.phase) && mediaStatus?.mode !== 'mock'"
+            :disabled="busy"
+            @click="endMeeting"
+          >
+            End Current Meeting
+          </button>
+          <button
+            v-if="dashboard.phase === 'REVIEW' && mediaStatus?.mode !== 'mock'"
+            :disabled="busy || !mediaStatus?.summary_version"
+            @click="regenerateSummary"
+          >
+            Regenerate Summary
           </button>
           <button :disabled="busy" @click="exportData">Export Data</button>
         </section>
@@ -347,6 +426,7 @@ onUnmounted(() => {
 .researcher-shell { width:min(1080px, calc(100% - 2rem)); margin:2rem auto; color:#263746; font-family:Inter,ui-sans-serif,system-ui,sans-serif; }
 .panel { background:#f9fbfc; border:1px solid #dce3e9; border-radius:12px; padding:1.25rem; margin:1.25rem 0; }
 .login { max-width:460px; }
+.login-centered { box-sizing:border-box; width:min(460px,100%); margin:1.25rem auto; }
 .grid,.metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:1rem; }
 label { display:grid; gap:.4rem; margin:.8rem 0; font-weight:650; }
 input,textarea,select { padding:.65rem; border:1px solid #bac6d0; border-radius:7px; font:inherit; }
@@ -362,4 +442,15 @@ code { overflow-wrap:anywhere; }
 table { width:100%; border-collapse:collapse; }
 th,td { text-align:left; border-bottom:1px solid #dde4ea; padding:.65rem; }
 .controls { display:flex; flex-wrap:wrap; gap:.65rem; margin:1.25rem 0 3rem; }
+.panel-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; }
+.panel-heading h2,.panel-heading p { margin:0; }
+.panel-heading p { margin-top:.25rem; color:#667786; text-transform:capitalize; }
+.service-state { padding:.35rem .55rem; border:1px solid #c6d0d8; border-radius:6px; color:#536471; font-size:.78rem; }
+.service-state[data-state="ok"] { border-color:#70a883; background:#edf8f1; color:#17633c; }
+.media-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1rem; margin:1.25rem 0; }
+.media-grid div { min-width:0; border-left:3px solid #cad5dc; padding-left:.75rem; }
+.media-grid dt { color:#667786; font-size:.75rem; font-weight:700; text-transform:uppercase; }
+.media-grid dd { margin:.25rem 0 0; font-weight:700; overflow-wrap:anywhere; }
+.media-grid small { display:block; margin-top:.2rem; color:#70808c; font-weight:400; }
+@media (max-width:720px) { .media-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 </style>

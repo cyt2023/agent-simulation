@@ -10,6 +10,8 @@ import ReviewPhase from '../components/ReviewPhase.vue'
 import SurveyPhase from '../components/SurveyPhase.vue'
 import HandoffPhase from '../components/HandoffPhase.vue'
 import CompletionPhase from '../components/CompletionPhase.vue'
+import Study1VoiceRoom from '../components/Study1VoiceRoom.vue'
+import Study1DeviceCheck from '../components/Study1DeviceCheck.vue'
 import {
   clearStudy1Auth,
   createSubmission,
@@ -44,7 +46,10 @@ async function refresh() {
   const result = await fetchMe(identity.value.session_id)
   identity.value = result.identity
   session.value = result.session
-  if (phase.value === 'MATERIAL_READING') {
+  if (
+    phase.value === 'MATERIAL_READING'
+    || (phase.value === 'PROXY_CONFIGURATION' && role.value === 'principal')
+  ) {
     materials.value = (await fetchMyMaterials(identity.value.session_id)).materials
   }
 }
@@ -131,7 +136,10 @@ onUnmounted(() => {
       <p v-if="error" class="message error">{{ error }}</p>
       <p v-if="notice" class="message success">{{ notice }}</p>
       <div class="card">
-        <WaitingRoom v-if="phase === 'SETUP'" message="The researcher has not started the session." />
+        <section v-if="phase === 'SETUP'">
+          <Study1DeviceCheck :session-id="identity.session_id" />
+          <WaitingRoom message="The researcher has not started the session." />
+        </section>
         <MaterialPhase
           v-else-if="phase === 'MATERIAL_READING'"
           :materials="materials"
@@ -147,8 +155,17 @@ onUnmounted(() => {
         <ProxyConfigPhase
           v-else-if="phase === 'PROXY_CONFIGURATION'"
           :role="role"
+          :materials="materials"
           :busy="busy"
           @submit="submit(role === 'principal' ? 'proxy_config' : 'proxy_ready', $event)"
+        />
+        <Study1VoiceRoom
+          v-else-if="phase === 'PROXY_MEETING' && role !== 'principal'"
+          :session-id="identity.session_id"
+          :phase="phase"
+          :phase-version="session.phase_version"
+          :role="role"
+          @error="error = $event"
         />
         <WaitingRoom
           v-else-if="phase === 'PROXY_MEETING'"
@@ -183,9 +200,13 @@ onUnmounted(() => {
         />
         <WaitingRoom v-else-if="phase === 'COMPREHENSION_MEASUREMENT'" />
         <HandoffPhase v-else-if="phase === 'HANDOFF'" />
-        <WaitingRoom
+        <Study1VoiceRoom
           v-else-if="phase === 'SYNC_MEETING'"
-          message="The synchronous meeting stage is controlled by the researcher and external media service."
+          :session-id="identity.session_id"
+          :phase="phase"
+          :phase-version="session.phase_version"
+          :role="role"
+          @error="error = $event"
         />
         <VotePhase
           v-else-if="phase === 'FINAL_DECISION'"

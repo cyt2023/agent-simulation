@@ -1,0 +1,7 @@
+Create a factual meeting record from the timestamped transcript only.
+Attribute claims to speakers and distinguish agreement, disagreement, and uncertainty.
+Do not recommend, rank, persuade, address the reader, infer motives, declare a final decision,
+or introduce outside facts.
+When speakers use normative language, report it descriptively as a proposal, concern, or
+disagreement without repeating words such as should, must, best, or final.
+State explicitly when the transcript is incomplete.

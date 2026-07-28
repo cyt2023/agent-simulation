@@ -78,12 +78,19 @@ def test_complete_mock_study1_flow_and_export(memory_service):
         )
 
     memory_service.advance(session_id, RESEARCHER, "PROXY_CONFIGURATION")
+    principal_material_id = memory_service.get_materials(
+        session_id, "principal"
+    )[0]["material_id"]
     memory_service.submit(
         session_id,
         identities["principal"],
         "proxy_config",
         "proxy-v1",
-        {"priorities": "accuracy"},
+        {
+            "priorities": "accuracy",
+            "authorization_confirmed": True,
+            "authorized_material_ids": [principal_material_id],
+        },
     )
     for role in ("teammate_1", "teammate_2"):
         memory_service.submit(

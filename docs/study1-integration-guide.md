@@ -2,7 +2,7 @@
 
 本文档描述 Study 1 “A：实验流程、权限与数据”服务的端口、环境变量、鉴权方式、API、Socket.IO 事件以及 A/B 数据交换格式。
 
-> 当前仅实现 `MockMediaGateway`。项目不包含 LiveKit、RTC/WebRTC、麦克风、ASR、TTS、Proxy Runtime、实时音频会议或录音能力。
+> `MockMediaGateway` 仍用于测试和显式 Mock 模式。Docker Compose 默认接入独立 B 服务、LiveKit OSS、服务端 ASR/LLM/TTS、单一 X、录音、逐字稿、摘要和持久 outbox。
 
 ## 1. 服务与端口
 
@@ -12,7 +12,8 @@
 | Flask REST API | `http://localhost:5000` | `http://backend:5000` | `BACKEND_PORT` |
 | Socket.IO | `http://localhost:5000/socket.io` | `http://backend:5000/socket.io` | 与后端共用端口 |
 | PostgreSQL | `127.0.0.1:5432` | `postgres:5432` | `POSTGRES_PORT` / `PGPORT` |
-| MockMediaGateway | 无独立端口 | 后端进程内 | 无 |
+| Media Service B | 不暴露 | `http://media-service:8000` | `MEDIA_SERVICE_URL` |
+| LiveKit OSS | `ws://localhost:7880` | `ws://livekit:7880` | `LIVEKIT_PUBLIC_URL` |
 
 Docker Compose 中：
 
@@ -46,6 +47,18 @@ STUDY1_RESEARCHER_KEY=replace-with-researcher-key
 
 # B -> A 内部接口共享密钥
 STUDY1_INTERNAL_API_KEY=replace-with-internal-service-key
+A_TO_B_SERVICE_TOKEN=replace-with-a-different-service-key
+MEDIA_GATEWAY_MODE=http
+MEDIA_SERVICE_URL=http://media-service:8000
+
+# B 独立 PostgreSQL schema/user
+MEDIA_DATABASE_PASSWORD=replace-with-media-database-password
+MEDIA_DATABASE_SCHEMA=study1_media
+
+# LiveKit
+LIVEKIT_API_KEY=replace-with-livekit-key
+LIVEKIT_API_SECRET=replace-with-livekit-secret
+LIVEKIT_PUBLIC_URL=ws://localhost:7880
 
 # 写入 ZIP 导出的版本信息
 STUDY1_FRONTEND_BUILD_VERSION=git-sha-or-release
@@ -363,10 +376,29 @@ Content-Type: application/json
 
 ```text
 START_PROXY_MEETING
+END_CURRENT_MEETING
 BEGIN_HANDOFF
 START_SYNC_MEETING
+REGENERATE_SUMMARY
 STOP_SESSION
 ```
+
+`END_CURRENT_MEETING` 由研究者显式结束当前 Proxy/同步会议。
+`REGENERATE_SUMMARY` 必须携带原因、源 transcript checksum 和源 summary
+version。两条命令都不会推进 A 的 phase。
+
+### Media access 与研究者代理接口
+
+```text
+POST /api/study1/sessions/{session_id}/media-access
+GET  /api/study1/sessions/{session_id}/media-status
+GET  /api/study1/sessions/{session_id}/recordings/{recording_id}
+GET  /api/study1/sessions/{session_id}/export
+```
+
+Participant media-access 忽略浏览器提交的角色，只使用 A 签名 token 中的身份。
+P 不会获得 Proxy room token。录音回放只允许已提交委托预期的 P 在
+Review/Comprehension 阶段使用，且每次必须请求不超过 1 MiB 的 Range。
 
 `command_id` 是幂等键。相同 command 不得执行两次。
 
@@ -385,6 +417,23 @@ Content-Type: application/json
   "payload": {}
 }
 ```
+
+For `START_PROXY_MEETING`, A ignores this browser payload and constructs the
+context from P's locked `proxy_config`. That submission must contain:
+
+```json
+{
+  "priorities": "P-authored priorities",
+  "boundaries": "P-authored boundaries",
+  "authorization_confirmed": true,
+  "authorized_material_ids": ["p-material-uuid"]
+}
+```
+
+A validates that every ID belongs to P and sends only those selected materials
+to B. Sync uses a hidden subscribe-only B recorder; X is never present in the
+Sync room. `HANDOFF_COMPLETE` requires X to be stopped plus successful device
+preflight records for P, T1, and T2.
 
 ## 10. B -> A Event
 

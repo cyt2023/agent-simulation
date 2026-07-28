@@ -223,3 +223,32 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
         archive.writestr("schema_version.json", _json_bytes(schema))
     buffer.seek(0)
     return buffer
+
+
+def merge_media_export(
+    workflow_bundle: io.BytesIO,
+    media_bundle: bytes | None,
+    media_error: str | None = None,
+) -> io.BytesIO:
+    """Copy B's bundle under media/ without trusting its filesystem paths."""
+    output = io.BytesIO()
+    workflow_bundle.seek(0)
+    with zipfile.ZipFile(workflow_bundle, "r") as workflow, zipfile.ZipFile(
+        output, "w", compression=zipfile.ZIP_DEFLATED
+    ) as merged:
+        for info in workflow.infolist():
+            merged.writestr(info.filename, workflow.read(info.filename))
+        if media_bundle:
+            with zipfile.ZipFile(io.BytesIO(media_bundle), "r") as media:
+                for info in media.infolist():
+                    normalized = info.filename.replace("\\", "/").lstrip("/")
+                    if ".." in normalized.split("/") or info.is_dir():
+                        continue
+                    merged.writestr(f"media/{normalized}", media.read(info.filename))
+        elif media_error:
+            merged.writestr(
+                "media/media_export_error.json",
+                _json_bytes({"error": "MEDIA_EXPORT_UNAVAILABLE", "message": media_error}),
+            )
+    output.seek(0)
+    return output
