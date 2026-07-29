@@ -1,4 +1,5 @@
 #!/bin/sh
+# This file must remain LF-only because it runs inside the Linux Postgres image.
 set -eu
 
 if [ -z "${MEDIA_DATABASE_PASSWORD:-}" ]; then
