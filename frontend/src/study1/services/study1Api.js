@@ -54,6 +54,19 @@ export function fetchMyMaterials(sessionId) {
   return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/me/materials`)
 }
 
+export async function fetchStudy1Recording(sessionId, recordingId) {
+  const token = getStudy1Token()
+  const response = await fetch(
+    `/api/study1/sessions/${encodeURIComponent(sessionId)}/recordings/${encodeURIComponent(recordingId)}`,
+    { headers: token ? { Authorization: `Bearer ${token}` } : {} },
+  )
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}))
+    throw new Error(data?.message || `Recording replay failed (${response.status})`)
+  }
+  return response.blob()
+}
+
 export function createSubmission(sessionId, type, payload, instrumentVersion = '1.0') {
   return request(
     `/api/study1/sessions/${encodeURIComponent(sessionId)}/submissions/${encodeURIComponent(type)}`,
@@ -120,6 +133,20 @@ export function addStudy1Incident(sessionId, payload) {
     method: 'POST',
     body: JSON.stringify(payload),
   })
+}
+
+export function cloneStudy1Session(sessionId, sessionName) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/clone`, {
+    method: 'POST',
+    body: JSON.stringify({ session_name: sessionName }),
+  })
+}
+
+export function addTranscriptCorrection(sessionId, payload) {
+  return request(
+    `/api/study1/sessions/${encodeURIComponent(sessionId)}/transcript-corrections`,
+    { method: 'POST', body: JSON.stringify(payload) },
+  )
 }
 
 export function issueStudy1MediaCommand(sessionId, command, payload = {}) {

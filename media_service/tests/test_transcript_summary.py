@@ -70,6 +70,8 @@ async def test_summary_uses_transcript_without_delegation_measurements():
     assert result.prompt_version == "neutral-summary-v1"
     assert "north route" in result.content
     assert "[segment:seg-1]" in result.content
+    assert "1. Discussion overview" in result.content
+    assert "5. Open questions and next steps" in result.content
     assert "delegation" not in llm.calls[0][1].lower()
 
 

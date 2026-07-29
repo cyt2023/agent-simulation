@@ -1,1 +1,4 @@
 .env
+.pytest_cache/
+pytest-cache-files-*/
+**/pytest-cache-files-*/

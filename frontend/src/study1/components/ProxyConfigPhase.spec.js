@@ -24,6 +24,7 @@ it('submits only explicitly authorized P material IDs', async () => {
     {
       priorities: 'Protect the budget',
       boundaries: '',
+      authority_level: 'suggest',
       authorization_confirmed: true,
       authorized_material_ids: ['material-2'],
     },

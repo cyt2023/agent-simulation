@@ -23,13 +23,24 @@ class SummaryResult:
 
 
 NEUTRAL_SUMMARY_PROMPT = """You create a factual meeting record from the supplied transcript only.
-Return exactly one JSON object shaped as {"items":[{"text":"...","segment_ids":["..."]}]}.
+Return exactly one JSON object with five arrays:
+{"sections":{"discussion_overview":[],"information_and_reasons":[],"positions_and_disagreements":[],
+"tentative_outcome_and_status":[],"open_questions_and_next_steps":[]}}.
+Every array item is shaped as {"text":"...","segment_ids":["..."]}.
 Each item must stay factual and closely grounded in its cited final transcript segments. Do not put
 speaker labels in text because the server adds attribution. Cite every claim with one or more
 supplied segment_ids. Do not recommend, rank, persuade, address the reader, infer motives, declare
 a final decision, or introduce facts absent from the cited segments. When speakers use normative
 language, report it descriptively as a proposal, concern, or disagreement without repeating words
 such as should, must, best, or final. Omit a claim when evidence is incomplete."""
+
+SUMMARY_SECTIONS = (
+    ("discussion_overview", "1. Discussion overview"),
+    ("information_and_reasons", "2. Information and reasons"),
+    ("positions_and_disagreements", "3. Positions and disagreements"),
+    ("tentative_outcome_and_status", "4. Tentative outcome and status"),
+    ("open_questions_and_next_steps", "5. Open questions and next steps"),
+)
 
 _PROHIBITED_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -123,7 +134,10 @@ class SummaryService:
         final_segments = [segment for segment in segments if segment.is_final]
         if not final_segments:
             return SummaryResult(
-                content="No final transcript segments were available.",
+                content="\n\n".join(
+                    f"## {label}\nNo transcript-supported content."
+                    for _, label in SUMMARY_SECTIONS
+                ),
                 prompt_version=self.prompt_version,
             )
         transcript_payload = [
@@ -163,33 +177,46 @@ class SummaryService:
             payload = json.loads(raw)
         except (TypeError, json.JSONDecodeError) as error:
             raise NeutralityError("Summary is not valid JSON") from error
-        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
-            raise NeutralityError("Summary JSON must contain an items list")
+        if not isinstance(payload, dict):
+            raise NeutralityError("Summary JSON must be an object")
+        sections = payload.get("sections")
+        if sections is None and isinstance(payload.get("items"), list):
+            # Compatibility for older providers; rendering is still the locked five-section form.
+            sections = {"discussion_overview": payload["items"]}
+        if not isinstance(sections, dict):
+            raise NeutralityError("Summary JSON must contain a sections object")
         by_id = {segment.segment_id: segment for segment in segments}
-        rendered: list[str] = []
-        for item in payload["items"]:
-            if not isinstance(item, dict):
-                raise NeutralityError("Summary item must be an object")
-            text = str(item.get("text") or "").strip()
-            segment_ids = item.get("segment_ids")
-            if not text or not isinstance(segment_ids, list) or not segment_ids:
-                raise NeutralityError("Summary item requires text and segment_ids")
-            validate_neutral_language(text, surface="Summary")
-            unknown = [segment_id for segment_id in segment_ids if segment_id not in by_id]
-            if unknown:
-                raise NeutralityError(
-                    f"Summary cites unknown transcript segment: {unknown[0]}"
+        rendered_sections: list[str] = []
+        for key, label in SUMMARY_SECTIONS:
+            items = sections.get(key) or []
+            if not isinstance(items, list):
+                raise NeutralityError(f"Summary section {key} must be a list")
+            rendered: list[str] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    raise NeutralityError("Summary item must be an object")
+                text = str(item.get("text") or "").strip()
+                segment_ids = item.get("segment_ids")
+                if not text or not isinstance(segment_ids, list) or not segment_ids:
+                    raise NeutralityError("Summary item requires text and segment_ids")
+                validate_neutral_language(text, surface="Summary")
+                unknown = [segment_id for segment_id in segment_ids if segment_id not in by_id]
+                if unknown:
+                    raise NeutralityError(
+                        f"Summary cites unknown transcript segment: {unknown[0]}"
+                    )
+                evidence = " ".join(by_id[segment_id].text for segment_id in segment_ids)
+                terms = _grounding_terms(text)
+                evidence_terms = _grounding_terms(evidence)
+                if terms and len(terms & evidence_terms) / len(terms) < 0.6:
+                    raise NeutralityError(
+                        "Summary contains facts not grounded in its cited transcript segments"
+                    )
+                speakers = "/".join(
+                    sorted({_speaker_label(by_id[segment_id].speaker) for segment_id in segment_ids})
                 )
-            evidence = " ".join(by_id[segment_id].text for segment_id in segment_ids)
-            terms = _grounding_terms(text)
-            evidence_terms = _grounding_terms(evidence)
-            if terms and len(terms & evidence_terms) / len(terms) < 0.6:
-                raise NeutralityError(
-                    "Summary contains facts not grounded in its cited transcript segments"
-                )
-            speakers = "/".join(
-                sorted({_speaker_label(by_id[segment_id].speaker) for segment_id in segment_ids})
-            )
-            citations = ",".join(f"segment:{segment_id}" for segment_id in segment_ids)
-            rendered.append(f"{speakers} stated: {text} [{citations}]")
-        return "\n".join(rendered) or "No factual summary items were generated."
+                citations = ",".join(f"segment:{segment_id}" for segment_id in segment_ids)
+                rendered.append(f"- {speakers} stated: {text} [{citations}]")
+            body = "\n".join(rendered) or "No transcript-supported content."
+            rendered_sections.append(f"## {label}\n{body}")
+        return "\n\n".join(rendered_sections)

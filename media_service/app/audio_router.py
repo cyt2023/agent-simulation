@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import uuid
+import wave
 
 from .audio import PcmWaveRecorder
 from .pipeline import ProxyMediaPipeline
@@ -92,7 +93,13 @@ class AudioPipelineRouter:
         detector = self.detectors.setdefault(
             key, VoiceActivityBuffer(sample_rate=frame.sample_rate)
         )
-        for utterance in detector.feed(pcm):
+        was_speaking = detector.start_ms is not None
+        utterances = detector.feed(pcm)
+        if not was_speaking and detector.start_ms is not None:
+            interrupt = getattr(self.pipeline, "interrupt", None)
+            if interrupt:
+                interrupt(session_id, speaker)
+        for utterance in utterances:
             task = asyncio.create_task(
                 self.pipeline.process_utterance(
                     session_id,
@@ -176,6 +183,8 @@ class AudioPipelineRouter:
                     "content_type": "audio/wav",
                     "size": len(payload),
                     "checksum": hashlib.sha256(payload).hexdigest(),
+                    "duration_ms": _wave_duration_ms(recorder.path),
+                    "consent_scope": "study1_audio_recording_and_research_export",
                 }
             )
             self.recorders.pop(key, None)
@@ -199,6 +208,9 @@ class AudioPipelineRouter:
             for row in self.pipeline.repository.list_session_segments(session_id)
             if row.runtime_id == state.runtime_id and row.speaker == "proxy"
         ]
+        pipeline_log = getattr(self.pipeline, "agent_log", None)
+        if pipeline_log:
+            agent_log.extend(pipeline_log(session_id, state.runtime_id))
         for kind, value in (
             ("recording_manifest", recordings),
             ("agent_log_manifest", agent_log),
@@ -216,7 +228,6 @@ class AudioPipelineRouter:
                 generator_version="study1-media-runtime-v1",
                 metadata={"runtime_id": state.runtime_id},
             )
-
     async def regenerate_summary(
         self, session_id: str, phase_version: int, payload: dict
     ) -> None:
@@ -227,3 +238,9 @@ class AudioPipelineRouter:
             source_transcript_checksum=str(payload["source_transcript_checksum"]),
             source_summary_version=str(payload["source_summary_version"]),
         )
+
+
+def _wave_duration_ms(path: Path) -> int:
+    with wave.open(str(path), "rb") as stream:
+        frame_rate = stream.getframerate()
+        return round(stream.getnframes() * 1000 / frame_rate) if frame_rate else 0

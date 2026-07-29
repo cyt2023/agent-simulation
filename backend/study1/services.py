@@ -6,7 +6,9 @@ import hashlib
 import copy
 import io
 import json
+import math
 import os
+import random
 import re
 import secrets
 import threading
@@ -78,6 +80,7 @@ class ActionNotAllowedInPhase(Study1ServiceError):
 
 
 SUBMISSION_RULES: dict[str, tuple[Study1Phase, tuple[Study1Role, ...]]] = {
+    "consent": (Study1Phase.SETUP, HUMAN_ROLES),
     "material_ack": (Study1Phase.MATERIAL_READING, HUMAN_ROLES),
     "pre_vote": (Study1Phase.PRE_VOTE, HUMAN_ROLES),
     "proxy_config": (Study1Phase.PROXY_CONFIGURATION, (Study1Role.PRINCIPAL,)),
@@ -102,6 +105,71 @@ SUBMISSION_RULES: dict[str, tuple[Study1Phase, tuple[Study1Role, ...]]] = {
     "post_survey": (Study1Phase.POST_SURVEY, HUMAN_ROLES),
 }
 
+PROXY_AUTHORITY_LEVELS = {
+    "share_only",
+    "suggest",
+    "agree_tentative",
+}
+
+STRUCTURED_SUBMISSION_FIELDS: dict[str, tuple[str, ...]] = {
+    "consent": (
+        "consent_version",
+        "identity_confirmed",
+        "role_confirmed",
+        "audio_recording_confirmed",
+        "voluntary_participation_confirmed",
+    ),
+    "pre_vote": ("decision", "rationale", "confidence"),
+    "proxy_config": (
+        "priorities",
+        "boundaries",
+        "authority_level",
+        "authorization_confirmed",
+        "authorized_material_ids",
+    ),
+    "tentative_decision": (
+        "decision",
+        "rationale",
+        "confidence",
+        "decision_status",
+        "proxy_authority_belief",
+        "expected_principal_acceptance",
+    ),
+    "delegation_expectation": (
+        "expected_information_shared",
+        "expected_recommendation",
+        "expected_tentative_agreement",
+        "confidence",
+    ),
+    "comprehension_measurement": (
+        "conclusion",
+        "reasons",
+        "member_positions",
+        "disagreements",
+        "decision_status",
+        "proxy_commitments",
+        "acceptance_intention",
+        "confidence",
+    ),
+    "final_decision": (
+        "decision",
+        "rationale",
+        "confidence",
+        "decision_scope",
+    ),
+    "followup_task": (
+        "resource_allocation",
+        "action_ranking",
+        "implementation_plan",
+    ),
+    "post_survey": (
+        "understanding",
+        "proxy_trust",
+        "team_synchronization",
+        "comments",
+    ),
+}
+
 REVIEW_UI_EVENTS = {
     "review_page_enter",
     "review_page_leave",
@@ -111,6 +179,8 @@ REVIEW_UI_EVENTS = {
     "transcript_segment_view",
     "scroll_depth",
     "active_reading_time",
+    "critical_marker",
+    "recording_replay",
 }
 
 
@@ -1329,6 +1399,17 @@ def _record_review_ui_event(
         safe_payload["visible_segments"] = [str(value)[:64] for value in segments[:100]]
     if event_type == "transcript_segment_view":
         safe_payload = {"segment_id": str(safe_payload.get("segment_id") or "")[:64]}
+    if event_type == "critical_marker":
+        safe_payload = {
+            "target_type": str(safe_payload.get("target_type") or "")[:32],
+            "target_id": str(safe_payload.get("target_id") or "")[:128],
+            "note": str(safe_payload.get("note") or "")[:500],
+        }
+    if event_type == "recording_replay":
+        safe_payload = {
+            "recording_id": str(safe_payload.get("recording_id") or "")[:160],
+            "action": str(safe_payload.get("action") or "")[:32],
+        }
     session["completion"]["review_reading_recorded:principal"] = True
     opened = session.get("review_opened_at")
     if opened:
@@ -1348,6 +1429,7 @@ def _review_payload(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "summary": latest.get("summary"),
         "transcript": latest.get("transcript"),
+        "recording_manifest": latest.get("recording_manifest"),
     }
 
 
@@ -1380,6 +1462,17 @@ def _apply_session_control(
         raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
     events: list[dict[str, Any]] = []
     status = session["status"]
+    reason = str(payload.get("reason") or "").strip()
+    if (
+        session.get("structured_instruments")
+        and action in {"pause", "resume", "extend", "terminate"}
+        and not reason
+    ):
+        raise Study1ServiceError(
+            "CONTROL_REASON_REQUIRED",
+            f"A reason is required for {action} in a locked Study 1 session",
+            400,
+        )
     if action == "start":
         if status != "waiting" or session["phase"] != Study1Phase.SETUP.value:
             raise Study1ServiceError(
@@ -1399,28 +1492,42 @@ def _apply_session_control(
             raise Study1ServiceError(
                 "SESSION_CANNOT_PAUSE", "Only a running session can be paused", 409
             )
+        session["remaining_seconds"] = _remaining_seconds(session)
+        session["phase_deadline_at"] = None
         session["status"] = "paused"
-        events.append(_status_event(session, actor, "session_pause"))
+        events.append(_status_event(session, actor, "session_pause", {"reason": reason or None}))
     elif action == "resume":
         if status != "paused":
             raise Study1ServiceError(
                 "SESSION_CANNOT_RESUME", "Only a paused session can be resumed", 409
             )
         session["status"] = "running"
-        events.append(_status_event(session, actor, "session_resume"))
+        remaining = int(session.get("remaining_seconds") or 0)
+        session["phase_deadline_at"] = (
+            utc_iso(utc_now() + timedelta(seconds=remaining)) if remaining > 0 else None
+        )
+        events.append(_status_event(session, actor, "session_resume", {"reason": reason or None}))
     elif action == "extend":
         seconds = int(payload.get("seconds") or 0)
         if seconds <= 0 or seconds > 86400:
             raise Study1ServiceError(
                 "INVALID_EXTENSION", "seconds must be between 1 and 86400", 400
             )
-        session["remaining_seconds"] = int(session.get("remaining_seconds") or 0) + seconds
+        session["remaining_seconds"] = _remaining_seconds(session) + seconds
+        if session["status"] == "running":
+            session["phase_deadline_at"] = utc_iso(
+                utc_now() + timedelta(seconds=session["remaining_seconds"])
+            )
         events.append(
             _status_event(
                 session,
                 actor,
                 "session_extend",
-                {"seconds": seconds, "remaining_seconds": session["remaining_seconds"]},
+                {
+                    "seconds": seconds,
+                    "remaining_seconds": session["remaining_seconds"],
+                    "reason": reason or None,
+                },
             )
         )
     elif action == "terminate":
@@ -1434,12 +1541,23 @@ def _apply_session_control(
                 session,
                 actor,
                 "session_terminate",
-                {"reason": str(payload.get("reason") or "").strip() or None},
+                {"reason": reason or None},
             )
         )
     else:
         raise Study1ServiceError("UNKNOWN_CONTROL_ACTION", "Unknown control action", 400)
     return events
+
+
+def _remaining_seconds(session: dict[str, Any]) -> int:
+    deadline = session.get("phase_deadline_at")
+    if deadline and session.get("status") == "running":
+        try:
+            deadline_at = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
+            return max(0, math.ceil((deadline_at - utc_now()).total_seconds()))
+        except ValueError:
+            pass
+    return max(0, int(session.get("remaining_seconds") or 0))
 
 
 def _new_incident(
@@ -1538,7 +1656,7 @@ def _dashboard_payload(
             "transcript": "ready" if "transcript" in types else "pending",
         },
         "incident_count": len(incidents),
-        "remaining_seconds": session.get("remaining_seconds"),
+        "remaining_seconds": _remaining_seconds(session),
     }
 
 
@@ -1642,21 +1760,27 @@ class Study1Service:
         invite_ttl_seconds: int = 86400,
         materials_by_role: dict[str, list[dict[str, Any]]] | None = None,
         minimum_review_seconds: int = 0,
+        experiment_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         clean_name = (session_name or "").strip()
         if not clean_name:
             raise Study1ServiceError(
                 "SESSION_NAME_REQUIRED", "session_name is required", 400
             )
+        config = _normalize_experiment_config(experiment_config or {})
         now = utc_now()
         session_id = str(uuid.uuid4())
+        assigned_roles = list(HUMAN_ROLES)
+        if config["role_assignment_mode"] == "randomized":
+            random.Random(config["randomization_seed"]).shuffle(assigned_roles)
         participants = [
             {
                 "participant_id": str(uuid.uuid4()),
                 "role": role.value,
                 "online": False,
+                "assignment_order": index,
             }
-            for role in HUMAN_ROLES
+            for index, role in enumerate(assigned_roles, start=1)
         ]
         snapshot = {
             "session_id": session_id,
@@ -1692,9 +1816,25 @@ class Study1Service:
             "participants": participants,
             "created_at": utc_iso(now),
             "protocol_version": "study1-a-1.0",
-            "task_version": "1.0",
+            "task_version": config["task_version"],
+            "task_instance_id": config["task_instance_id"],
             "minimum_review_seconds": max(0, int(minimum_review_seconds)),
+            "require_consent": config["require_consent"],
+            "structured_instruments": config["structured_instruments"],
+            "experiment_config": config,
+            "configuration_locked_at": utc_iso(now),
+            "configuration_checksum": hashlib.sha256(
+                json.dumps(config, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest(),
+            "remaining_seconds": int(
+                config["phase_durations_seconds"].get(Study1Phase.SETUP.value) or 0
+            ),
         }
+        snapshot["phase_deadline_at"] = (
+            utc_iso(now + timedelta(seconds=snapshot["remaining_seconds"]))
+            if snapshot["remaining_seconds"] > 0
+            else None
+        )
         expires_at = now + timedelta(seconds=max(60, int(invite_ttl_seconds)))
         created: list[CreatedInvite] = []
         rows: list[dict[str, Any]] = []
@@ -1727,6 +1867,38 @@ class Study1Service:
             "session": self.session_dto(snapshot),
             "invites": [invite.public_dict() for invite in created],
         }
+
+    def clone_session(
+        self,
+        source_session_id: str,
+        session_name: str,
+        invite_ttl_seconds: int = 86400,
+    ) -> dict[str, Any]:
+        source = self.repository.export_data(source_session_id)
+        snapshot = source.get("session")
+        if not snapshot:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        materials_by_role: dict[str, list[dict[str, Any]]] = {
+            role.value: [] for role in HUMAN_ROLES
+        }
+        for item in source.get("materials") or []:
+            materials_by_role[item["role"]].append(
+                {
+                    "title": item.get("title"),
+                    "content": item.get("content"),
+                    "storage_uri": item.get("storage_uri"),
+                    "metadata": item.get("metadata") or {},
+                }
+            )
+        config = copy.deepcopy(snapshot.get("experiment_config") or {})
+        config["randomization_seed"] = secrets.token_hex(8)
+        return self.create_session(
+            session_name,
+            invite_ttl_seconds,
+            materials_by_role,
+            int(snapshot.get("minimum_review_seconds") or 0),
+            config,
+        )
 
     def get_materials(self, session_id: str, role: Study1Role | str) -> list[dict[str, Any]]:
         role_value = Study1Role(role)
@@ -1810,6 +1982,13 @@ class Study1Service:
         payload: dict[str, Any],
         client_timestamp: str | None = None,
     ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if session.get("structured_instruments"):
+            self._validate_structured_submission(
+                submission_type, instrument_version, payload
+            )
         if submission_type == "proxy_config":
             self._validate_proxy_config_authorization(
                 session_id, identity, payload
@@ -1835,6 +2014,69 @@ class Study1Service:
             parsed_client_time,
         )
 
+    def _validate_structured_submission(
+        self,
+        submission_type: str,
+        instrument_version: str,
+        payload: dict[str, Any],
+    ) -> None:
+        required = STRUCTURED_SUBMISSION_FIELDS.get(submission_type)
+        if required is None:
+            return
+        if not str(instrument_version or "").startswith("2."):
+            raise Study1ServiceError(
+                "INSTRUMENT_VERSION_REQUIRED",
+                f"{submission_type} must use the locked Study 1 instrument version 2.x",
+                400,
+            )
+        if not isinstance(payload, dict):
+            raise Study1ServiceError("INVALID_PAYLOAD", "payload must be an object", 400)
+        missing = [
+            field
+            for field in required
+            if field not in payload
+            or payload[field] is None
+            or (isinstance(payload[field], str) and not payload[field].strip())
+        ]
+        if missing:
+            raise Study1ServiceError(
+                "INCOMPLETE_INSTRUMENT",
+                "Required fields are missing: " + ", ".join(missing),
+                400,
+            )
+        for field in (
+            "confidence",
+            "expected_principal_acceptance",
+            "understanding",
+            "proxy_trust",
+            "team_synchronization",
+        ):
+            if field in payload:
+                try:
+                    value = int(payload[field])
+                except (TypeError, ValueError) as error:
+                    raise Study1ServiceError(
+                        "INVALID_SCALE_VALUE", f"{field} must be an integer from 1 to 7", 400
+                    ) from error
+                if value < 1 or value > 7:
+                    raise Study1ServiceError(
+                        "INVALID_SCALE_VALUE", f"{field} must be between 1 and 7", 400
+                    )
+        if submission_type == "consent" and not all(
+            payload.get(field) is True
+            for field in (
+                "identity_confirmed",
+                "role_confirmed",
+                "audio_recording_confirmed",
+                "voluntary_participation_confirmed",
+            )
+        ):
+            raise Study1ServiceError(
+                "CONSENT_REQUIRED",
+                "All identity, role, recording, and voluntary participation confirmations are required",
+                400,
+            )
+
     def _validate_proxy_config_authorization(
         self,
         session_id: str,
@@ -1847,6 +2089,15 @@ class Study1Service:
             raise Study1ServiceError(
                 "PROXY_AUTHORIZATION_REQUIRED",
                 "P must explicitly confirm the Proxy material authorization",
+                400,
+            )
+        if (
+            "authority_level" in payload
+            and payload.get("authority_level") not in PROXY_AUTHORITY_LEVELS
+        ):
+            raise Study1ServiceError(
+                "INVALID_PROXY_AUTHORITY_LEVEL",
+                "authority_level must be share_only, suggest, or agree_tentative",
                 400,
             )
         material_ids = payload.get("authorized_material_ids")
@@ -1935,6 +2186,17 @@ class Study1Service:
         action: str,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if action == "start":
+            current = self.repository.get_session(session_id)
+            if current is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            missing = readiness(current)["missing_prerequisites"]
+            if missing:
+                raise Study1ServiceError(
+                    "PREREQUISITES_NOT_MET",
+                    "Missing prerequisites: " + ", ".join(missing),
+                    409,
+                )
         snapshot, events = self.repository.control_session(
             session_id, action, actor, payload or {}
         )
@@ -2091,6 +2353,11 @@ class Study1Service:
                 Study1Role.TEAMMATE_1.value,
                 Study1Role.TEAMMATE_2.value,
             },
+            Study1Phase.HANDOFF.value: {
+                Study1Role.PRINCIPAL.value,
+                Study1Role.TEAMMATE_1.value,
+                Study1Role.TEAMMATE_2.value,
+            },
         }
         if role not in allowed.get(session["phase"], set()):
             raise Study1ServiceError(
@@ -2231,6 +2498,82 @@ class Study1Service:
         created, value = self.repository.create_artifact(session_id, artifact)
         return {"created": created, "duplicate": not created, "artifact": value}
 
+    def create_transcript_correction(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        segment_id: str,
+        corrected_text: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        clean_segment_id = segment_id.strip()
+        clean_text = corrected_text.strip()
+        clean_reason = reason.strip()
+        if not clean_segment_id or not clean_text or not clean_reason:
+            raise Study1ServiceError(
+                "TRANSCRIPT_CORRECTION_FIELDS_REQUIRED",
+                "segment_id, corrected_text, and reason are required",
+                400,
+            )
+        data = self.repository.export_data(session_id)
+        transcripts = [
+            item for item in data.get("artifacts") or [] if item.get("type") == "transcript"
+        ]
+        if not transcripts:
+            raise Study1ServiceError(
+                "TRANSCRIPT_NOT_FOUND", "No source transcript is available", 404
+            )
+        source = transcripts[-1]
+        try:
+            segments = json.loads(source.get("content") or "[]")
+        except json.JSONDecodeError as error:
+            raise Study1ServiceError(
+                "TRANSCRIPT_NOT_STRUCTURED", "Source transcript is not structured JSON", 409
+            ) from error
+        original = next(
+            (
+                item for item in segments
+                if str(item.get("segment_id") or "") == clean_segment_id
+            ),
+            None,
+        )
+        if original is None:
+            raise Study1ServiceError(
+                "TRANSCRIPT_SEGMENT_NOT_FOUND", "Transcript segment was not found", 404
+            )
+        existing = [
+            item for item in data.get("artifacts") or []
+            if item.get("type") == "transcript_correction"
+        ]
+        content = json.dumps(
+            {
+                "segment_id": clean_segment_id,
+                "original_text": str(original.get("text") or ""),
+                "corrected_text": clean_text,
+                "reason": clean_reason,
+                "corrected_by": actor.get("participant_id"),
+                "corrected_at": utc_iso(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return self.create_artifact(
+            session_id,
+            {
+                "type": "transcript_correction",
+                "version": str(len(existing) + 1),
+                "content": content,
+                "generator_version": "human-researcher-correction-v1",
+                "metadata": {
+                    "source_transcript_artifact_id": source.get("artifact_id"),
+                    "source_transcript_checksum": source.get("checksum"),
+                    "append_only": True,
+                },
+            },
+        )
+
     def export_bundle(self, session_id: str):
         from .export_service import build_study1_export, merge_media_export
 
@@ -2286,9 +2629,19 @@ class Study1Service:
             "phase": snapshot["phase"],
             "phase_version": snapshot["phase_version"],
             "phase_started_at": snapshot["phase_started_at"],
-            "remaining_seconds": snapshot.get("remaining_seconds"),
+            "remaining_seconds": _remaining_seconds(snapshot),
             **readiness(snapshot),
+            "consent_version": (snapshot.get("experiment_config") or {}).get(
+                "consent_version", "study1-consent-v1"
+            ),
+            "structured_instruments": bool(snapshot.get("structured_instruments")),
         }
+        if role in {item.value for item in HUMAN_ROLES}:
+            completion = snapshot.get("completion") or {}
+            base["my_completed_actions"] = sorted(
+                key for key, completed in completion.items()
+                if completed is True and key.endswith(f":{role}")
+            )
         if role == Study1Role.PRINCIPAL.value and snapshot["phase"] == "PROXY_MEETING":
             return {
                 **base,
@@ -2333,6 +2686,7 @@ def _normalize_materials(
                 if content is not None
                 else str(storage_uri).encode("utf-8")
             )
+            metadata = copy.deepcopy(item.get("metadata") or {})
             rows.append(
                 {
                     "material_id": str(uuid.uuid4()),
@@ -2343,10 +2697,119 @@ def _normalize_materials(
                     "storage_uri": str(storage_uri) if storage_uri else None,
                     "checksum": hashlib.sha256(checksum_source).hexdigest(),
                     "created_at": created_at,
-                    "metadata_payload": copy.deepcopy(item.get("metadata") or {}),
+                    "metadata_payload": metadata,
                 }
             )
+    visibility_by_text: dict[str, set[str]] = {}
+    for row in rows:
+        for text in _material_fact_texts(row.get("content")):
+            visibility_by_text.setdefault(text.casefold(), set()).add(row["role"])
+    for row in rows:
+        if row["metadata_payload"].get("facts"):
+            _validate_material_facts(row["metadata_payload"]["facts"], row["role"])
+            continue
+        facts = []
+        for index, text in enumerate(_material_fact_texts(row.get("content")), start=1):
+            visible_to = sorted(visibility_by_text[text.casefold()])
+            facts.append(
+                {
+                    "fact_id": f"{row['role']}-f{index}-{hashlib.sha256(text.encode('utf-8')).hexdigest()[:10]}",
+                    "text": text,
+                    "candidate_id": "unspecified",
+                    "valence": "neutral",
+                    "information_type": "shared" if len(visible_to) > 1 else "unique",
+                    "visible_to_roles": visible_to,
+                }
+            )
+        row["metadata_payload"]["facts"] = facts
     return rows
+
+
+def _material_fact_texts(content: Any) -> list[str]:
+    if content is None:
+        return []
+    return [
+        value.strip()
+        for value in re.split(r"(?:\r?\n)+|(?<=[。！？.!?])\s+", str(content))
+        if value.strip()
+    ]
+
+
+def _validate_material_facts(facts: Any, material_role: str) -> None:
+    if not isinstance(facts, list) or not facts:
+        raise Study1ServiceError("INVALID_MATERIAL_FACTS", "facts must be a non-empty list", 400)
+    seen: set[str] = set()
+    for fact in facts:
+        if not isinstance(fact, dict):
+            raise Study1ServiceError("INVALID_MATERIAL_FACTS", "each fact must be an object", 400)
+        required = (
+            "fact_id",
+            "text",
+            "candidate_id",
+            "valence",
+            "information_type",
+            "visible_to_roles",
+        )
+        if any(fact.get(field) in (None, "", []) for field in required):
+            raise Study1ServiceError(
+                "INVALID_MATERIAL_FACTS",
+                "each fact requires fact_id, text, candidate_id, valence, information_type, and visible_to_roles",
+                400,
+            )
+        if fact["fact_id"] in seen:
+            raise Study1ServiceError("INVALID_MATERIAL_FACTS", "fact_id values must be unique", 400)
+        seen.add(fact["fact_id"])
+        if material_role not in fact["visible_to_roles"]:
+            raise Study1ServiceError(
+                "INVALID_MATERIAL_FACTS",
+                "a material fact must be visible to its assigned role",
+                400,
+            )
+
+
+def _normalize_experiment_config(value: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise Study1ServiceError(
+            "INVALID_EXPERIMENT_CONFIG", "experiment_config must be an object", 400
+        )
+    durations = value.get("phase_durations_seconds") or {}
+    if not isinstance(durations, dict):
+        raise Study1ServiceError(
+            "INVALID_PHASE_DURATIONS", "phase_durations_seconds must be an object", 400
+        )
+    clean_durations: dict[str, int] = {}
+    valid_phases = {phase.value for phase in Study1Phase}
+    for phase, seconds in durations.items():
+        if phase not in valid_phases:
+            raise Study1ServiceError("INVALID_PHASE_DURATIONS", f"Unknown phase: {phase}", 400)
+        try:
+            clean_seconds = int(seconds)
+        except (TypeError, ValueError) as error:
+            raise Study1ServiceError(
+                "INVALID_PHASE_DURATIONS", f"Duration for {phase} must be an integer", 400
+            ) from error
+        if clean_seconds < 0 or clean_seconds > 86400:
+            raise Study1ServiceError(
+                "INVALID_PHASE_DURATIONS", f"Duration for {phase} must be 0-86400", 400
+            )
+        clean_durations[phase] = clean_seconds
+    return {
+        "task_version": str(value.get("task_version") or "2.0")[:64],
+        "task_instance_id": str(value.get("task_instance_id") or "study1-default")[:128],
+        "summary_template_version": str(
+            value.get("summary_template_version") or "study1-five-section-v1"
+        )[:64],
+        "transcript_access_policy": str(
+            value.get("transcript_access_policy") or "principal_after_delegation"
+        )[:64],
+        "proxy_model_version": str(value.get("proxy_model_version") or "configured-at-runtime")[:128],
+        "consent_version": str(value.get("consent_version") or "study1-consent-v1")[:64],
+        "role_assignment_mode": str(value.get("role_assignment_mode") or "fixed")[:32],
+        "randomization_seed": str(value.get("randomization_seed") or secrets.token_hex(8))[:64],
+        "phase_durations_seconds": clean_durations,
+        "require_consent": bool(value.get("require_consent", False)),
+        "structured_instruments": bool(value.get("structured_instruments", False)),
+    }
 
 
 def _validate_media_event_envelope(data: dict[str, Any]) -> dict[str, Any]:
@@ -2375,7 +2838,13 @@ def _validate_media_event_envelope(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_artifact(session_id: str, data: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"transcript", "summary", "recording_manifest", "agent_log_manifest"}
+    allowed = {
+        "transcript",
+        "summary",
+        "recording_manifest",
+        "agent_log_manifest",
+        "transcript_correction",
+    }
     artifact_type = str(data.get("type") or "")
     if artifact_type not in allowed:
         raise Study1ServiceError("INVALID_ARTIFACT_TYPE", "Invalid artifact type", 400)

@@ -67,6 +67,7 @@ def create_study1_session():
             int(data.get("invite_ttl_seconds") or 86400),
             data.get("materials_by_role") or {},
             int(data.get("minimum_review_seconds") or 0),
+            data.get("experiment_config") or {},
         )
         return jsonify(result), 201
     except Study1ServiceError as error:
@@ -307,6 +308,38 @@ def create_study1_incident(session_id: str):
                 ),
             }
         ), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/clone")
+@require_study1_auth([Study1Role.RESEARCHER])
+def clone_study1_session(session_id: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().clone_session(
+            session_id,
+            str(data.get("session_name") or ""),
+            int(data.get("invite_ttl_seconds") or 86400),
+        )
+        return jsonify(result), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/transcript-corrections")
+@require_study1_auth([Study1Role.RESEARCHER])
+def create_study1_transcript_correction(session_id: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().create_transcript_correction(
+            session_id,
+            g.study1_identity.as_actor(),
+            str(data.get("segment_id") or ""),
+            str(data.get("corrected_text") or ""),
+            str(data.get("reason") or ""),
+        )
+        return jsonify(result), 201
     except Study1ServiceError as error:
         return _service_error(error)
 

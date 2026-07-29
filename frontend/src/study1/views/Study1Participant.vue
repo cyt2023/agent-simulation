@@ -8,10 +8,10 @@ import ProxyConfigPhase from '../components/ProxyConfigPhase.vue'
 import WaitingRoom from '../components/WaitingRoom.vue'
 import ReviewPhase from '../components/ReviewPhase.vue'
 import SurveyPhase from '../components/SurveyPhase.vue'
-import HandoffPhase from '../components/HandoffPhase.vue'
 import CompletionPhase from '../components/CompletionPhase.vue'
 import Study1VoiceRoom from '../components/Study1VoiceRoom.vue'
 import Study1DeviceCheck from '../components/Study1DeviceCheck.vue'
+import ConsentPhase from '../components/ConsentPhase.vue'
 import {
   clearStudy1Auth,
   createSubmission,
@@ -42,6 +42,8 @@ let noticeTimer = null
 const phase = computed(() => session.value?.phase || 'SETUP')
 const role = computed(() => identity.value?.role || '')
 const isParticipant = computed(() => ['principal', 'teammate_1', 'teammate_2'].includes(role.value))
+const completedActions = computed(() => new Set(session.value?.my_completed_actions || []))
+const hasCompleted = type => completedActions.value.has(`${type}:${role.value}`)
 
 function clearError() {
   window.clearTimeout(errorTimer)
@@ -118,7 +120,7 @@ async function submit(type, payload) {
   clearError()
   clearNotice()
   try {
-    await createSubmission(identity.value.session_id, type, payload)
+    await createSubmission(identity.value.session_id, type, payload, '2.0')
     showTransientNotice('Saved and locked. Please wait for the researcher.')
     await refresh()
   } catch (reason) {
@@ -169,12 +171,20 @@ onUnmounted(() => {
         :phase="session.phase"
         :status="session.status"
         :ready="session.ready_to_advance"
+        :remaining-seconds="session.remaining_seconds"
       />
       <p class="role-label">Signed in as {{ role.replaceAll('_', ' ') }}</p>
       <p v-if="error" class="message error">{{ error }}</p>
       <p v-if="notice" class="message success">{{ notice }}</p>
       <div class="card">
         <section v-if="phase === 'SETUP'">
+          <ConsentPhase
+            :role="role"
+            :consent-version="session.consent_version"
+            :busy="busy"
+            :locked="hasCompleted('consent')"
+            @submit="submit('consent', $event)"
+          />
           <Study1DeviceCheck :session-id="identity.session_id" />
           <WaitingRoom message="The researcher has not started the session." />
         </section>
@@ -187,7 +197,9 @@ onUnmounted(() => {
         <VotePhase
           v-else-if="phase === 'PRE_VOTE'"
           title="Initial judgment"
+          variant="pre"
           :busy="busy"
+          :locked="hasCompleted(role === 'principal' ? 'proxy_config' : 'proxy_ready')"
           @submit="submit('pre_vote', $event)"
         />
         <ProxyConfigPhase
@@ -214,6 +226,7 @@ onUnmounted(() => {
         <VotePhase
           v-else-if="phase === 'TENTATIVE_DECISION' && role !== 'principal'"
           title="Tentative decision"
+          variant="tentative"
           :busy="busy"
           @submit="submit('tentative_decision', $event)"
         />
@@ -221,6 +234,7 @@ onUnmounted(() => {
         <SurveyPhase
           v-else-if="phase === 'DELEGATION_EXPECTATION' && role === 'principal'"
           title="Delegation expectation"
+          instrument="delegation_expectation"
           :busy="busy"
           @submit="submit('delegation_expectation', $event)"
         />
@@ -233,13 +247,13 @@ onUnmounted(() => {
         <SurveyPhase
           v-else-if="phase === 'COMPREHENSION_MEASUREMENT' && role === 'principal'"
           title="Comprehension measurement"
+          instrument="comprehension_measurement"
           :busy="busy"
           @submit="submit('comprehension_measurement', $event)"
         />
         <WaitingRoom v-else-if="phase === 'COMPREHENSION_MEASUREMENT'" />
-        <HandoffPhase v-else-if="phase === 'HANDOFF'" />
         <Study1VoiceRoom
-          v-else-if="phase === 'SYNC_MEETING'"
+          v-else-if="['HANDOFF', 'SYNC_MEETING'].includes(phase)"
           :session-id="identity.session_id"
           :phase="phase"
           :phase-version="session.phase_version"
@@ -249,18 +263,21 @@ onUnmounted(() => {
         <VotePhase
           v-else-if="phase === 'FINAL_DECISION'"
           title="Final decision"
+          variant="final"
           :busy="busy"
           @submit="submit('final_decision', $event)"
         />
         <SurveyPhase
           v-else-if="phase === 'FOLLOWUP_TASK'"
           title="Follow-up collaboration task"
+          instrument="followup_task"
           :busy="busy"
           @submit="submit('followup_task', $event)"
         />
         <SurveyPhase
           v-else-if="phase === 'POST_SURVEY'"
           title="Final questionnaire"
+          instrument="post_survey"
           :busy="busy"
           @submit="submit('post_survey', $event)"
         />

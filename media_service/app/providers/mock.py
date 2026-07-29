@@ -32,16 +32,18 @@ class MockLanguageModelProvider:
         if "factual meeting record" in system_prompt:
             segments = json.loads(input_text)
             if not segments:
-                return json.dumps({"items": []})
+                return json.dumps({"sections": {}})
             first = segments[0]
             return json.dumps(
                 {
-                    "items": [
-                        {
-                            "text": first["text"],
-                            "segment_ids": [first["segment_id"]],
-                        }
-                    ]
+                    "sections": {
+                        "discussion_overview": [
+                            {
+                                "text": first["text"],
+                                "segment_ids": [first["segment_id"]],
+                            }
+                        ]
+                    }
                 }
             )
         return "Meeting statements were recorded with speaker attribution."
