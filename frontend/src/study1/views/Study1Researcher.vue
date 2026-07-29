@@ -4,7 +4,9 @@ import PhaseHeader from '../components/PhaseHeader.vue'
 import Study1FilePicker from '../components/Study1FilePicker.vue'
 import {
   addStudy1Incident,
+  addTranscriptCorrection,
   controlStudy1Session,
+  cloneStudy1Session,
   createStudy1Session,
   fetchResearcherDashboard,
   getStudy1Identity,
@@ -35,6 +37,15 @@ const appOrigin = window.location.origin
 const researcherKey = ref('')
 const sessionName = ref('')
 const minimumReviewSeconds = ref(0)
+const taskInstanceId = ref('study1-default')
+const proxyModelVersion = ref('configured-at-runtime')
+const phaseDurations = ref({
+  MATERIAL_READING: 600,
+  PRE_VOTE: 300,
+  PROXY_MEETING: 900,
+  REVIEW: 600,
+  SYNC_MEETING: 900,
+})
 const materialText = ref({ principal: '', teammate_1: '', teammate_2: '' })
 const materialFiles = ref({ principal: [], teammate_1: [], teammate_2: [] })
 const sessionList = ref([])
@@ -82,6 +93,20 @@ async function createSession() {
       session_name: sessionName.value,
       minimum_review_seconds: Number(minimumReviewSeconds.value) || 0,
       materials_by_role: materialsByRole,
+      experiment_config: {
+        task_version: '2.0',
+        task_instance_id: taskInstanceId.value.trim() || 'study1-default',
+        summary_template_version: 'study1-five-section-v1',
+        transcript_access_policy: 'principal_after_delegation',
+        proxy_model_version: proxyModelVersion.value.trim() || 'configured-at-runtime',
+        consent_version: 'study1-consent-v1',
+        role_assignment_mode: 'randomized',
+        require_consent: true,
+        structured_instruments: true,
+        phase_durations_seconds: Object.fromEntries(
+          Object.entries(phaseDurations.value).map(([phase, seconds]) => [phase, Number(seconds) || 0]),
+        ),
+      },
     })
     invites.value = result.invites
     selectedSessionId.value = result.session.session_id
@@ -165,7 +190,32 @@ async function advance(force = false) {
 
 function extendPhase() {
   const seconds = Number(window.prompt('Extension in seconds:', '300'))
-  if (seconds > 0) control('extend', { seconds })
+  if (seconds <= 0) return
+  const reason = window.prompt('Reason for extending this phase (required):')?.trim()
+  if (reason) control('extend', { seconds, reason })
+}
+
+async function cloneSelectedSession() {
+  if (!selectedSessionId.value) return
+  const name = window.prompt('New session label for the cloned locked configuration:')?.trim()
+  if (!name) return
+  busy.value = true
+  try {
+    const result = await cloneStudy1Session(selectedSessionId.value, name)
+    invites.value = result.invites
+    selectedSessionId.value = result.session.session_id
+    await loadSessions()
+    await selectSession()
+  } catch (failure) {
+    error.value = failure.message
+  } finally {
+    busy.value = false
+  }
+}
+
+function auditedControl(action) {
+  const reason = window.prompt(`Reason for ${action} (required):`)?.trim()
+  if (reason) control(action, { reason })
 }
 
 async function addIncident() {
@@ -180,6 +230,28 @@ async function addIncident() {
     await refreshDashboard()
   } catch (reason) {
     error.value = reason.message
+  }
+}
+
+async function correctTranscript() {
+  const segmentId = window.prompt('Transcript segment ID:')?.trim()
+  if (!segmentId) return
+  const correctedText = window.prompt('Corrected transcript text:')?.trim()
+  if (!correctedText) return
+  const reason = window.prompt('Correction reason (required):')?.trim()
+  if (!reason) return
+  busy.value = true
+  try {
+    await addTranscriptCorrection(selectedSessionId.value, {
+      segment_id: segmentId,
+      corrected_text: correctedText,
+      reason,
+    })
+    await refreshDashboard()
+  } catch (failure) {
+    error.value = failure.message
+  } finally {
+    busy.value = false
   }
 }
 
@@ -289,7 +361,18 @@ onUnmounted(() => {
         <div class="grid">
           <label>Session label<input v-model="sessionName" /></label>
           <label>Minimum review seconds<input v-model.number="minimumReviewSeconds" type="number" min="0" /></label>
+          <label>Task instance ID<input v-model="taskInstanceId" /></label>
+          <label>Proxy model/version<input v-model="proxyModelVersion" /></label>
         </div>
+        <details>
+          <summary>Locked phase durations</summary>
+          <div class="grid duration-grid">
+            <label v-for="(_, phase) in phaseDurations" :key="phase">
+              {{ phase.replaceAll('_', ' ') }} seconds
+              <input v-model.number="phaseDurations[phase]" type="number" min="0" max="86400">
+            </label>
+          </div>
+        </details>
         <label v-for="role in ['principal', 'teammate_1', 'teammate_2']" :key="role">
           {{ role.replaceAll('_', ' ') }} private material
           <textarea v-model="materialText[role]" rows="3" />
@@ -320,6 +403,9 @@ onUnmounted(() => {
             </option>
           </select>
         </label>
+        <button :disabled="busy || !selectedSessionId" @click="cloneSelectedSession">
+          Clone locked configuration
+        </button>
       </section>
 
       <template v-if="dashboard">
@@ -327,6 +413,7 @@ onUnmounted(() => {
           :phase="dashboard.phase"
           :status="dashboard.status"
           :ready="dashboard.ready_to_advance"
+          :remaining-seconds="dashboard.remaining_seconds"
         />
         <section class="metrics">
           <div><span>Phase started</span><strong>{{ dashboard.phase_started_at }}</strong></div>
@@ -381,7 +468,7 @@ onUnmounted(() => {
           <div class="primary-controls">
             <button
               class="control-button control-button--major"
-              :disabled="busy || dashboard.status !== 'waiting'"
+              :disabled="busy || dashboard.status !== 'waiting' || !dashboard.ready_to_advance"
               @click="control('start')"
             >
               Start Session
@@ -422,10 +509,17 @@ onUnmounted(() => {
 
           <div class="supporting-controls">
             <div class="secondary-controls">
-              <button :disabled="busy || dashboard.status !== 'running'" @click="control('pause')">Pause</button>
-              <button :disabled="busy || dashboard.status !== 'paused'" @click="control('resume')">Resume</button>
+              <button :disabled="busy || dashboard.status !== 'running'" @click="auditedControl('pause')">Pause</button>
+              <button :disabled="busy || dashboard.status !== 'paused'" @click="auditedControl('resume')">Resume</button>
               <button :disabled="busy" @click="extendPhase">Extend Phase</button>
               <button :disabled="busy" @click="addIncident">Add Incident</button>
+              <button
+                v-if="dashboard.phase === 'REVIEW'"
+                :disabled="busy"
+                @click="correctTranscript"
+              >
+                Record ASR Correction
+              </button>
               <button
                 v-if="dashboard.phase === 'REVIEW' && mediaStatus?.mode !== 'mock'"
                 :disabled="busy || !mediaStatus?.summary_version"
@@ -439,7 +533,7 @@ onUnmounted(() => {
               <button
                 class="danger"
                 :disabled="busy || ['terminated','completed'].includes(dashboard.status)"
-                @click="control('terminate', { reason: 'researcher action' })"
+                @click="auditedControl('terminate')"
               >
                 Terminate
               </button>
@@ -500,4 +594,5 @@ th,td { text-align:left; border-bottom:1px solid #dde4ea; padding:.65rem; }
   .control-button--major { width:100%; }
   .supporting-controls { align-items:flex-start; flex-direction:column; }
 }
+
 </style>

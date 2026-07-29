@@ -15,6 +15,7 @@ class AccessDenied(ValueError):
 
 _ROOM_ACCESS = {
     "PROXY_MEETING": {"teammate_1", "teammate_2", "proxy"},
+    "HANDOFF": {"principal", "teammate_1", "teammate_2"},
     "SYNC_MEETING": {"principal", "teammate_1", "teammate_2"},
 }
 
@@ -40,7 +41,11 @@ class MediaAccessService:
         if role == "proxy" and phase != "PROXY_MEETING":
             raise AccessDenied("Proxy cannot enter the synchronous room")
         room_kind = "proxy" if phase == "PROXY_MEETING" else "sync"
-        room_name = f"study1-{_room_session_part(session_id)}-{room_kind}-v{phase_version}"
+        room_name = (
+            f"study1-{_room_session_part(session_id)}-proxy-v{phase_version}"
+            if room_kind == "proxy"
+            else f"study1-{_room_session_part(session_id)}-sync"
+        )
         expires_at = datetime.now(timezone.utc) + timedelta(
             seconds=self.settings.livekit_token_ttl_seconds
         )
@@ -55,9 +60,7 @@ class MediaAccessService:
     def issue_recorder_access(
         self, session_id: str, phase_version: int
     ) -> MediaAccessResponse:
-        room_name = (
-            f"study1-{_room_session_part(session_id)}-sync-v{phase_version}"
-        )
+        room_name = f"study1-{_room_session_part(session_id)}-sync"
         expires_at = datetime.now(timezone.utc) + timedelta(
             seconds=self.settings.livekit_token_ttl_seconds
         )

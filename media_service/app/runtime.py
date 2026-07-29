@@ -46,6 +46,8 @@ def room_name(session_id: str, room_kind: str, phase_version: int) -> str:
         character if character.isalnum() or character in "_-" else "-"
         for character in session_id
     )[:96]
+    if room_kind == "sync":
+        return f"study1-{safe_session}-sync"
     return f"study1-{safe_session}-{room_kind}-v{phase_version}"
 
 
@@ -210,11 +212,17 @@ class RuntimeCoordinator:
             self.repository.update_runtime_state(
                 runtime.runtime_id, RuntimeState.STOPPED, ended=True
             )
+        sync_room = room_name(session_id, "sync", phase_version)
+        await self.livekit.ensure_room(sync_room)
         self.repository.enqueue_event(
             session_id,
             phase_version,
             "HANDOFF_COMPLETE",
-            {"proxy_disconnected": True},
+            {
+                "proxy_disconnected": True,
+                "sync_room_ready": True,
+                "room_name": sync_room,
+            },
         )
 
     async def regenerate_summary(

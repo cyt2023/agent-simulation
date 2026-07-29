@@ -180,7 +180,12 @@ async function disconnectRoom() {
 
 watch(
   () => [props.phase, props.phaseVersion],
-  () => disconnectRoom(),
+  ([nextPhase], [previousPhase]) => {
+    const seamlessHandoff = (
+      previousPhase === 'HANDOFF' && nextPhase === 'SYNC_MEETING'
+    )
+    if (!seamlessHandoff) disconnectRoom()
+  },
 )
 
 onMounted(checkMicrophone)
@@ -194,7 +199,9 @@ onUnmounted(() => {
   <section class="voice-room" aria-labelledby="voice-room-title">
     <header>
       <div>
-        <p class="eyebrow">{{ phase === 'PROXY_MEETING' ? 'Delegated discussion' : 'Synchronous discussion' }}</p>
+        <p class="eyebrow">
+          {{ phase === 'PROXY_MEETING' ? 'Delegated discussion' : (phase === 'HANDOFF' ? 'Live handoff' : 'Synchronous discussion') }}
+        </p>
         <h2 id="voice-room-title">Audio meeting</h2>
       </div>
       <span class="connection" :data-state="connectionState">{{ connectionState }}</span>
@@ -260,7 +267,7 @@ onUnmounted(() => {
       </template>
     </div>
     <p v-if="connectionState === 'connected'" data-test="microphone-status" class="microphone-status">
-      Microphone {{ muted ? 'muted' : 'live' }}
+      {{ phase === 'HANDOFF' ? 'Stay connected; the researcher is admitting P and removing X.' : `Microphone ${muted ? 'muted' : 'live'}` }}
     </p>
     <div ref="audioHost" hidden />
   </section>

@@ -30,6 +30,9 @@ def access_service():
         ("SYNC_MEETING", "principal", True),
         ("SYNC_MEETING", "teammate_1", True),
         ("SYNC_MEETING", "teammate_2", True),
+        ("HANDOFF", "principal", True),
+        ("HANDOFF", "teammate_1", True),
+        ("HANDOFF", "teammate_2", True),
     ],
 )
 def test_access_matrix(access_service, phase, role, allowed):
@@ -41,7 +44,7 @@ def test_access_matrix(access_service, phase, role, allowed):
     result = access_service.issue_access(
         "session-1", phase, 7, role, f"id-{role}"
     )
-    assert result.room_name.endswith("proxy-v7" if phase == "PROXY_MEETING" else "sync-v7")
+    assert result.room_name.endswith("proxy-v7" if phase == "PROXY_MEETING" else "sync")
     assert result.captions_enabled is False
     assert result.token
     claims = jwt.decode(result.token, options={"verify_signature": False})
@@ -61,6 +64,6 @@ def test_sync_recorder_token_is_subscribe_only(access_service):
 
     claims = jwt.decode(result.token, options={"verify_signature": False})
     assert claims["name"] == "recorder"
-    assert claims["video"]["room"] == "study1-session-1-sync-v7"
+    assert claims["video"]["room"] == "study1-session-1-sync"
     assert claims["video"]["canSubscribe"] is True
     assert claims["video"]["canPublish"] is False

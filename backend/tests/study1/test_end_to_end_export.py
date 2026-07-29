@@ -204,6 +204,7 @@ def test_complete_mock_study1_flow_and_export(memory_service):
             "artifacts_manifest.json",
             "materials_assignment.json",
             "schema_version.json",
+            "integrity_report.json",
         }
         schema = json.loads(archive.read("schema_version.json"))
         assert schema["protocol_version"] == "study1-a-1.0"

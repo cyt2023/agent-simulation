@@ -61,6 +61,8 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
     }
     missing_submissions = []
     for submission_type, (_, roles) in SUBMISSION_RULES.items():
+        if submission_type == "consent" and not session.get("require_consent"):
+            continue
         for role in roles:
             if (submission_type, role.value) not in submitted_keys:
                 missing_submissions.append(f"{submission_type}:{role.value}")
@@ -174,6 +176,28 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
         },
         "generated_at": utc_iso(),
     }
+    integrity_report = {
+        "complete": not (
+            missing_submissions
+            or missing_artifacts
+            or incidents
+            or schema["missing_data"]["current_phase_prerequisites"]
+        ),
+        "missing_submissions": missing_submissions,
+        "missing_artifacts": missing_artifacts,
+        "missing_current_phase_prerequisites": schema["missing_data"][
+            "current_phase_prerequisites"
+        ],
+        "incident_count": len(incidents),
+        "disconnect_events": [
+            event
+            for event in events
+            if event.get("event_type") in ("participant_disconnected", "media_disconnected")
+        ],
+        "override_count": len(override_events),
+        "configuration_checksum": session.get("configuration_checksum"),
+        "generated_at": utc_iso(),
+    }
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -221,6 +245,7 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
         archive.writestr("artifacts_manifest.json", _json_bytes(artifact_manifest))
         archive.writestr("materials_assignment.json", _json_bytes(material_assignment))
         archive.writestr("schema_version.json", _json_bytes(schema))
+        archive.writestr("integrity_report.json", _json_bytes(integrity_report))
     buffer.seek(0)
     return buffer
 

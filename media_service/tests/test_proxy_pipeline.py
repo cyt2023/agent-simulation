@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+import asyncio
 import io
 import json
 import zipfile
@@ -215,3 +216,50 @@ async def test_proxy_pipeline_blocks_non_neutral_live_response(repository, tmp_p
     event = repository.pending_outbox()[-1]
     assert event.event_type == "MEDIA_PROXY_NEUTRALITY_BLOCKED"
     assert event.payload["runtime_id"] == "runtime-1"
+
+
+class BlockingTts:
+    version = "blocking-tts-v1"
+
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def synthesize(self, _text):
+        self.started.set()
+        await self.release.wait()
+        yield b"late-proxy-audio"
+
+
+@pytest.mark.asyncio
+async def test_human_barge_in_cancels_proxy_audio_and_is_audited(repository, tmp_path):
+    published = []
+    tts = BlockingTts()
+
+    async def publish(session_id, chunk):
+        published.append((session_id, chunk))
+
+    pipeline = ProxyMediaPipeline(
+        repository,
+        FakeAsr(),
+        FakeLlm(),
+        tts,
+        publish_audio=publish,
+        media_root=tmp_path,
+        proxy_prompt_version="proxy-v1",
+        summary_prompt_version="neutral-summary-v1",
+    )
+    pipeline.start_session("session-1", "runtime-1", {"proxy_config": {}})
+
+    processing = asyncio.create_task(
+        pipeline.process_utterance(
+            "session-1", "teammate_1", b"human-pcm", start_ms=100, end_ms=900
+        )
+    )
+    await tts.started.wait()
+    assert pipeline.interrupt("session-1", "teammate_2") is True
+    await processing
+
+    assert published == []
+    assert all(row.speaker != "proxy" for row in repository.list_session_segments("session-1"))
+    assert repository.pending_outbox()[-1].event_type == "MEDIA_BARGE_IN"

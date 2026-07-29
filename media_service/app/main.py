@@ -203,6 +203,7 @@ def create_app(
         return {
             "session_id": session_id,
             "service_status": "ok",
+            "mode": "mock" if resolved_settings.media_provider == "mock" else "live",
             "runtime_state": active.state if active else "IDLE",
             "room_kind": active.room_kind if active else None,
             "room_name": active.room_name if active else None,

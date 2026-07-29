@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, MutableMapping
 
 from .models import HUMAN_ROLES, PHASE_ORDER, Study1Phase
@@ -74,7 +74,9 @@ def missing_prerequisites(
     completion = session.get("completion") or {}
     missing: list[str] = []
 
-    if target is Study1Phase.PRE_VOTE:
+    if target is Study1Phase.MATERIAL_READING and session.get("require_consent"):
+        missing.extend(_all_roles(completion, "consent"))
+    elif target is Study1Phase.PRE_VOTE:
         missing.extend(_all_roles(completion, "material_ack"))
     elif target is Study1Phase.PROXY_CONFIGURATION:
         missing.extend(_all_roles(completion, "pre_vote"))
@@ -235,4 +237,16 @@ def transition_phase(
     session["entered_by"] = actor_payload
     session["transition_reason"] = clean_reason or None
     session["prerequisites"] = copy.deepcopy(event["prerequisites"])
+    durations = (session.get("experiment_config") or {}).get(
+        "phase_durations_seconds", {}
+    )
+    session["remaining_seconds"] = int(durations.get(target.value) or 0)
+    session["phase_deadline_at"] = (
+        _utc_iso(
+            (now or datetime.now(timezone.utc))
+            + timedelta(seconds=session["remaining_seconds"])
+        )
+        if session["remaining_seconds"] > 0
+        else None
+    )
     return event
