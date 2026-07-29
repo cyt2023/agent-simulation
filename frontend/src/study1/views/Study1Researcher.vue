@@ -377,45 +377,75 @@ onUnmounted(() => {
           </table>
           <p v-if="mediaStatus?.error" class="error">{{ mediaStatus.error }}</p>
         </section>
-        <section class="controls">
-          <button :disabled="busy || dashboard.status !== 'waiting'" @click="control('start')">Start Session</button>
-          <button :disabled="busy || !nextPhase || !dashboard.ready_to_advance" @click="advance(false)">Advance Phase</button>
-          <button :disabled="busy || dashboard.status !== 'running'" @click="control('pause')">Pause</button>
-          <button :disabled="busy || dashboard.status !== 'paused'" @click="control('resume')">Resume</button>
-          <button :disabled="busy" @click="extendPhase">Extend Phase</button>
-          <button :disabled="busy || ['terminated','completed'].includes(dashboard.status)" @click="control('terminate', { reason: 'researcher action' })">Terminate</button>
-          <button class="danger" :disabled="busy || !nextPhase" @click="advance(true)">Force Advance</button>
-          <button :disabled="busy" @click="addIncident">Add Incident</button>
-          <button
-            v-if="['PROXY_MEETING','HANDOFF','SYNC_MEETING'].includes(dashboard.phase)"
-            :disabled="busy"
-            @click="startMedia"
-          >
-            {{ mediaStatus?.mode === 'mock' ? 'Issue Mock Media Command' : 'Start Media Operation' }}
-          </button>
-          <button
-            v-if="['PROXY_MEETING','HANDOFF','SYNC_MEETING'].includes(dashboard.phase)"
-            v-show="mediaStatus?.mode === 'mock'"
-            :disabled="busy || mediaStatus?.mode !== 'mock'"
-            @click="confirmMockComplete"
-          >
-            Confirm Mock Complete
-          </button>
-          <button
-            v-if="canEndMeeting(dashboard.phase) && mediaStatus?.mode !== 'mock'"
-            :disabled="busy"
-            @click="endMeeting"
-          >
-            End Current Meeting
-          </button>
-          <button
-            v-if="dashboard.phase === 'REVIEW' && mediaStatus?.mode !== 'mock'"
-            :disabled="busy || !mediaStatus?.summary_version"
-            @click="regenerateSummary"
-          >
-            Regenerate Summary
-          </button>
-          <button :disabled="busy" @click="exportData">Export Data</button>
+        <section class="controls" aria-label="Session controls">
+          <div class="primary-controls">
+            <button
+              class="control-button control-button--major"
+              :disabled="busy || dashboard.status !== 'waiting'"
+              @click="control('start')"
+            >
+              Start Session
+            </button>
+            <button
+              class="control-button control-button--major control-button--advance"
+              :disabled="busy || !nextPhase || !dashboard.ready_to_advance"
+              @click="advance(false)"
+            >
+              Advance Phase
+            </button>
+            <button
+              v-if="['PROXY_MEETING','HANDOFF','SYNC_MEETING'].includes(dashboard.phase)"
+              class="control-button control-button--major control-button--media"
+              :disabled="busy"
+              @click="startMedia"
+            >
+              {{ mediaStatus?.mode === 'mock' ? 'Issue Mock Media Command' : 'Start Media Operation' }}
+            </button>
+            <button
+              v-if="['PROXY_MEETING','HANDOFF','SYNC_MEETING'].includes(dashboard.phase)"
+              v-show="mediaStatus?.mode === 'mock'"
+              class="control-button control-button--major control-button--media"
+              :disabled="busy || mediaStatus?.mode !== 'mock'"
+              @click="confirmMockComplete"
+            >
+              Confirm Mock Complete
+            </button>
+            <button
+              v-if="canEndMeeting(dashboard.phase) && mediaStatus?.mode !== 'mock'"
+              class="control-button control-button--major control-button--media"
+              :disabled="busy"
+              @click="endMeeting"
+            >
+              End Current Meeting
+            </button>
+          </div>
+
+          <div class="supporting-controls">
+            <div class="secondary-controls">
+              <button :disabled="busy || dashboard.status !== 'running'" @click="control('pause')">Pause</button>
+              <button :disabled="busy || dashboard.status !== 'paused'" @click="control('resume')">Resume</button>
+              <button :disabled="busy" @click="extendPhase">Extend Phase</button>
+              <button :disabled="busy" @click="addIncident">Add Incident</button>
+              <button
+                v-if="dashboard.phase === 'REVIEW' && mediaStatus?.mode !== 'mock'"
+                :disabled="busy || !mediaStatus?.summary_version"
+                @click="regenerateSummary"
+              >
+                Regenerate Summary
+              </button>
+              <button :disabled="busy" @click="exportData">Export Data</button>
+            </div>
+            <div class="safety-controls">
+              <button
+                class="danger"
+                :disabled="busy || ['terminated','completed'].includes(dashboard.status)"
+                @click="control('terminate', { reason: 'researcher action' })"
+              >
+                Terminate
+              </button>
+              <button class="danger" :disabled="busy || !nextPhase" @click="advance(true)">Force Advance</button>
+            </div>
+          </div>
         </section>
       </template>
     </template>
@@ -430,9 +460,12 @@ onUnmounted(() => {
 .grid,.metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:1rem; }
 label { display:grid; gap:.4rem; margin:.8rem 0; font-weight:650; }
 input,textarea,select { padding:.65rem; border:1px solid #bac6d0; border-radius:7px; font:inherit; }
-button { border:0; border-radius:7px; padding:.65rem .9rem; background:#265f8c; color:white; font-weight:700; cursor:pointer; }
-button:disabled { opacity:.45; cursor:not-allowed; }
-.danger { background:#9c3434; }
+button { border:0; border-radius:7px; padding:.65rem .9rem; background:#265f8c; color:white; font-weight:700; cursor:pointer; transition:background-color .15s ease,box-shadow .15s ease,transform .15s ease; }
+button:not(:disabled):hover { background:#1f5278; }
+button:focus-visible { outline:3px solid rgba(38,95,140,.28); outline-offset:2px; }
+button:disabled { opacity:.42; cursor:not-allowed; box-shadow:none; }
+.danger { border:1px solid #c98585; background:#fff7f7; color:#8d2f2f; }
+.danger:not(:disabled):hover { background:#fbe8e8; color:#792424; }
 .error { background:#fff0f0; color:#922; padding:.75rem; border-radius:7px; }
 .invite { display:grid; grid-template-columns:120px 1fr; gap:1rem; padding:.5rem 0; }
 code { overflow-wrap:anywhere; }
@@ -441,7 +474,16 @@ code { overflow-wrap:anywhere; }
 .metrics span { color:#667786; font-size:.78rem; text-transform:uppercase; }
 table { width:100%; border-collapse:collapse; }
 th,td { text-align:left; border-bottom:1px solid #dde4ea; padding:.65rem; }
-.controls { display:flex; flex-wrap:wrap; gap:.65rem; margin:1.25rem 0 3rem; }
+.controls { display:grid; gap:.85rem; margin:1.25rem 0 3rem; padding:1rem; border:1px solid #dce3e9; border-radius:12px; background:#f9fbfc; }
+.primary-controls,.secondary-controls,.safety-controls { display:flex; flex-wrap:wrap; gap:.65rem; }
+.primary-controls { align-items:stretch; }
+.control-button--major { min-height:3.25rem; padding:.85rem 1.25rem; font-size:1.02rem; box-shadow:0 5px 12px rgba(38,95,140,.16); }
+.control-button--advance { background:#176b58; }
+.control-button--advance:not(:disabled):hover { background:#125746; }
+.control-button--media { background:#5a4a91; }
+.control-button--media:not(:disabled):hover { background:#493b78; }
+.supporting-controls { display:flex; align-items:center; justify-content:space-between; gap:.85rem; padding-top:.85rem; border-top:1px solid #dce3e9; }
+.secondary-controls button,.safety-controls button { padding:.48rem .7rem; font-size:.86rem; font-weight:650; }
 .panel-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; }
 .panel-heading h2,.panel-heading p { margin:0; }
 .panel-heading p { margin-top:.25rem; color:#667786; text-transform:capitalize; }
@@ -452,5 +494,10 @@ th,td { text-align:left; border-bottom:1px solid #dde4ea; padding:.65rem; }
 .media-grid dt { color:#667786; font-size:.75rem; font-weight:700; text-transform:uppercase; }
 .media-grid dd { margin:.25rem 0 0; font-weight:700; overflow-wrap:anywhere; }
 .media-grid small { display:block; margin-top:.2rem; color:#70808c; font-weight:400; }
-@media (max-width:720px) { .media-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media (max-width:720px) {
+  .media-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .primary-controls { display:grid; grid-template-columns:1fr; }
+  .control-button--major { width:100%; }
+  .supporting-controls { align-items:flex-start; flex-direction:column; }
+}
 </style>

@@ -555,9 +555,8 @@ docker compose ps
 
 ```powershell
 Set-Location frontend
-corepack enable
-yarn install
-yarn dev
+npm install
+npm run dev
 ```
 
 Vite 默认使用 `http://127.0.0.1:5173` 或终端显示的可用端口；开发服务器会把 `/api` 和 `/socket.io` 代理到 `http://localhost:5000`。
@@ -579,7 +578,7 @@ Get-ChildItem -Force
 
 同样表示当前目录错误。Docker Compose 必须在包含 `docker-compose.yml` 的目录执行。
 
-### Docker Hub、Debian 或 pip/yarn 下载超时
+### Docker Hub、Debian 或 pip/npm 下载超时
 
 这是网络或代理问题，不是应用代码错误。先确认 Docker Desktop 能访问 Docker Hub。使用本机代理时，需要在 Docker Desktop 配置 HTTPS Proxy；构建参数也可显式传递：
 

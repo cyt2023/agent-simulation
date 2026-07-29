@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import PhaseHeader from '../components/PhaseHeader.vue'
 import MaterialPhase from '../components/MaterialPhase.vue'
@@ -36,10 +36,36 @@ const notice = ref('')
 const session = ref(null)
 const identity = ref(getStudy1Identity())
 const materials = ref([])
+let errorTimer = null
+let noticeTimer = null
 
 const phase = computed(() => session.value?.phase || 'SETUP')
 const role = computed(() => identity.value?.role || '')
 const isParticipant = computed(() => ['principal', 'teammate_1', 'teammate_2'].includes(role.value))
+
+function clearError() {
+  window.clearTimeout(errorTimer)
+  errorTimer = null
+  error.value = ''
+}
+
+function clearNotice() {
+  window.clearTimeout(noticeTimer)
+  noticeTimer = null
+  notice.value = ''
+}
+
+function showTransientError(message) {
+  clearError()
+  error.value = message
+  errorTimer = window.setTimeout(clearError, 6000)
+}
+
+function showTransientNotice(message) {
+  clearNotice()
+  notice.value = message
+  noticeTimer = window.setTimeout(clearNotice, 4500)
+}
 
 async function refresh() {
   if (!identity.value?.session_id) return
@@ -77,20 +103,23 @@ async function bootstrap() {
 }
 
 function showError(reason) {
+  let message = ''
   if (reason?.data?.error === 'ACTION_NOT_ALLOWED_IN_PHASE') {
-    error.value = `This action requires ${reason.data.required_phase}; the server is currently in ${reason.data.current_phase}.`
+    message = `This action requires ${reason.data.required_phase}; the server is currently in ${reason.data.current_phase}.`
   } else {
-    error.value = reason?.message || 'Unable to load Study 1.'
+    message = reason?.message || 'Unable to load Study 1.'
   }
+  if (session.value) showTransientError(message)
+  else error.value = message
 }
 
 async function submit(type, payload) {
   busy.value = true
-  error.value = ''
-  notice.value = ''
+  clearError()
+  clearNotice()
   try {
     await createSubmission(identity.value.session_id, type, payload)
-    notice.value = 'Saved and locked. Please wait for the researcher.'
+    showTransientNotice('Saved and locked. Please wait for the researcher.')
     await refresh()
   } catch (reason) {
     showError(reason)
@@ -103,6 +132,13 @@ function onPhaseEvent(event) {
   if (event?.session_id === identity.value?.session_id) refresh().catch(showError)
 }
 
+watch(phase, (currentPhase, previousPhase) => {
+  if (currentPhase !== previousPhase) {
+    clearError()
+    clearNotice()
+  }
+})
+
 onMounted(() => {
   onStudy1Event('study1_phase_updated', onPhaseEvent)
   onStudy1Event('study1_readiness_updated', onPhaseEvent)
@@ -111,6 +147,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  window.clearTimeout(errorTimer)
+  window.clearTimeout(noticeTimer)
   offStudy1Event('study1_phase_updated', onPhaseEvent)
   offStudy1Event('study1_readiness_updated', onPhaseEvent)
   offStudy1Event('study1_session_terminated', onPhaseEvent)
@@ -165,7 +203,7 @@ onUnmounted(() => {
           :phase="phase"
           :phase-version="session.phase_version"
           :role="role"
-          @error="error = $event"
+          @error="showTransientError($event)"
         />
         <WaitingRoom
           v-else-if="phase === 'PROXY_MEETING'"
@@ -206,7 +244,7 @@ onUnmounted(() => {
           :phase="phase"
           :phase-version="session.phase_version"
           :role="role"
-          @error="error = $event"
+          @error="showTransientError($event)"
         />
         <VotePhase
           v-else-if="phase === 'FINAL_DECISION'"
@@ -236,10 +274,11 @@ onUnmounted(() => {
 .study-shell { width:min(840px, calc(100% - 2rem)); margin:2rem auto; color:#263746; font-family:Inter, ui-sans-serif, system-ui, sans-serif; }
 .card { background:#f9fbfc; border:1px solid #dce3e9; border-radius:14px; margin-top:1.25rem; padding:1.5rem; box-shadow:0 10px 28px rgba(39,58,74,.06); }
 .role-label { color:#667482; font-size:.85rem; text-transform:capitalize; }
-.message { padding:.75rem 1rem; border-radius:8px; }
+.message { padding:.75rem 1rem; border-radius:8px; animation:message-in .18s ease-out; }
 .error { background:#fff0f0; color:#9b2828; }
 .success { background:#e9f7ef; color:#17633c; }
 .error-card { text-align:center; margin-top:5rem; }
 button { border:0; border-radius:8px; background:#245f8e; color:white; padding:.7rem 1rem; font:inherit; font-weight:700; cursor:pointer; }
 button:disabled { opacity:.5; cursor:not-allowed; }
+@keyframes message-in { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:translateY(0); } }
 </style>

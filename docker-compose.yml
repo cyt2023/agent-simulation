@@ -43,6 +43,8 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:changeme@postgres:5432/humanagent}
       PGSCHEMA: ${PGSCHEMA:-humanagent_collab}
       FLASK_SECRET_KEY: ${FLASK_SECRET_KEY:-change-me-in-production}
+      FLASK_DEBUG: ${FLASK_DEBUG:-false}
+      STUDY1_RESEARCHER_KEY: ${STUDY1_RESEARCHER_KEY:?STUDY1_RESEARCHER_KEY is required}
       MEDIA_GATEWAY_MODE: http
       MEDIA_SERVICE_URL: http://media-service:8000
       A_TO_B_SERVICE_TOKEN: ${A_TO_B_SERVICE_TOKEN:?A_TO_B_SERVICE_TOKEN is required}
@@ -60,6 +62,11 @@ services:
         condition: service_healthy
       media-service:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
     networks:
       - app-network
     restart: unless-stopped
@@ -128,7 +135,8 @@ services:
     ports:
       - "${FRONTEND_PORT:-8080}:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
       - app-network
     restart: unless-stopped

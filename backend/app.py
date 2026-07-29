@@ -6,7 +6,7 @@ try:
 except ImportError:
     pass  # python-dotenv optional; use env vars directly if not installed
 
-from flask import Flask, render_template, jsonify
+from flask import Flask, jsonify
 from flask_socketio import SocketIO
 from flask_cors import CORS
 from routes.session import session_bp, hydrate_sessions_from_db
@@ -47,7 +47,18 @@ start_production_service()
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return jsonify({
+        'service': 'human-agent-collab-backend',
+        'status': 'ok',
+    })
+
+
+@app.route('/healthz')
+def healthz():
+    return jsonify({
+        'service': 'human-agent-collab-backend',
+        'status': 'ok',
+    })
 
 # Debug route to list all registered routes
 @app.route('/debug/routes')
@@ -71,7 +82,7 @@ if __name__ == '__main__':
     # allow_unsafe_werkzeug: required by Flask-SocketIO + Werkzeug 3.x when using the embedded
     # server (e.g. Docker). For hardened production, run behind gunicorn/eventlet instead.
     _port = int(os.environ.get('PORT', '5000'))
-    _debug = os.environ.get('FLASK_DEBUG', 'true').lower() in ('1', 'true', 'yes')
+    _debug = os.environ.get('FLASK_DEBUG', 'false').lower() in ('1', 'true', 'yes')
     socketio.run(
         app,
         debug=_debug,
