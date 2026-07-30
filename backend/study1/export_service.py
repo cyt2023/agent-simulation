@@ -11,6 +11,8 @@ from datetime import date, datetime
 from typing import Any
 
 from .models import HUMAN_ROLES, PHASE_SCHEMA_VERSION
+from .formal_projection import formal_readiness, project_formal_session
+from .instruments import load_instrument_catalog
 from .services import SUBMISSION_RULES, readiness, utc_iso
 
 EXPORT_SCHEMA_VERSION = "1.0"
@@ -46,7 +48,13 @@ def _csv_bytes(fieldnames: list[str], rows: list[dict[str, Any]]) -> bytes:
 
 
 def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
-    session = data["session"]
+    raw_session = data["session"]
+    is_formal = raw_session.get("protocol_mode") == "formal_v2"
+    session = (
+        project_formal_session(raw_session, data)
+        if is_formal
+        else raw_session
+    )
     submissions = data.get("submissions") or []
     events = data.get("events") or []
     incidents = data.get("incidents") or []
@@ -70,6 +78,7 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
     missing_artifacts = [
         kind for kind in ("summary", "transcript") if kind not in artifact_types
     ]
+    current_state = formal_readiness(session) if is_formal else readiness(session)
     override_events = [
         event for event in events if event.get("event_type") == "override"
     ]
@@ -153,6 +162,14 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
         "export_schema_version": EXPORT_SCHEMA_VERSION,
         "protocol_version": session.get("protocol_version"),
         "task_version": session.get("task_version"),
+        "formal_certifiable": bool(
+            is_formal and session.get("formal_certifiable", False)
+        ),
+        "certification_status": (
+            "certifiable"
+            if is_formal and session.get("formal_certifiable", False)
+            else "uncertifiable"
+        ),
         "frontend_build_version": os.environ.get(
             "STUDY1_FRONTEND_BUILD_VERSION", "unknown"
         ),
@@ -170,9 +187,7 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
         "missing_data": {
             "submissions": missing_submissions,
             "artifacts": missing_artifacts,
-            "current_phase_prerequisites": readiness(session)[
-                "missing_prerequisites"
-            ],
+            "current_phase_prerequisites": current_state["missing_prerequisites"],
         },
         "generated_at": utc_iso(),
     }
@@ -244,6 +259,56 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
         )
         archive.writestr("artifacts_manifest.json", _json_bytes(artifact_manifest))
         archive.writestr("materials_assignment.json", _json_bytes(material_assignment))
+        if is_formal:
+            task_definition = data.get("task_definition") or {
+                "task_definition_id": session.get("task_definition_id"),
+                "task_version": session.get("task_version"),
+                "title": session.get("session_name"),
+                "candidate_ids": session.get("candidate_ids") or [],
+                "facts": [],
+            }
+            task_facts = task_definition.get("facts") or []
+            catalog = load_instrument_catalog()
+            ordered_instruments = {
+                "catalog_version": catalog.get("catalog_version"),
+                "catalog_checksum": catalog.get("checksum"),
+                "instruments": catalog.get("instruments") or [],
+                "responses": data.get("instrument_responses") or [],
+            }
+            archive.writestr("task_definition.json", _json_bytes(task_definition))
+            archive.writestr("task_facts.jsonl", _jsonl_bytes(task_facts))
+            archive.writestr(
+                "role_assignments.jsonl",
+                _jsonl_bytes(data.get("role_assignments") or []),
+            )
+            archive.writestr(
+                "fact_assignments.jsonl",
+                _jsonl_bytes(data.get("fact_assignments") or []),
+            )
+            archive.writestr(
+                "protocol_snapshot.json",
+                _json_bytes(data.get("protocol_snapshot") or {}),
+            )
+            archive.writestr(
+                "decisions.jsonl",
+                _jsonl_bytes(data.get("decisions") or []),
+            )
+            archive.writestr(
+                "shared_artifacts.json",
+                _json_bytes(data.get("shared_artifacts") or []),
+            )
+            archive.writestr(
+                "shared_revisions.jsonl",
+                _jsonl_bytes(data.get("shared_revisions") or []),
+            )
+            archive.writestr(
+                "shared_confirmations.jsonl",
+                _jsonl_bytes(data.get("shared_confirmations") or []),
+            )
+            archive.writestr(
+                "ordered_instruments.json",
+                _json_bytes(ordered_instruments),
+            )
         archive.writestr("schema_version.json", _json_bytes(schema))
         archive.writestr("integrity_report.json", _json_bytes(integrity_report))
     buffer.seek(0)

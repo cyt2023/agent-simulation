@@ -360,6 +360,57 @@ def create_study1_decision(session_id: str, decision_kind: str):
         return _service_error(error)
 
 
+@study1_bp.get("/api/study1/sessions/<session_id>/shared-artifacts/<kind>")
+@require_study1_auth(HUMAN_ROLES)
+def get_study1_shared_artifact(session_id: str, kind: str):
+    try:
+        return jsonify(
+            get_service().get_shared_artifact(
+                session_id, g.study1_identity.as_actor(), kind.replace("-", "_")
+            )
+        ), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post(
+    "/api/study1/sessions/<session_id>/shared-artifacts/<kind>/revisions"
+)
+@require_study1_auth(HUMAN_ROLES)
+def create_study1_shared_revision(session_id: str, kind: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().create_shared_revision(
+            session_id,
+            g.study1_identity.as_actor(),
+            kind.replace("-", "_"),
+            data.get("parent_revision_id"),
+            data.get("content") or {},
+        )
+        return jsonify(result), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post(
+    "/api/study1/sessions/<session_id>/shared-artifacts/<kind>/revisions/<revision_id>/confirm"
+)
+@require_study1_auth(HUMAN_ROLES)
+def confirm_study1_shared_revision(
+    session_id: str, kind: str, revision_id: str
+):
+    try:
+        result = get_service().confirm_shared_revision(
+            session_id,
+            g.study1_identity.as_actor(),
+            kind.replace("-", "_"),
+            revision_id,
+        )
+        return jsonify(result), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
 @study1_bp.get("/api/study1/sessions/<session_id>/review")
 @require_study1_auth([Study1Role.PRINCIPAL])
 def get_study1_review(session_id: str):

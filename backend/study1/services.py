@@ -15,7 +15,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Mapping, MutableMapping
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -36,6 +36,9 @@ from .models import (
     Study1ProtocolSnapshotRow,
     Study1DecisionRow,
     Study1InstrumentResponseRow,
+    Study1SharedArtifactRow,
+    Study1SharedConfirmationRow,
+    Study1SharedRevisionRow,
     Study1SubmissionRow,
     Study1TaskDefinitionRow,
     Study1TaskFactRow,
@@ -72,6 +75,18 @@ from .instruments import (
     instrument_for,
     load_instrument_catalog,
     validate_ordered_responses,
+)
+from .shared_artifacts import (
+    SharedArtifactKind,
+    SharedArtifactValidationError,
+    content_checksum,
+    validate_shared_artifact_context,
+    validate_shared_content,
+)
+from .formal_projection import (
+    formal_capabilities,
+    formal_readiness,
+    project_formal_session,
 )
 
 
@@ -249,6 +264,9 @@ class InMemoryStudy1Repository:
         self.protocol_snapshots: dict[str, dict[str, Any]] = {}
         self.decisions: list[dict[str, Any]] = []
         self.instrument_responses: list[dict[str, Any]] = []
+        self.shared_artifacts: dict[tuple[str, str], dict[str, Any]] = {}
+        self.shared_revisions: list[dict[str, Any]] = []
+        self.shared_confirmations: list[dict[str, Any]] = []
         self.idempotency_keys: set[str] = set()
         self._lock = threading.RLock()
 
@@ -417,16 +435,23 @@ class InMemoryStudy1Repository:
         actor: dict[str, Any],
         reason: str | None,
         override: bool,
+        completion_override: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         with self._lock:
-            session = self.sessions.get(session_id)
-            if not session:
+            stored = self.sessions.get(session_id)
+            if not stored:
                 raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            session = copy.deepcopy(stored)
+            if completion_override is not None:
+                session["completion"] = copy.deepcopy(dict(completion_override))
             transition = transition_phase(
                 session, target_phase, actor, reason=reason, override=override
             )
             if session["phase"] == Study1Phase.COMPLETED.value:
                 session["status"] = "completed"
+            if completion_override is not None:
+                session["completion"] = copy.deepcopy(stored.get("completion") or {})
+            self.sessions[session_id] = session
             events = _transition_events(session_id, actor, transition)
             self.events.extend(copy.deepcopy(events))
             return copy.deepcopy(session), events
@@ -525,6 +550,185 @@ class InMemoryStudy1Repository:
                 raise Study1ServiceError("INSTRUMENT_ALREADY_SUBMITTED", "Instrument already submitted", 409)
             self.instrument_responses.append(copy.deepcopy(response))
             return copy.deepcopy(response)
+
+    def get_shared_artifact(
+        self, session_id: str, kind: str
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            artifact = self.shared_artifacts.get((session_id, kind))
+            if artifact is None:
+                return None
+            return _shared_artifact_projection(
+                artifact,
+                [
+                    row
+                    for row in self.shared_revisions
+                    if row["shared_artifact_id"] == artifact["shared_artifact_id"]
+                ],
+                self.shared_confirmations,
+            )
+
+    def create_shared_revision(
+        self,
+        session_id: str,
+        kind: str,
+        parent_revision_id: str | None,
+        content: dict[str, Any],
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            key = (session_id, kind)
+            artifact = self.shared_artifacts.get(key)
+            now = utc_now()
+            if artifact is None:
+                if parent_revision_id is not None:
+                    raise Study1ServiceError(
+                        "SHARED_REVISION_CONFLICT",
+                        "parent_revision_id does not match the current revision",
+                        409,
+                    )
+                artifact = {
+                    "shared_artifact_id": str(uuid.uuid4()),
+                    "session_id": session_id,
+                    "kind": kind,
+                    "current_revision_id": None,
+                    "locked_revision_id": None,
+                    "locked_at": None,
+                    "created_at": now,
+                }
+                self.shared_artifacts[key] = artifact
+            if artifact.get("locked_revision_id"):
+                raise Study1ServiceError(
+                    "SHARED_ARTIFACT_LOCKED", "Shared artifact is already locked", 409
+                )
+            if parent_revision_id != artifact.get("current_revision_id"):
+                raise Study1ServiceError(
+                    "SHARED_REVISION_CONFLICT",
+                    "parent_revision_id does not match the current revision",
+                    409,
+                )
+            revision_number = 1 + sum(
+                1
+                for row in self.shared_revisions
+                if row["shared_artifact_id"] == artifact["shared_artifact_id"]
+            )
+            revision = {
+                "revision_id": str(uuid.uuid4()),
+                "shared_artifact_id": artifact["shared_artifact_id"],
+                "revision_number": revision_number,
+                "parent_revision_id": parent_revision_id,
+                "content": copy.deepcopy(content),
+                "content_checksum": content_checksum(content),
+                "editor_participant_id": identity["participant_id"],
+                "editor_role": identity["role"],
+                "created_at": now,
+            }
+            self.shared_revisions.append(revision)
+            artifact["current_revision_id"] = revision["revision_id"]
+            self.events.append(
+                _shared_artifact_event(
+                    session,
+                    identity,
+                    "shared_revision_created",
+                    {
+                        "kind": kind,
+                        "revision_id": revision["revision_id"],
+                        "revision_number": revision_number,
+                        "parent_revision_id": parent_revision_id,
+                        "content_checksum": revision["content_checksum"],
+                    },
+                    now,
+                )
+            )
+            return _shared_revision_projection(revision, [], artifact)
+
+    def confirm_shared_revision(
+        self,
+        session_id: str,
+        kind: str,
+        revision_id: str,
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            artifact = self.shared_artifacts.get((session_id, kind))
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            if artifact is None or artifact.get("current_revision_id") != revision_id:
+                raise Study1ServiceError(
+                    "SHARED_REVISION_NOT_CURRENT",
+                    "Only the current revision can be confirmed",
+                    409,
+                )
+            revision = next(
+                (
+                    row
+                    for row in self.shared_revisions
+                    if row["revision_id"] == revision_id
+                ),
+                None,
+            )
+            if revision is None:
+                raise Study1ServiceError(
+                    "SHARED_REVISION_NOT_FOUND", "Shared revision not found", 404
+                )
+            existing = next(
+                (
+                    row
+                    for row in self.shared_confirmations
+                    if row["revision_id"] == revision_id
+                    and row["participant_id"] == identity["participant_id"]
+                ),
+                None,
+            )
+            now = utc_now()
+            if existing is None:
+                confirmation = {
+                    "confirmation_id": str(uuid.uuid4()),
+                    "revision_id": revision_id,
+                    "participant_id": identity["participant_id"],
+                    "role": identity["role"],
+                    "confirmed_at": now,
+                }
+                self.shared_confirmations.append(confirmation)
+                self.events.append(
+                    _shared_artifact_event(
+                        session,
+                        identity,
+                        "shared_revision_confirmed",
+                        {"kind": kind, "revision_id": revision_id},
+                        now,
+                    )
+                )
+            confirmations = [
+                row
+                for row in self.shared_confirmations
+                if row["revision_id"] == revision_id
+            ]
+            roles = {row["role"] for row in confirmations}
+            if roles == {role.value for role in HUMAN_ROLES} and not artifact.get(
+                "locked_revision_id"
+            ):
+                artifact["locked_revision_id"] = revision_id
+                artifact["locked_at"] = now
+                _apply_shared_lock_to_snapshot(session, kind)
+                if kind == SharedArtifactKind.TEAM_FINAL.value:
+                    self.decisions.append(
+                        _team_final_decision(session_id, revision, now)
+                    )
+                self.events.append(
+                    _shared_artifact_event(
+                        session,
+                        identity,
+                        "shared_artifact_locked",
+                        {"kind": kind, "revision_id": revision_id},
+                        now,
+                    )
+                )
+            return _shared_revision_projection(revision, confirmations, artifact)
 
     def add_artifact_for_testing(self, artifact: dict[str, Any]) -> None:
         with self._lock:
@@ -678,6 +882,41 @@ class InMemoryStudy1Repository:
                 ),
                 "instrument_responses": copy.deepcopy(
                     [item for item in self.instrument_responses if item["session_id"] == session_id]
+                ),
+                "shared_artifacts": copy.deepcopy(
+                    [
+                        item
+                        for item in self.shared_artifacts.values()
+                        if item["session_id"] == session_id
+                    ]
+                ),
+                "shared_revisions": copy.deepcopy(
+                    [
+                        item
+                        for item in self.shared_revisions
+                        if any(
+                            artifact["shared_artifact_id"]
+                            == item["shared_artifact_id"]
+                            and artifact["session_id"] == session_id
+                            for artifact in self.shared_artifacts.values()
+                        )
+                    ]
+                ),
+                "shared_confirmations": copy.deepcopy(
+                    [
+                        item
+                        for item in self.shared_confirmations
+                        if any(
+                            revision["revision_id"] == item["revision_id"]
+                            and any(
+                                artifact["shared_artifact_id"]
+                                == revision["shared_artifact_id"]
+                                and artifact["session_id"] == session_id
+                                for artifact in self.shared_artifacts.values()
+                            )
+                            for revision in self.shared_revisions
+                        )
+                    ]
                 ),
             }
 
@@ -1072,6 +1311,7 @@ class SqlAlchemyStudy1Repository:
         actor: dict[str, Any],
         reason: str | None,
         override: bool,
+        completion_override: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         with self.SessionLocal() as db:
             row = db.scalar(
@@ -1081,12 +1321,17 @@ class SqlAlchemyStudy1Repository:
             )
             if not row or row.payload.get("experiment_type") != "study1":
                 raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            original_completion = copy.deepcopy((row.payload or {}).get("completion") or {})
             snapshot = copy.deepcopy(row.payload)
+            if completion_override is not None:
+                snapshot["completion"] = copy.deepcopy(dict(completion_override))
             transition = transition_phase(
                 snapshot, target_phase, actor, reason=reason, override=override
             )
             if snapshot["phase"] == Study1Phase.COMPLETED.value:
                 snapshot["status"] = "completed"
+            if completion_override is not None:
+                snapshot["completion"] = original_completion
             events = _transition_events(session_id, actor, transition)
             for event in events:
                 db.add(_event_orm(event))
@@ -1215,6 +1460,243 @@ class SqlAlchemyStudy1Repository:
             raise Study1ServiceError(
                 "INSTRUMENT_ALREADY_SUBMITTED", "Instrument already submitted", 409
             ) from error
+
+    def get_shared_artifact(
+        self, session_id: str, kind: str
+    ) -> dict[str, Any] | None:
+        with self.SessionLocal() as db:
+            artifact = db.scalar(
+                select(Study1SharedArtifactRow).where(
+                    Study1SharedArtifactRow.session_id == session_id,
+                    Study1SharedArtifactRow.kind == kind,
+                )
+            )
+            if artifact is None:
+                return None
+            revisions = db.scalars(
+                select(Study1SharedRevisionRow)
+                .where(
+                    Study1SharedRevisionRow.shared_artifact_id
+                    == artifact.shared_artifact_id
+                )
+                .order_by(Study1SharedRevisionRow.revision_number.asc())
+            ).all()
+            confirmations = db.scalars(
+                select(Study1SharedConfirmationRow).where(
+                    Study1SharedConfirmationRow.revision_id.in_(
+                        [row.revision_id for row in revisions]
+                    )
+                )
+            ).all() if revisions else []
+            return _shared_artifact_projection(
+                _shared_artifact_row_dict(artifact),
+                [_shared_revision_row_dict(row) for row in revisions],
+                [_shared_confirmation_row_dict(row) for row in confirmations],
+            )
+
+    def create_shared_revision(
+        self,
+        session_id: str,
+        kind: str,
+        parent_revision_id: str | None,
+        content: dict[str, Any],
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if session_row is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            artifact = db.scalar(
+                select(Study1SharedArtifactRow)
+                .where(
+                    Study1SharedArtifactRow.session_id == session_id,
+                    Study1SharedArtifactRow.kind == kind,
+                )
+                .with_for_update()
+            )
+            now = utc_now()
+            if artifact is None:
+                if parent_revision_id is not None:
+                    raise Study1ServiceError(
+                        "SHARED_REVISION_CONFLICT",
+                        "parent_revision_id does not match the current revision",
+                        409,
+                    )
+                artifact = Study1SharedArtifactRow(
+                    shared_artifact_id=str(uuid.uuid4()),
+                    session_id=session_id,
+                    kind=kind,
+                    current_revision_id=None,
+                    locked_revision_id=None,
+                    locked_at=None,
+                    created_at=now,
+                )
+                db.add(artifact)
+                db.flush()
+            if artifact.locked_revision_id:
+                raise Study1ServiceError(
+                    "SHARED_ARTIFACT_LOCKED", "Shared artifact is already locked", 409
+                )
+            if parent_revision_id != artifact.current_revision_id:
+                raise Study1ServiceError(
+                    "SHARED_REVISION_CONFLICT",
+                    "parent_revision_id does not match the current revision",
+                    409,
+                )
+            revision_number = (
+                db.scalar(
+                    select(Study1SharedRevisionRow.revision_number)
+                    .where(
+                        Study1SharedRevisionRow.shared_artifact_id
+                        == artifact.shared_artifact_id
+                    )
+                    .order_by(Study1SharedRevisionRow.revision_number.desc())
+                    .limit(1)
+                )
+                or 0
+            ) + 1
+            revision = Study1SharedRevisionRow(
+                revision_id=str(uuid.uuid4()),
+                shared_artifact_id=artifact.shared_artifact_id,
+                revision_number=revision_number,
+                parent_revision_id=parent_revision_id,
+                content=copy.deepcopy(content),
+                content_checksum=content_checksum(content),
+                editor_participant_id=identity["participant_id"],
+                editor_role=identity["role"],
+                created_at=now,
+            )
+            db.add(revision)
+            artifact.current_revision_id = revision.revision_id
+            event = _shared_artifact_event(
+                session_row.payload,
+                identity,
+                "shared_revision_created",
+                {
+                    "kind": kind,
+                    "revision_id": revision.revision_id,
+                    "revision_number": revision_number,
+                    "parent_revision_id": parent_revision_id,
+                    "content_checksum": revision.content_checksum,
+                },
+                now,
+            )
+            db.add(_event_orm(event))
+            db.commit()
+            return _shared_revision_projection(
+                _shared_revision_row_dict(revision), [], _shared_artifact_row_dict(artifact)
+            )
+
+    def confirm_shared_revision(
+        self,
+        session_id: str,
+        kind: str,
+        revision_id: str,
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if session_row is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            artifact = db.scalar(
+                select(Study1SharedArtifactRow)
+                .where(
+                    Study1SharedArtifactRow.session_id == session_id,
+                    Study1SharedArtifactRow.kind == kind,
+                )
+                .with_for_update()
+            )
+            if artifact is None or artifact.current_revision_id != revision_id:
+                raise Study1ServiceError(
+                    "SHARED_REVISION_NOT_CURRENT",
+                    "Only the current revision can be confirmed",
+                    409,
+                )
+            revision = db.scalar(
+                select(Study1SharedRevisionRow).where(
+                    Study1SharedRevisionRow.revision_id == revision_id
+                )
+            )
+            if revision is None:
+                raise Study1ServiceError(
+                    "SHARED_REVISION_NOT_FOUND", "Shared revision not found", 404
+                )
+            existing = db.scalar(
+                select(Study1SharedConfirmationRow).where(
+                    Study1SharedConfirmationRow.revision_id == revision_id,
+                    Study1SharedConfirmationRow.participant_id
+                    == identity["participant_id"],
+                )
+            )
+            now = utc_now()
+            if existing is None:
+                db.add(
+                    Study1SharedConfirmationRow(
+                        confirmation_id=str(uuid.uuid4()),
+                        revision_id=revision_id,
+                        participant_id=identity["participant_id"],
+                        role=identity["role"],
+                        confirmed_at=now,
+                    )
+                )
+                db.add(
+                    _event_orm(
+                        _shared_artifact_event(
+                            session_row.payload,
+                            identity,
+                            "shared_revision_confirmed",
+                            {"kind": kind, "revision_id": revision_id},
+                            now,
+                        )
+                    )
+                )
+                db.flush()
+            confirmations = db.scalars(
+                select(Study1SharedConfirmationRow).where(
+                    Study1SharedConfirmationRow.revision_id == revision_id
+                )
+            ).all()
+            roles = {row.role for row in confirmations}
+            if roles == {role.value for role in HUMAN_ROLES} and not artifact.locked_revision_id:
+                artifact.locked_revision_id = revision_id
+                artifact.locked_at = now
+                snapshot = copy.deepcopy(session_row.payload)
+                _apply_shared_lock_to_snapshot(snapshot, kind)
+                session_row.payload = snapshot
+                if kind == SharedArtifactKind.TEAM_FINAL.value:
+                    existing_team_decision = db.scalar(
+                        select(Study1DecisionRow).where(
+                            Study1DecisionRow.session_id == session_id,
+                            Study1DecisionRow.decision_kind == SharedArtifactKind.TEAM_FINAL.value,
+                        )
+                    )
+                    if existing_team_decision is None:
+                        db.add(_team_final_decision_orm(session_id, revision, now))
+                db.add(
+                    _event_orm(
+                        _shared_artifact_event(
+                            snapshot,
+                            identity,
+                            "shared_artifact_locked",
+                            {"kind": kind, "revision_id": revision_id},
+                            now,
+                        )
+                    )
+                )
+            db.commit()
+            return _shared_revision_projection(
+                _shared_revision_row_dict(revision),
+                [_shared_confirmation_row_dict(row) for row in confirmations],
+                _shared_artifact_row_dict(artifact),
+            )
 
     def open_review(
         self, session_id: str, identity: dict[str, Any]
@@ -1457,6 +1939,36 @@ class SqlAlchemyStudy1Repository:
                 .where(Study1InstrumentResponseRow.session_id == session_id)
                 .order_by(Study1InstrumentResponseRow.submitted_at.asc())
             ).all()
+            shared_artifact_rows = db.scalars(
+                select(Study1SharedArtifactRow)
+                .where(Study1SharedArtifactRow.session_id == session_id)
+                .order_by(Study1SharedArtifactRow.created_at.asc())
+            ).all()
+            shared_artifact_ids = [
+                row.shared_artifact_id for row in shared_artifact_rows
+            ]
+            shared_revision_rows = db.scalars(
+                select(Study1SharedRevisionRow)
+                .where(
+                    Study1SharedRevisionRow.shared_artifact_id.in_(
+                        shared_artifact_ids
+                    )
+                )
+                .order_by(
+                    Study1SharedRevisionRow.shared_artifact_id.asc(),
+                    Study1SharedRevisionRow.revision_number.asc(),
+                )
+            ).all() if shared_artifact_ids else []
+            shared_revision_ids = [row.revision_id for row in shared_revision_rows]
+            shared_confirmation_rows = db.scalars(
+                select(Study1SharedConfirmationRow)
+                .where(
+                    Study1SharedConfirmationRow.revision_id.in_(
+                        shared_revision_ids
+                    )
+                )
+                .order_by(Study1SharedConfirmationRow.confirmed_at.asc())
+            ).all() if shared_revision_ids else []
             protocol_row = db.scalar(
                 select(Study1ProtocolSnapshotRow).where(
                     Study1ProtocolSnapshotRow.session_id == session_id
@@ -1510,6 +2022,16 @@ class SqlAlchemyStudy1Repository:
                 "instrument_responses": [
                     _instrument_response_row_dict(row)
                     for row in instrument_response_rows
+                ],
+                "shared_artifacts": [
+                    _shared_artifact_row_dict(row) for row in shared_artifact_rows
+                ],
+                "shared_revisions": [
+                    _shared_revision_row_dict(row) for row in shared_revision_rows
+                ],
+                "shared_confirmations": [
+                    _shared_confirmation_row_dict(row)
+                    for row in shared_confirmation_rows
                 ],
             }
 
@@ -1762,6 +2284,174 @@ def _decision_row_dict(row: Study1DecisionRow) -> dict[str, Any]:
         "source_revision_id": row.source_revision_id,
         "locked": bool(row.locked),
         "created_at": utc_iso(row.created_at) if row.created_at else None,
+    }
+
+
+def _shared_artifact_event(
+    session: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    event_type: str,
+    payload: dict[str, Any],
+    occurred_at: datetime,
+) -> dict[str, Any]:
+    return {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session["session_id"],
+        "participant_id": identity.get("participant_id"),
+        "role": identity.get("role"),
+        "phase": session.get("phase"),
+        "phase_version": int(session.get("phase_version") or 1),
+        "event_type": event_type,
+        "occurred_at": occurred_at,
+        "payload": copy.deepcopy(payload),
+        "idempotency_key": None,
+    }
+
+
+def _apply_shared_lock_to_snapshot(session: MutableMapping[str, Any], kind: str) -> None:
+    completion = session.setdefault("completion", {})
+    if kind == SharedArtifactKind.TEAM_FINAL.value:
+        completion["team_final_locked"] = True
+    elif kind == SharedArtifactKind.FOLLOWUP_TASK.value:
+        completion["followup_task_locked"] = True
+        for role in HUMAN_ROLES:
+            completion[f"followup_task:{role.value}"] = True
+
+
+def _team_final_decision(
+    session_id: str, revision: Mapping[str, Any], created_at: datetime
+) -> dict[str, Any]:
+    content = revision["content"]
+    return {
+        "decision_id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "decision_kind": SharedArtifactKind.TEAM_FINAL.value,
+        "participant_id": None,
+        "role": "team",
+        "candidate_id": content["candidate_id"],
+        "rationale": content["rationale"],
+        "confidence": content.get("confidence"),
+        "ratings": copy.deepcopy(content.get("ratings") or {}),
+        "decision_status": content.get("decision_status"),
+        "phase": Study1Phase.FINAL_DECISION.value,
+        "instrument_version": "2.0",
+        "source_revision_id": revision["revision_id"],
+        "locked": True,
+        "created_at": created_at,
+    }
+
+
+def _team_final_decision_orm(
+    session_id: str, revision: Study1SharedRevisionRow, created_at: datetime
+) -> Study1DecisionRow:
+    content = revision.content
+    return Study1DecisionRow(
+        decision_id=str(uuid.uuid4()),
+        session_id=session_id,
+        decision_kind=SharedArtifactKind.TEAM_FINAL.value,
+        participant_id=None,
+        role="team",
+        candidate_id=content["candidate_id"],
+        rationale=content["rationale"],
+        confidence=content.get("confidence"),
+        ratings=copy.deepcopy(content.get("ratings") or {}),
+        decision_status=content.get("decision_status"),
+        phase=Study1Phase.FINAL_DECISION.value,
+        instrument_version="2.0",
+        source_revision_id=revision.revision_id,
+        locked=True,
+        created_at=created_at,
+    )
+
+
+def _shared_revision_projection(
+    revision: Mapping[str, Any],
+    confirmations: list[Mapping[str, Any]],
+    artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    roles = {str(item.get("role") or "") for item in confirmations}
+    ordered_roles = [role.value for role in HUMAN_ROLES]
+    return {
+        "revision_id": revision["revision_id"],
+        "shared_artifact_id": revision["shared_artifact_id"],
+        "kind": artifact["kind"],
+        "revision_number": revision["revision_number"],
+        "parent_revision_id": revision.get("parent_revision_id"),
+        "content": copy.deepcopy(revision["content"]),
+        "content_checksum": revision["content_checksum"],
+        "editor_participant_id": revision["editor_participant_id"],
+        "editor_role": revision["editor_role"],
+        "created_at": utc_iso(revision["created_at"]),
+        "confirmed_roles": [role for role in ordered_roles if role in roles],
+        "locked": artifact.get("locked_revision_id") == revision["revision_id"],
+    }
+
+
+def _shared_artifact_projection(
+    artifact: Mapping[str, Any],
+    revisions: list[Mapping[str, Any]],
+    confirmations: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    current_id = artifact.get("current_revision_id")
+    current = next(
+        (item for item in revisions if item["revision_id"] == current_id), None
+    )
+    current_confirmations = [
+        item for item in confirmations if item["revision_id"] == current_id
+    ]
+    return {
+        "shared_artifact_id": artifact["shared_artifact_id"],
+        "session_id": artifact["session_id"],
+        "kind": artifact["kind"],
+        "current_revision_id": current_id,
+        "locked_revision_id": artifact.get("locked_revision_id"),
+        "locked_at": (
+            utc_iso(artifact["locked_at"]) if artifact.get("locked_at") else None
+        ),
+        "current_revision": (
+            _shared_revision_projection(current, current_confirmations, artifact)
+            if current is not None
+            else None
+        ),
+        "locked": bool(artifact.get("locked_revision_id")),
+    }
+
+
+def _shared_artifact_row_dict(row: Study1SharedArtifactRow) -> dict[str, Any]:
+    return {
+        "shared_artifact_id": row.shared_artifact_id,
+        "session_id": row.session_id,
+        "kind": row.kind,
+        "current_revision_id": row.current_revision_id,
+        "locked_revision_id": row.locked_revision_id,
+        "locked_at": row.locked_at,
+        "created_at": row.created_at,
+    }
+
+
+def _shared_revision_row_dict(row: Study1SharedRevisionRow) -> dict[str, Any]:
+    return {
+        "revision_id": row.revision_id,
+        "shared_artifact_id": row.shared_artifact_id,
+        "revision_number": row.revision_number,
+        "parent_revision_id": row.parent_revision_id,
+        "content": copy.deepcopy(row.content),
+        "content_checksum": row.content_checksum,
+        "editor_participant_id": row.editor_participant_id,
+        "editor_role": row.editor_role,
+        "created_at": row.created_at,
+    }
+
+
+def _shared_confirmation_row_dict(
+    row: Study1SharedConfirmationRow,
+) -> dict[str, Any]:
+    return {
+        "confirmation_id": row.confirmation_id,
+        "revision_id": row.revision_id,
+        "participant_id": row.participant_id,
+        "role": row.role,
+        "confirmed_at": row.confirmed_at,
     }
 
 
@@ -2348,7 +3038,7 @@ def _dashboard_payload(
     artifacts: list[dict[str, Any]],
     incidents: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    state = readiness(session)
+    state = formal_readiness(session) if session.get("protocol_mode") == "formal_v2" else readiness(session)
     completion = session.get("completion") or {}
     participant_status = []
     for participant in session.get("participants") or []:
@@ -3172,6 +3862,91 @@ class Study1Service:
             self.repository.mark_completion(session_id, f"post_survey:{identity['role']}")
         return created
 
+    def get_shared_artifact(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        kind: SharedArtifactKind | str,
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if session.get("protocol_mode") != "formal_v2":
+            raise Study1ServiceError("FORMAL_PROTOCOL_REQUIRED", "Formal protocol required", 409)
+        try:
+            artifact_kind = validate_shared_artifact_context(kind, session, identity)
+        except SharedArtifactValidationError as error:
+            status = 403 if error.code == "FORBIDDEN" else 409
+            raise Study1ServiceError(error.code, str(error), status) from error
+        self._authorize(session, "submit", str(identity.get("role") or ""))
+        artifact = self.repository.get_shared_artifact(session_id, artifact_kind.value)
+        if artifact is not None:
+            return artifact
+        return {
+            "shared_artifact_id": None,
+            "session_id": session_id,
+            "kind": artifact_kind.value,
+            "current_revision_id": None,
+            "locked_revision_id": None,
+            "locked_at": None,
+            "current_revision": None,
+            "locked": False,
+        }
+
+    def create_shared_revision(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        kind: SharedArtifactKind | str,
+        parent_revision_id: str | None,
+        content: dict[str, Any],
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if session.get("protocol_mode") != "formal_v2":
+            raise Study1ServiceError("FORMAL_PROTOCOL_REQUIRED", "Formal protocol required", 409)
+        try:
+            artifact_kind = validate_shared_artifact_context(kind, session, identity)
+            normalized = validate_shared_content(artifact_kind, session, content)
+        except SharedArtifactValidationError as error:
+            status = 403 if error.code == "FORBIDDEN" else 409 if error.code == "ACTION_NOT_ALLOWED_IN_PHASE" else 400
+            raise Study1ServiceError(error.code, str(error), status) from error
+        self._authorize(session, "submit", str(identity.get("role") or ""))
+        return self.repository.create_shared_revision(
+            session_id,
+            artifact_kind.value,
+            parent_revision_id,
+            normalized,
+            identity,
+        )
+
+    def confirm_shared_revision(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        kind: SharedArtifactKind | str,
+        revision_id: str,
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if session.get("protocol_mode") != "formal_v2":
+            raise Study1ServiceError("FORMAL_PROTOCOL_REQUIRED", "Formal protocol required", 409)
+        try:
+            artifact_kind = validate_shared_artifact_context(kind, session, identity)
+        except SharedArtifactValidationError as error:
+            status = 403 if error.code == "FORBIDDEN" else 409
+            raise Study1ServiceError(error.code, str(error), status) from error
+        self._authorize(session, "submit", str(identity.get("role") or ""))
+        if not str(revision_id or "").strip():
+            raise Study1ServiceError(
+                "SHARED_REVISION_REQUIRED", "revision_id is required", 400
+            )
+        return self.repository.confirm_shared_revision(
+            session_id, artifact_kind.value, revision_id, identity
+        )
+
     def _validate_structured_submission(
         self,
         submission_type: str,
@@ -3316,9 +4091,17 @@ class Study1Service:
         if session is None:
             raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
         self._authorize(session, "advance", str(actor.get("role") or ""))
+        completion_override = None
+        if session.get("protocol_mode") == "formal_v2":
+            completion_override = self._project_snapshot(session).get("completion") or {}
         try:
             snapshot, events = self.repository.transition(
-                session_id, target_phase, actor, reason, override
+                session_id,
+                target_phase,
+                actor,
+                reason,
+                override,
+                completion_override=completion_override,
             )
             return {"session": self.session_dto(snapshot), "events": events}
         except OverrideReasonRequired as error:
@@ -3352,7 +4135,10 @@ class Study1Service:
             current = self.repository.get_session(session_id)
             if current is None:
                 raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
-            missing = readiness(current)["missing_prerequisites"]
+            current_projected = self._project_snapshot(current)
+            missing = self._readiness_for_snapshot(current_projected)[
+                "missing_prerequisites"
+            ]
             if missing:
                 raise Study1ServiceError(
                     "PREREQUISITES_NOT_MET",
@@ -3413,7 +4199,13 @@ class Study1Service:
         self.repository.participant_status(session_id, identity, online)
 
     def researcher_dashboard(self, session_id: str) -> dict[str, Any]:
-        return self.repository.dashboard(session_id)
+        data = self.repository.export_data(session_id)
+        session = self._project_snapshot(data["session"], data)
+        return _dashboard_payload(
+            session,
+            data.get("artifacts") or [],
+            data.get("incidents") or [],
+        )
 
     def issue_media_command(
         self,
@@ -3767,7 +4559,13 @@ class Study1Service:
     def export_bundle(self, session_id: str):
         from .export_service import build_study1_export, merge_media_export
 
-        workflow = build_study1_export(self.repository.export_data(session_id))
+        data = self.repository.export_data(session_id)
+        session = data["session"]
+        if session.get("task_definition_id"):
+            data["task_definition"] = self.repository.get_task_definition(
+                session["task_definition_id"], session.get("task_version")
+            )
+        workflow = build_study1_export(data)
         try:
             media = self.media_gateway.export_bundle(session_id)
             return merge_media_export(workflow, media)
@@ -3813,39 +4611,60 @@ class Study1Service:
     def session_dto(
         self, snapshot: dict[str, Any], role: str | None = None
     ) -> dict[str, Any]:
+        projected = self._project_snapshot(snapshot)
+        state = self._readiness_for_snapshot(projected)
         base = {
-            "session_id": snapshot["session_id"],
-            "status": snapshot["status"],
-            "phase": snapshot["phase"],
-            "phase_version": snapshot["phase_version"],
-            "phase_started_at": snapshot["phase_started_at"],
-            "remaining_seconds": _remaining_seconds(snapshot),
-            "protocol_mode": snapshot.get("protocol_mode", "legacy_protocol"),
-            "formal_certifiable": bool(snapshot.get("formal_certifiable", False)),
-            "task_definition_id": snapshot.get("task_definition_id"),
-            "task_version": snapshot.get("task_version"),
-            **readiness(snapshot),
-            "consent_version": (snapshot.get("experiment_config") or {}).get(
+            "session_id": projected["session_id"],
+            "status": projected["status"],
+            "phase": projected["phase"],
+            "phase_version": projected["phase_version"],
+            "phase_started_at": projected["phase_started_at"],
+            "remaining_seconds": _remaining_seconds(projected),
+            "protocol_mode": projected.get("protocol_mode", "legacy_protocol"),
+            "formal_certifiable": bool(projected.get("formal_certifiable", False)),
+            "task_definition_id": projected.get("task_definition_id"),
+            "task_version": projected.get("task_version"),
+            **state,
+            "consent_version": (projected.get("experiment_config") or {}).get(
                 "consent_version", "study1-consent-v1"
             ),
-            "structured_instruments": bool(snapshot.get("structured_instruments")),
+            "structured_instruments": bool(projected.get("structured_instruments")),
         }
         if role in {item.value for item in HUMAN_ROLES}:
-            completion = snapshot.get("completion") or {}
+            completion = projected.get("completion") or {}
             base["my_completed_actions"] = sorted(
                 key for key, completed in completion.items()
                 if completed is True and key.endswith(f":{role}")
             )
-        if role == Study1Role.PRINCIPAL.value and snapshot["phase"] == "PROXY_MEETING":
+        if role:
+            base["capabilities"] = formal_capabilities(projected, role)
+        if role == Study1Role.PRINCIPAL.value and projected["phase"] == "PROXY_MEETING":
             return {
                 **base,
                 "waiting_room": {
                     "message": "The delegated discussion is in progress.",
-                    "remaining_seconds": snapshot.get("remaining_seconds"),
+                    "remaining_seconds": projected.get("remaining_seconds"),
                     "connection_status": "connected",
                 },
             }
         return base
+
+    def _project_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if snapshot.get("protocol_mode") != "formal_v2":
+            return snapshot
+        exported = data
+        if exported is None:
+            exported = self.repository.export_data(snapshot["session_id"])
+        return project_formal_session(snapshot, exported)
+
+    def _readiness_for_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        if snapshot.get("protocol_mode") == "formal_v2":
+            return formal_readiness(snapshot)
+        return readiness(snapshot)
 
 
 def _registered_task_materials(
