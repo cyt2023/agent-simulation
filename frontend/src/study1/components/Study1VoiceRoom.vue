@@ -1,41 +1,54 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { Headphones, Mic, MicOff, PhoneOff, RefreshCw } from '@lucide/vue'
-import { Room, RoomEvent } from 'livekit-client'
+import { RefreshCw } from '@lucide/vue'
 
-import { fetchMediaAccess } from '../services/study1Api.js'
+import { useStableAudioSession } from '../composables/useStableAudioSession.js'
 import { displayMicrophoneLabel } from '../services/uiLabels.js'
+import MeetingControls from './MeetingControls.vue'
 
 const props = defineProps({
   sessionId: { type: String, required: true },
   phase: { type: String, required: true },
   phaseVersion: { type: Number, required: true },
   role: { type: String, required: true },
+  audioSession: { type: Object, default: null },
+  showRoster: { type: Boolean, default: true },
+  embedded: Boolean,
 })
-
 const emit = defineEmits(['error'])
+
+const ownedSession = props.audioSession ? null : useStableAudioSession()
+const session = props.audioSession || ownedSession
 const devices = ref([])
 const selectedDeviceId = ref('')
 const deviceState = ref('checking')
-const connectionState = ref('disconnected')
-const muted = ref(false)
-const error = ref('')
-const remoteIdentities = ref(new Set())
-const activeIdentities = ref(new Set())
+const localError = ref('')
 const audioHost = ref(null)
-let room = null
-let connectionGeneration = 0
-let disposed = false
 
+function valueOf(source, fallback) {
+  if (source && typeof source === 'object' && 'value' in source) return source.value
+  return source ?? fallback
+}
+
+const connectionState = computed(() => valueOf(session.connectionState, 'disconnected'))
+const reconnectSeconds = computed(() => Number(valueOf(session.reconnectSecondsRemaining, 0)))
+const muted = computed(() => Boolean(valueOf(session.muted, false)))
+const sessionError = computed(() => String(valueOf(session.error, '')))
+const remoteIdentities = computed(() => valueOf(session.remoteIdentities, new Set()))
+const activeIdentities = computed(() => valueOf(session.activeIdentities, new Set()))
+const outputDevices = computed(() => valueOf(session.outputDevices, []))
+const selectedOutputId = computed(() => String(valueOf(session.selectedOutputId, '')))
+const outputSupported = computed(() => Boolean(valueOf(session.outputSupported, false)))
+const outputNotice = computed(() => String(valueOf(session.outputNotice, '')))
+const canJoin = computed(() => (
+  deviceState.value === 'ready'
+  && Boolean(selectedDeviceId.value)
+  && ['disconnected', 'reconnect_failed'].includes(connectionState.value)
+))
 const expectedRoles = computed(() => (
   props.phase === 'PROXY_MEETING'
     ? ['teammate_1', 'teammate_2', 'proxy']
     : ['principal', 'teammate_1', 'teammate_2']
-))
-const canJoin = computed(() => (
-  deviceState.value === 'ready'
-  && Boolean(selectedDeviceId.value)
-  && connectionState.value === 'disconnected'
 ))
 
 function readableRole(role) {
@@ -48,19 +61,23 @@ function readableRole(role) {
 }
 
 function reportError(reason, fallback) {
-  error.value = reason?.message || fallback
-  emit('error', error.value)
+  const message = reason?.message || fallback
+  localError.value = message
+  emit('error', message)
 }
 
 async function checkMicrophone() {
   deviceState.value = 'checking'
-  error.value = ''
+  localError.value = ''
   try {
     const permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true })
     permissionStream.getTracks().forEach(track => track.stop())
-    devices.value = (await navigator.mediaDevices.enumerateDevices())
-      .filter(device => device.kind === 'audioinput')
-    selectedDeviceId.value = devices.value[0]?.deviceId || ''
+    const availableDevices = await navigator.mediaDevices.enumerateDevices()
+    devices.value = availableDevices.filter(device => device.kind === 'audioinput')
+    session.configureOutputDevices?.(availableDevices)
+    if (!devices.value.some(device => device.deviceId === selectedDeviceId.value)) {
+      selectedDeviceId.value = devices.value[0]?.deviceId || ''
+    }
     deviceState.value = selectedDeviceId.value ? 'ready' : 'missing'
   } catch (reason) {
     deviceState.value = 'denied'
@@ -68,146 +85,62 @@ async function checkMicrophone() {
   }
 }
 
-function syncParticipants() {
-  if (!room) return
-  remoteIdentities.value = new Set(
-    [...room.remoteParticipants.values()].map(
-      participant => participant.name || participant.identity,
-    ),
-  )
-}
-
-function attachTrack(track) {
-  const element = track.attach()
-  element.autoplay = true
-  element.dataset.study1RemoteAudio = 'true'
-  audioHost.value?.appendChild(element)
-}
-
-function detachTrack(track) {
-  track.detach().forEach(element => element.remove())
-}
-
 async function joinAudio() {
   if (!canJoin.value) return
-  const generation = ++connectionGeneration
-  const requestedSession = props.sessionId
-  const requestedPhase = props.phase
-  const requestedVersion = props.phaseVersion
-  let candidate = null
-  connectionState.value = 'connecting'
-  error.value = ''
-  try {
-    const access = await fetchMediaAccess(props.sessionId)
-    if (access.available === false) throw new Error('Live media is not enabled for this session.')
-    if (
-      disposed
-      || generation !== connectionGeneration
-      || requestedSession !== props.sessionId
-      || requestedPhase !== props.phase
-      || requestedVersion !== props.phaseVersion
-    ) return
-    candidate = new Room({ adaptiveStream: true, dynacast: false })
-    room = candidate
-    candidate
-      .on(RoomEvent.TrackSubscribed, attachTrack)
-      .on(RoomEvent.TrackUnsubscribed, detachTrack)
-      .on(RoomEvent.ActiveSpeakersChanged, speakers => {
-        activeIdentities.value = new Set(
-          speakers
-            .map(participant => participant.name || participant.identity)
-            .filter(identity => !(muted.value && identity === props.role)),
-        )
-      })
-      .on(RoomEvent.ConnectionStateChanged, state => {
-        connectionState.value = String(state).toLowerCase()
-      })
-      .on(RoomEvent.ParticipantConnected, syncParticipants)
-      .on(RoomEvent.ParticipantDisconnected, syncParticipants)
-    await candidate.connect(access.url, access.token)
-    if (disposed || generation !== connectionGeneration || room !== candidate) {
-      await candidate.disconnect()
-      return
-    }
-    await candidate.localParticipant.setMicrophoneEnabled(
-      true,
-      { deviceId: selectedDeviceId.value },
-    )
-    muted.value = false
-    connectionState.value = 'connected'
-    syncParticipants()
-  } catch (reason) {
-    if (candidate) await candidate.disconnect()
-    if (room === candidate) room = null
-    if (generation === connectionGeneration && !disposed) {
-      connectionState.value = 'disconnected'
-      reportError(reason, 'Unable to join the audio meeting.')
-    }
-  }
+  const connected = await session.connect({
+    sessionId: props.sessionId,
+    phase: props.phase,
+    phaseVersion: props.phaseVersion,
+    role: props.role,
+    deviceId: selectedDeviceId.value,
+  })
+  if (!connected && sessionError.value) emit('error', sessionError.value)
 }
 
 async function toggleMute() {
-  if (!room || connectionState.value !== 'connected') return
-  const nextMuted = !muted.value
-  error.value = ''
-  try {
-    await room.localParticipant.setMicrophoneEnabled(
-      !nextMuted,
-      { deviceId: selectedDeviceId.value },
-    )
-    muted.value = nextMuted
-    if (nextMuted) {
-      const nextActive = new Set(activeIdentities.value)
-      nextActive.delete(props.role)
-      activeIdentities.value = nextActive
-    }
-  } catch (reason) {
-    reportError(reason, 'Unable to change the microphone state.')
+  const changed = await session.toggleMute()
+  if (changed === false && sessionError.value) emit('error', sessionError.value)
+}
+
+async function leaveAudio() {
+  await session.disconnect()
+}
+
+async function selectOutput(deviceId) {
+  const changed = await session.setOutputDevice?.(deviceId)
+  if (changed === false && valueOf(session.outputNotice, '')) {
+    emit('error', valueOf(session.outputNotice, ''))
   }
 }
 
-async function disconnectRoom() {
-  const generation = ++connectionGeneration
-  const activeRoom = room
-  room = null
-  if (activeRoom) await activeRoom.disconnect()
-  remoteIdentities.value = new Set()
-  activeIdentities.value = new Set()
-  await nextTick()
-  audioHost.value?.querySelectorAll('[data-study1-remote-audio]').forEach(node => node.remove())
-  if (generation === connectionGeneration) connectionState.value = 'disconnected'
-}
+watch(sessionError, message => {
+  if (message) emit('error', message)
+})
 
 watch(
   () => [props.phase, props.phaseVersion],
-  ([nextPhase], [previousPhase]) => {
-    const seamlessHandoff = (
-      previousPhase === 'HANDOFF' && nextPhase === 'SYNC_MEETING'
-    )
-    if (!seamlessHandoff) disconnectRoom()
+  () => {
+    // Standalone use has no participant shell to preserve the authoritative
+    // room lifecycle, so invalidate any in-flight access request.
+    if (ownedSession) ownedSession.disconnect()
   },
 )
 
+watch(audioHost, async element => {
+  await nextTick()
+  session.setAudioHost?.(element)
+})
+
 onMounted(checkMicrophone)
 onUnmounted(() => {
-  disposed = true
-  disconnectRoom()
+  session.setAudioHost?.(null)
+  if (ownedSession) ownedSession.dispose()
 })
 </script>
 
 <template>
-  <section class="voice-room" aria-labelledby="voice-room-title">
-    <header>
-      <div>
-        <p class="eyebrow">
-          {{ phase === 'PROXY_MEETING' ? 'Delegated discussion' : (phase === 'HANDOFF' ? 'Live handoff' : 'Synchronous discussion') }}
-        </p>
-        <h2 id="voice-room-title">Audio meeting</h2>
-      </div>
-      <span class="connection" :data-state="connectionState">{{ connectionState }}</span>
-    </header>
-
-    <div class="participants" aria-label="Meeting participants">
+  <section class="voice-room" :class="{ embedded }" aria-label="Audio meeting connection">
+    <div v-if="showRoster" class="participants" aria-label="Meeting participants">
       <div
         v-for="participantRole in expectedRoles"
         :key="participantRole"
@@ -221,87 +154,85 @@ onUnmounted(() => {
           <span v-if="participantRole === 'proxy'">
             {{ remoteIdentities.has('proxy') ? 'Proxy is connected' : 'Proxy is joining the room' }}
           </span>
-          <span v-else>{{ participantRole === role ? 'you' : (remoteIdentities.has(participantRole) ? 'connected' : 'waiting') }}</span>
+          <span v-else>
+            {{ participantRole === role ? 'you' : (remoteIdentities.has(participantRole) ? 'connected' : 'waiting') }}
+          </span>
         </div>
       </div>
     </div>
 
     <div class="device-row">
       <label for="study1-microphone">Microphone</label>
-      <select id="study1-microphone" v-model="selectedDeviceId" :disabled="connectionState !== 'disconnected'">
+      <select
+        id="study1-microphone"
+        v-model="selectedDeviceId"
+        :disabled="!['disconnected', 'reconnect_failed'].includes(connectionState)"
+      >
         <option v-if="!devices.length" value="">No microphone available</option>
         <option v-for="(device, index) in devices" :key="device.deviceId" :value="device.deviceId">
           {{ displayMicrophoneLabel(device.label, index) }}
         </option>
       </select>
-      <button class="icon-button secondary" type="button" title="Check microphone" @click="checkMicrophone">
+      <button
+        class="check-button"
+        type="button"
+        title="Check microphone"
+        :disabled="connectionState === 'connecting'"
+        @click="checkMicrophone"
+      >
         <RefreshCw :size="18" aria-hidden="true" />
         <span class="sr-only">Check microphone</span>
       </button>
     </div>
 
-    <p v-if="deviceState === 'denied' || deviceState === 'missing'" class="room-error">{{ error || 'No microphone was detected.' }}</p>
-    <p v-else-if="error" class="room-error">{{ error }}</p>
+    <p v-if="deviceState === 'denied' || deviceState === 'missing'" class="room-error">
+      {{ localError || 'No microphone was detected.' }}
+    </p>
+    <p v-else-if="localError || sessionError" class="room-error">{{ localError || sessionError }}</p>
 
-    <div class="room-controls">
-      <button
-        v-if="connectionState === 'disconnected'"
-        data-test="join-audio"
-        type="button"
-        :disabled="!canJoin"
-        @click="joinAudio"
-      >
-        <Headphones :size="18" aria-hidden="true" />
-        Join audio
-      </button>
-      <template v-else>
-        <button data-test="toggle-mute" class="icon-button" type="button" :title="muted ? 'Unmute microphone' : 'Mute microphone'" @click="toggleMute">
-          <MicOff v-if="!muted" :size="20" aria-hidden="true" />
-          <Mic v-else :size="20" aria-hidden="true" />
-          <span class="sr-only">{{ muted ? 'Unmute microphone' : 'Mute microphone' }}</span>
-        </button>
-        <button class="icon-button leave" type="button" title="Leave audio" @click="disconnectRoom">
-          <PhoneOff :size="20" aria-hidden="true" />
-          <span class="sr-only">Leave audio</span>
-        </button>
-      </template>
-    </div>
+    <MeetingControls
+      :connection-state="connectionState"
+      :reconnect-seconds="reconnectSeconds"
+      :muted="muted"
+      :can-join="canJoin"
+      :busy="connectionState === 'connecting'"
+      :output-devices="outputDevices"
+      :selected-output-id="selectedOutputId"
+      :output-supported="outputSupported"
+      :output-notice="outputNotice"
+      @join="joinAudio"
+      @toggle-mute="toggleMute"
+      @leave="leaveAudio"
+      @select-output="selectOutput"
+    />
     <p v-if="connectionState === 'connected'" data-test="microphone-status" class="microphone-status">
-      {{ phase === 'HANDOFF' ? 'Stay connected; the researcher is admitting P and removing X.' : `Microphone ${muted ? 'muted' : 'live'}` }}
+      {{ phase === 'HANDOFF' ? 'Stay connected while P joins and the AI Proxy leaves.' : `Microphone ${muted ? 'muted' : 'live'}` }}
     </p>
     <div ref="audioHost" hidden />
   </section>
 </template>
 
 <style scoped>
-.voice-room { display:grid; gap:1.25rem; }
-header { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; }
-h2,.eyebrow { margin:0; }
-h2 { font-size:1.35rem; letter-spacing:0; }
-.eyebrow { color:#64717d; font-size:.78rem; font-weight:700; text-transform:uppercase; }
-.connection { padding:.3rem .55rem; border:1px solid #c7d0d7; border-radius:6px; color:#52616d; font-size:.78rem; text-transform:capitalize; }
-.connection[data-state="connected"] { border-color:#70a883; color:#17633c; background:#edf8f1; }
-.participants { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.75rem; }
-.participant { min-width:0; display:flex; align-items:center; gap:.65rem; padding:.75rem; border:1px solid #dce3e9; border-radius:7px; background:#fff; }
+.voice-room { display:grid; background:#fff; }
+.voice-room.embedded { background:#182126; color:#eef3f4; }
+.participants { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.75rem; padding:1rem; }
+.participant { min-width:0; display:flex; align-items:center; gap:.65rem; padding:.75rem; border:1px solid #dce3e9; border-radius:6px; background:#fff; }
 .participant.active { border-color:#2f7c5d; box-shadow:inset 3px 0 #2f7c5d; }
 .participant div { min-width:0; display:grid; }
 .participant strong,.participant span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .participant div span { color:#6a7782; font-size:.76rem; }
 .avatar { flex:0 0 36px; width:36px; height:36px; display:grid; place-items:center; border-radius:50%; background:#e8edf1; color:#31414e; font-size:.78rem; font-weight:800; }
-.device-row { display:grid; grid-template-columns:auto minmax(0,1fr) 40px; align-items:center; gap:.75rem; }
-select { min-width:0; width:100%; padding:.62rem; border:1px solid #bac6d0; border-radius:6px; background:#fff; color:#263746; font:inherit; }
-.room-controls { min-height:44px; display:flex; justify-content:center; gap:.65rem; }
-.microphone-status { margin:0; color:#52616d; font-size:.78rem; text-align:center; }
-button { display:inline-flex; align-items:center; justify-content:center; gap:.5rem; min-height:40px; border:0; border-radius:7px; padding:.65rem .9rem; background:#245f8e; color:#fff; font:inherit; font-weight:700; cursor:pointer; }
-button:disabled { opacity:.45; cursor:not-allowed; }
-.icon-button { width:42px; padding:0; }
-.secondary { background:#e9eef2; color:#334551; }
-.leave { background:#a13838; }
-.room-error { margin:0; padding:.65rem .8rem; border-radius:6px; background:#fff0f0; color:#922; }
+.device-row { display:grid; grid-template-columns:auto minmax(0,1fr) 40px; align-items:center; gap:.75rem; padding:.8rem 1rem; border-top:1px solid #d8dfe4; }
+select { min-width:0; width:100%; padding:.58rem; border:1px solid #bac6d0; border-radius:6px; background:#fff; color:#263746; font:inherit; }
+.check-button { width:40px; height:40px; display:grid; place-items:center; border:1px solid #bdc8ce; border-radius:6px; background:#fff; color:#344853; cursor:pointer; }
+.check-button:disabled { opacity:.45; cursor:not-allowed; }
+.microphone-status { margin:0; padding:.55rem 1rem; border-top:1px solid #e2e7ea; color:#52616d; font-size:.78rem; text-align:center; }
+.room-error { margin:0; padding:.65rem 1rem; border-top:1px solid #efd2d2; background:#fff0f0; color:#922; }
+.embedded .device-row { border-color:#354148; background:#182126; color:#c7d2d6; }
+.embedded select { border-color:#4a585e; background:#222d32; color:#edf3f4; }
+.embedded .check-button { border-color:#4a585e; background:#222d32; color:#edf3f4; }
+.embedded .microphone-status { border-color:#354148; background:#182126; color:#aebcc2; }
+.embedded .room-error { border-color:#6b3f43; background:#321f22; color:#ffcccc; }
 .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
-@media (max-width:620px) {
-  .participants { grid-template-columns:1fr; }
-  .device-row { grid-template-columns:1fr 40px; }
-  .device-row label { grid-column:1/-1; }
-}
+@media (max-width:620px) { .participants { grid-template-columns:1fr; } .device-row { grid-template-columns:1fr 40px; } .device-row label { grid-column:1/-1; } }
 </style>

@@ -9,9 +9,10 @@ import WaitingRoom from '../components/WaitingRoom.vue'
 import ReviewPhase from '../components/ReviewPhase.vue'
 import SurveyPhase from '../components/SurveyPhase.vue'
 import CompletionPhase from '../components/CompletionPhase.vue'
-import Study1VoiceRoom from '../components/Study1VoiceRoom.vue'
+import Study1MeetingWorkspace from '../components/Study1MeetingWorkspace.vue'
 import Study1DeviceCheck from '../components/Study1DeviceCheck.vue'
 import ConsentPhase from '../components/ConsentPhase.vue'
+import { useStableAudioSession } from '../composables/useStableAudioSession.js'
 import {
   clearStudy1Auth,
   createSubmission,
@@ -19,6 +20,7 @@ import {
   fetchMe,
   fetchMyMaterials,
   getStudy1Identity,
+  logReviewUiEvent,
 } from '../services/study1Api.js'
 import {
   joinStudy1Session,
@@ -44,6 +46,47 @@ const role = computed(() => identity.value?.role || '')
 const isParticipant = computed(() => ['principal', 'teammate_1', 'teammate_2'].includes(role.value))
 const completedActions = computed(() => new Set(session.value?.my_completed_actions || []))
 const hasCompleted = type => completedActions.value.has(`${type}:${role.value}`)
+
+async function reportRtcTelemetry(sample) {
+  const sessionId = identity.value?.session_id
+  if (!sessionId) return
+  try {
+    await logReviewUiEvent(sessionId, 'rtc_metric_sample', sample)
+  } catch {
+    // Telemetry must never interrupt the participant's audio controls.
+  }
+}
+
+const audioSession = useStableAudioSession({ onTelemetrySample: reportRtcTelemetry })
+const teammateBridgePhases = new Set([
+  'PROXY_MEETING',
+  'TENTATIVE_DECISION',
+  'DELEGATION_EXPECTATION',
+  'REVIEW',
+  'COMPREHENSION_MEASUREMENT',
+  'HANDOFF',
+  'SYNC_MEETING',
+])
+const meetingWorkspaceVisible = computed(() => {
+  if (['HANDOFF', 'SYNC_MEETING'].includes(phase.value)) return true
+  return ['teammate_1', 'teammate_2'].includes(role.value)
+    && teammateBridgePhases.has(phase.value)
+})
+const workspaceTaskTitle = computed(() => ({
+  PROXY_MEETING: 'Discuss the assigned task',
+  TENTATIVE_DECISION: 'Record the tentative decision',
+  DELEGATION_EXPECTATION: 'Wait for P to record expectations',
+  REVIEW: 'Wait while P reviews the meeting record',
+  COMPREHENSION_MEASUREMENT: 'Wait while P completes the measurement',
+  HANDOFF: 'Prepare for P to rejoin',
+  SYNC_MEETING: 'Synchronize as a three-person team',
+}[phase.value] || 'Current study step'))
+const workspaceTaskDescription = computed(() => ({
+  PROXY_MEETING: 'Use the audio controls below the participant seats.',
+  TENTATIVE_DECISION: 'Your audio connection remains available while you submit this form.',
+  HANDOFF: 'Stay connected while the AI Proxy leaves and P joins.',
+  SYNC_MEETING: 'Continue the task with P, T1, and T2.',
+}[phase.value] || 'Remain on this page until the researcher advances the stage.'))
 
 function clearError() {
   window.clearTimeout(errorTimer)
@@ -140,6 +183,14 @@ watch(phase, (currentPhase, previousPhase) => {
     clearNotice()
   }
 })
+watch(
+  [phase, () => session.value?.phase_version, role],
+  ([currentPhase, phaseVersion, currentRole]) => {
+    audioSession
+      .syncAuthoritativePhase(currentPhase, Number(phaseVersion) || 0, currentRole)
+      .catch(showError)
+  },
+)
 
 onMounted(() => {
   onStudy1Event('study1_phase_updated', onPhaseEvent)
@@ -155,12 +206,13 @@ onUnmounted(() => {
   offStudy1Event('study1_readiness_updated', onPhaseEvent)
   offStudy1Event('study1_session_terminated', onPhaseEvent)
   leaveStudy1Session()
+  audioSession.dispose()
 })
 </script>
 
 <template>
   <main class="study-shell">
-    <div v-if="loading" class="card">Loading the authoritative study state…</div>
+    <div v-if="loading" class="card">Loading the authoritative study state...</div>
     <div v-else-if="!session" class="card error-card">
       <h1>Study 1 access unavailable</h1>
       <p>{{ error }}</p>
@@ -172,11 +224,41 @@ onUnmounted(() => {
         :status="session.status"
         :ready="session.ready_to_advance"
         :remaining-seconds="session.remaining_seconds"
+        :session-id="identity.session_id"
       />
       <p class="role-label">Signed in as {{ role.replaceAll('_', ' ') }}</p>
       <p v-if="error" class="message error">{{ error }}</p>
       <p v-if="notice" class="message success">{{ notice }}</p>
-      <div class="card">
+      <Study1MeetingWorkspace
+        v-if="meetingWorkspaceVisible"
+        :session-id="identity.session_id"
+        :phase="phase"
+        :phase-version="session.phase_version"
+        :role="role"
+        :audio-session="audioSession"
+        :task-title="workspaceTaskTitle"
+        :task-description="workspaceTaskDescription"
+        :remaining-seconds="session.remaining_seconds"
+        @error="showTransientError($event)"
+      >
+        <VotePhase
+          v-if="phase === 'TENTATIVE_DECISION'"
+          title="Tentative decision"
+          variant="tentative"
+          :busy="busy"
+          @submit="submit('tentative_decision', $event)"
+        />
+        <WaitingRoom
+          v-else-if="['DELEGATION_EXPECTATION', 'REVIEW', 'COMPREHENSION_MEASUREMENT'].includes(phase)"
+          message="Your audio connection is being kept ready. Wait for the researcher to continue."
+        />
+        <p v-else class="meeting-guidance">
+          {{ phase === 'PROXY_MEETING'
+            ? 'Discuss the task with the participants shown in the meeting.'
+            : 'Use the shared audio room for this stage.' }}
+        </p>
+      </Study1MeetingWorkspace>
+      <div v-else class="card">
         <section v-if="phase === 'SETUP'">
           <ConsentPhase
             :role="role"
@@ -209,26 +291,11 @@ onUnmounted(() => {
           :busy="busy"
           @submit="submit(role === 'principal' ? 'proxy_config' : 'proxy_ready', $event)"
         />
-        <Study1VoiceRoom
-          v-else-if="phase === 'PROXY_MEETING' && role !== 'principal'"
-          :session-id="identity.session_id"
-          :phase="phase"
-          :phase-version="session.phase_version"
-          :role="role"
-          @error="showTransientError($event)"
-        />
         <WaitingRoom
           v-else-if="phase === 'PROXY_MEETING'"
           :message="session.waiting_room?.message || 'The delegated discussion is in progress.'"
           :remaining-seconds="session.waiting_room?.remaining_seconds"
           :connection-status="session.waiting_room?.connection_status || 'connected'"
-        />
-        <VotePhase
-          v-else-if="phase === 'TENTATIVE_DECISION' && role !== 'principal'"
-          title="Tentative decision"
-          variant="tentative"
-          :busy="busy"
-          @submit="submit('tentative_decision', $event)"
         />
         <WaitingRoom v-else-if="phase === 'TENTATIVE_DECISION'" />
         <SurveyPhase
@@ -252,14 +319,6 @@ onUnmounted(() => {
           @submit="submit('comprehension_measurement', $event)"
         />
         <WaitingRoom v-else-if="phase === 'COMPREHENSION_MEASUREMENT'" />
-        <Study1VoiceRoom
-          v-else-if="['HANDOFF', 'SYNC_MEETING'].includes(phase)"
-          :session-id="identity.session_id"
-          :phase="phase"
-          :phase-version="session.phase_version"
-          :role="role"
-          @error="showTransientError($event)"
-        />
         <VotePhase
           v-else-if="phase === 'FINAL_DECISION'"
           title="Final decision"
@@ -288,9 +347,11 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.study-shell { width:min(840px, calc(100% - 2rem)); margin:2rem auto; color:#263746; font-family:Inter, ui-sans-serif, system-ui, sans-serif; }
-.card { background:#f9fbfc; border:1px solid #dce3e9; border-radius:14px; margin-top:1.25rem; padding:1.5rem; box-shadow:0 10px 28px rgba(39,58,74,.06); }
+:global(body) { background:#eef1f2; }
+.study-shell { width:min(1180px, calc(100% - 2rem)); min-height:100vh; margin:1.25rem auto 2rem; color:#263746; font-family:Inter, ui-sans-serif, system-ui, sans-serif; }
+.card { background:#f9fbfc; border:1px solid #dce3e9; border-radius:8px; margin-top:1.25rem; padding:1.5rem; box-shadow:0 10px 28px rgba(39,58,74,.06); }
 .role-label { color:#667482; font-size:.85rem; text-transform:capitalize; }
+.meeting-guidance { margin:0; color:#5f6f79; line-height:1.55; }
 .message { padding:.75rem 1rem; border-radius:8px; animation:message-in .18s ease-out; }
 .error { background:#fff0f0; color:#9b2828; }
 .success { background:#e9f7ef; color:#17633c; }

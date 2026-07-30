@@ -397,7 +397,7 @@ onUnmounted(() => {
         <label>
           Load session
           <select v-model="selectedSessionId" @change="selectSession">
-            <option value="">Select…</option>
+            <option value="">Select...</option>
             <option v-for="item in sessionList" :key="item.session_id" :value="item.session_id">
               {{ item.session_name }} — {{ item.phase }}
             </option>

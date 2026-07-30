@@ -53,7 +53,7 @@ function submit() {
     <template v-if="variant.includes('tentative')">
       <label>Current decision status
         <select v-model="decisionStatus">
-          <option value="">Select…</option>
+          <option value="">Select...</option>
           <option value="suggestion">Suggestion only</option>
           <option value="tentative_consensus">Tentative consensus</option>
           <option value="final_commitment">Final commitment</option>
@@ -61,7 +61,7 @@ function submit() {
       </label>
       <label>Did X have authority to agree on P's behalf?
         <select v-model="proxyAuthorityBelief">
-          <option value="">Select…</option>
+          <option value="">Select...</option>
           <option value="yes">Yes</option>
           <option value="no">No</option>
           <option value="uncertain">Uncertain</option>
@@ -74,7 +74,7 @@ function submit() {
     </template>
     <label v-if="variant === 'final'">Decision scope
       <select v-model="decisionScope">
-        <option value="">Select…</option>
+        <option value="">Select...</option>
         <option value="individual">My individual final decision</option>
         <option value="team">The team's agreed final decision</option>
       </select>

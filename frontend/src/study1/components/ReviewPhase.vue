@@ -136,7 +136,7 @@ onUnmounted(() => {
 <template>
   <section>
     <h2>Review the delegated discussion</h2>
-    <p v-if="loading">Loading the authorized artifact…</p>
+    <p v-if="loading">Loading the authorized artifact...</p>
     <p v-else-if="error" class="error">{{ error }}</p>
     <template v-else>
       <article class="summary">
