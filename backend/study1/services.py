@@ -32,6 +32,7 @@ from .models import (
     Study1Phase,
     Study1Role,
     Study1RoleAssignmentRow,
+    Study1ProtocolSnapshotRow,
     Study1SubmissionRow,
     Study1TaskDefinitionRow,
     Study1TaskFactRow,
@@ -52,6 +53,15 @@ from .state_machine import (
     transition_phase,
 )
 from .task_registry import TaskDefinitionValidationError, validate_registered_task
+from .protocol_config import (
+    ProtocolConfigError,
+    assert_protocol_runtime_match,
+    clone_protocol_values,
+    compute_protocol_checksum,
+    formal_protocol_defaults,
+    freeze_protocol_snapshot,
+    normalize_protocol_config_v2,
+)
 
 
 def utc_now() -> datetime:
@@ -186,6 +196,7 @@ REVIEW_UI_EVENTS = {
     "active_reading_time",
     "critical_marker",
     "recording_replay",
+    "rtc_metric_sample",
 }
 
 
@@ -224,6 +235,7 @@ class InMemoryStudy1Repository:
         self.task_definitions: dict[tuple[str, str], dict[str, Any]] = {}
         self.role_assignments: list[dict[str, Any]] = []
         self.fact_assignments: list[dict[str, Any]] = []
+        self.protocol_snapshots: dict[str, dict[str, Any]] = {}
         self.idempotency_keys: set[str] = set()
         self._lock = threading.RLock()
 
@@ -235,6 +247,7 @@ class InMemoryStudy1Repository:
         role_assignments: list[dict[str, Any]] | None = None,
         fact_assignments: list[dict[str, Any]] | None = None,
         initial_events: list[dict[str, Any]] | None = None,
+        protocol_snapshot: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
             self.sessions[snapshot["session_id"]] = copy.deepcopy(snapshot)
@@ -244,6 +257,32 @@ class InMemoryStudy1Repository:
             self.role_assignments.extend(copy.deepcopy(role_assignments or []))
             self.fact_assignments.extend(copy.deepcopy(fact_assignments or []))
             self.events.extend(copy.deepcopy(initial_events or []))
+            if protocol_snapshot is not None:
+                self.protocol_snapshots[snapshot["session_id"]] = copy.deepcopy(
+                    protocol_snapshot
+                )
+
+    def get_protocol_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            value = self.protocol_snapshots.get(session_id)
+            return copy.deepcopy(value) if value else None
+
+    def update_protocol_snapshot(
+        self, session_id: str, protocol_snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            self.protocol_snapshots[session_id] = copy.deepcopy(protocol_snapshot)
+            config = copy.deepcopy(protocol_snapshot.get("canonical_config") or {})
+            session["experiment_config"] = config
+            session["configuration_checksum"] = protocol_snapshot.get("checksum")
+            session["protocol_snapshot_id"] = protocol_snapshot.get(
+                "protocol_snapshot_id"
+            )
+            session["protocol_config_frozen"] = bool(protocol_snapshot.get("frozen"))
+            return copy.deepcopy(protocol_snapshot)
 
     def create_task_definition(self, task: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -471,7 +510,10 @@ class InMemoryStudy1Repository:
     ) -> dict[str, Any]:
         with self._lock:
             session = self.sessions.get(session_id)
-            _validate_review_access(session, identity)
+            if event_type == "rtc_metric_sample":
+                _validate_rtc_telemetry_access(session, identity)
+            else:
+                _validate_review_access(session, identity)
             event = _record_review_ui_event(
                 session, identity, event_type, payload, utc_now()
             )
@@ -578,6 +620,9 @@ class InMemoryStudy1Repository:
                         for item in self.fact_assignments
                         if item["session_id"] == session_id
                     ]
+                ),
+                "protocol_snapshot": copy.deepcopy(
+                    self.protocol_snapshots.get(session_id)
                 ),
             }
 
@@ -832,6 +877,7 @@ class SqlAlchemyStudy1Repository:
         role_assignments: list[dict[str, Any]] | None = None,
         fact_assignments: list[dict[str, Any]] | None = None,
         initial_events: list[dict[str, Any]] | None = None,
+        protocol_snapshot: dict[str, Any] | None = None,
     ) -> None:
         with self.SessionLocal() as db:
             db.add(
@@ -852,7 +898,88 @@ class SqlAlchemyStudy1Repository:
                 db.add(Study1FactAssignmentRow(**item))
             for item in initial_events or []:
                 db.add(_event_orm(item))
+            if protocol_snapshot is not None:
+                db.add(
+                    Study1ProtocolSnapshotRow(
+                        protocol_snapshot_id=protocol_snapshot["protocol_snapshot_id"],
+                        session_id=snapshot["session_id"],
+                        schema_version=protocol_snapshot.get("schema_version", "2.0"),
+                        protocol_mode=protocol_snapshot.get("protocol_mode", "formal_v2"),
+                        canonical_config=protocol_snapshot["canonical_config"],
+                        checksum=protocol_snapshot["checksum"],
+                        frozen=bool(protocol_snapshot.get("frozen", False)),
+                        frozen_at=protocol_snapshot.get("frozen_at"),
+                        frozen_by=protocol_snapshot.get("frozen_by"),
+                        created_at=protocol_snapshot.get("created_at") or utc_now(),
+                    )
+                )
             db.commit()
+
+    def get_protocol_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        with self.SessionLocal() as db:
+            row = db.scalar(
+                select(Study1ProtocolSnapshotRow).where(
+                    Study1ProtocolSnapshotRow.session_id == session_id
+                )
+            )
+            if row is None:
+                return None
+            return _protocol_snapshot_row_dict(row)
+
+    def update_protocol_snapshot(
+        self, session_id: str, protocol_snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
+        frozen_at = protocol_snapshot.get("frozen_at")
+        if isinstance(frozen_at, str):
+            frozen_at = datetime.fromisoformat(frozen_at.replace("Z", "+00:00"))
+        created_at = protocol_snapshot.get("created_at") or utc_now()
+        if isinstance(created_at, str):
+            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if session_row is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            row = db.scalar(
+                select(Study1ProtocolSnapshotRow)
+                .where(Study1ProtocolSnapshotRow.session_id == session_id)
+                .with_for_update()
+            )
+            if row is None:
+                db.add(
+                    Study1ProtocolSnapshotRow(
+                        protocol_snapshot_id=protocol_snapshot["protocol_snapshot_id"],
+                        session_id=session_id,
+                        schema_version=protocol_snapshot.get("schema_version", "2.0"),
+                        protocol_mode=protocol_snapshot.get("protocol_mode", "formal_v2"),
+                        canonical_config=protocol_snapshot["canonical_config"],
+                        checksum=protocol_snapshot["checksum"],
+                        frozen=bool(protocol_snapshot.get("frozen", False)),
+                        frozen_at=frozen_at,
+                        frozen_by=protocol_snapshot.get("frozen_by"),
+                        created_at=created_at,
+                    )
+                )
+            else:
+                row.canonical_config = protocol_snapshot["canonical_config"]
+                row.checksum = protocol_snapshot["checksum"]
+                row.frozen = bool(protocol_snapshot.get("frozen", False))
+                row.frozen_at = frozen_at
+                row.frozen_by = protocol_snapshot.get("frozen_by")
+            snapshot = copy.deepcopy(session_row.payload)
+            snapshot["experiment_config"] = copy.deepcopy(
+                protocol_snapshot["canonical_config"]
+            )
+            snapshot["configuration_checksum"] = protocol_snapshot["checksum"]
+            snapshot["protocol_snapshot_id"] = protocol_snapshot["protocol_snapshot_id"]
+            snapshot["protocol_config_frozen"] = bool(protocol_snapshot.get("frozen"))
+            session_row.payload = snapshot
+            session_row.updated_at = utc_now()
+            db.commit()
+            return copy.deepcopy(protocol_snapshot)
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self.SessionLocal() as db:
@@ -1037,7 +1164,10 @@ class SqlAlchemyStudy1Repository:
             if not session_row:
                 raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
             snapshot = copy.deepcopy(session_row.payload)
-            _validate_review_access(snapshot, identity)
+            if event_type == "rtc_metric_sample":
+                _validate_rtc_telemetry_access(snapshot, identity)
+            else:
+                _validate_review_access(snapshot, identity)
             event = _record_review_ui_event(
                 snapshot, identity, event_type, payload, utc_now()
             )
@@ -1216,6 +1346,11 @@ class SqlAlchemyStudy1Repository:
                 .where(Study1FactAssignmentRow.session_id == session_id)
                 .order_by(Study1FactAssignmentRow.id.asc())
             ).all()
+            protocol_row = db.scalar(
+                select(Study1ProtocolSnapshotRow).where(
+                    Study1ProtocolSnapshotRow.session_id == session_id
+                )
+            )
             return {
                 "session": dict(session_row.payload),
                 "events": [
@@ -1255,6 +1390,11 @@ class SqlAlchemyStudy1Repository:
                 "fact_assignments": [
                     _fact_assignment_row_dict(row) for row in fact_assignment_rows
                 ],
+                "protocol_snapshot": (
+                    _protocol_snapshot_row_dict(protocol_row)
+                    if protocol_row is not None
+                    else None
+                ),
             }
 
     def record_media_command(
@@ -1471,6 +1611,21 @@ def _fact_assignment_row_dict(row: Study1FactAssignmentRow) -> dict[str, Any]:
         "fact_id": row.fact_id,
         "role": row.role,
         "assigned_at": row.assigned_at,
+    }
+
+
+def _protocol_snapshot_row_dict(row: Study1ProtocolSnapshotRow) -> dict[str, Any]:
+    return {
+        "protocol_snapshot_id": row.protocol_snapshot_id,
+        "session_id": row.session_id,
+        "schema_version": row.schema_version,
+        "protocol_mode": row.protocol_mode,
+        "canonical_config": copy.deepcopy(row.canonical_config),
+        "checksum": row.checksum,
+        "frozen": bool(row.frozen),
+        "frozen_at": utc_iso(row.frozen_at) if row.frozen_at else None,
+        "frozen_by": row.frozen_by,
+        "created_at": utc_iso(row.created_at) if row.created_at else None,
     }
 
 
@@ -1759,6 +1914,23 @@ def _validate_review_access(
             "Delegation expectation must be submitted before review",
             409,
         )
+
+
+def _validate_rtc_telemetry_access(
+    session: dict[str, Any] | None, identity: dict[str, Any]
+) -> None:
+    if not session:
+        raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+    if identity.get("role") not in {
+        Study1Role.PRINCIPAL.value,
+        Study1Role.TEAMMATE_1.value,
+        Study1Role.TEAMMATE_2.value,
+    }:
+        raise Study1ServiceError(
+            "RTC_TELEMETRY_FORBIDDEN", "Participant role required", 403
+        )
+    if session.get("status") in {"terminated", "completed"}:
+        raise Study1ServiceError("SESSION_NOT_ACTIVE", "Session is not active", 409)
 
 
 def _ui_event(
@@ -2296,7 +2468,31 @@ class Study1Service:
             raw_config.setdefault("role_assignment_mode", "randomized")
             raw_config["task_version"] = registered_task["task_version"]
             raw_config["task_instance_id"] = registered_task["task_definition_id"]
-        config = _normalize_experiment_config(raw_config)
+        if registered_task:
+            # Formal Sessions always use the complete V2 vocabulary.  Request
+            # values override explicit defaults, while every phase/provider/build
+            # value remains present in the persisted snapshot.
+            defaults = formal_protocol_defaults(
+                str(raw_config.get("randomization_seed") or "") or None
+            )
+            defaults.update(raw_config)
+            default_durations = defaults["phase_durations_seconds"]
+            requested_durations = raw_config.get("phase_durations_seconds") or {}
+            defaults["phase_durations_seconds"] = {
+                **default_durations,
+                **requested_durations,
+            }
+            if minimum_review_seconds:
+                defaults["minimum_review_seconds"] = int(minimum_review_seconds)
+            # Keep the old public config field as a compatibility alias.
+            if "proxy_model_version" in raw_config and "proxy_model" not in raw_config:
+                defaults["proxy_model"] = raw_config["proxy_model_version"]
+            try:
+                config = dict(normalize_protocol_config_v2(defaults))
+            except ProtocolConfigError as error:
+                raise Study1ServiceError(error.code, str(error), 400) from error
+        else:
+            config = _normalize_experiment_config(raw_config)
         now = utc_now()
         session_id = str(uuid.uuid4())
         participant_slot_ids = [str(uuid.uuid4()) for _ in HUMAN_ROLES]
@@ -2346,7 +2542,7 @@ class Study1Service:
             ],
             "participants": participants,
             "created_at": utc_iso(now),
-            "protocol_version": "study1-a-1.0",
+            "protocol_version": config.get("protocol_version", "study1-a-1.0"),
             "protocol_mode": "formal_v2" if registered_task else "legacy_protocol",
             "formal_certifiable": bool(registered_task),
             "task_definition_id": (
@@ -2358,10 +2554,11 @@ class Study1Service:
             "require_consent": config["require_consent"],
             "structured_instruments": config["structured_instruments"],
             "experiment_config": config,
+            # ``configuration_locked_at`` is retained for legacy DTO clients;
+            # formal mutability is governed by protocol_config_frozen below.
             "configuration_locked_at": utc_iso(now),
-            "configuration_checksum": hashlib.sha256(
-                json.dumps(config, sort_keys=True, ensure_ascii=False).encode("utf-8")
-            ).hexdigest(),
+            "configuration_checksum": compute_protocol_checksum(config),
+            "protocol_config_frozen": False if registered_task else True,
             "remaining_seconds": int(
                 config["phase_durations_seconds"].get(Study1Phase.SETUP.value) or 0
             ),
@@ -2456,6 +2653,27 @@ class Study1Service:
                             now,
                         )
                     )
+        protocol_snapshot = None
+        if registered_task:
+            protocol_snapshot = {
+                "protocol_snapshot_id": str(uuid.uuid4()),
+                "session_id": session_id,
+                "schema_version": "2.0",
+                "protocol_mode": "formal_v2",
+                "canonical_config": copy.deepcopy(config),
+                "checksum": compute_protocol_checksum(
+                    config,
+                    registered_task,
+                    role_assignments + fact_assignments,
+                    materials,
+                ),
+                "frozen": False,
+                "frozen_at": None,
+                "frozen_by": None,
+                "created_at": now,
+            }
+            snapshot["protocol_snapshot_id"] = protocol_snapshot["protocol_snapshot_id"]
+            snapshot["configuration_checksum"] = protocol_snapshot["checksum"]
         self.repository.create_session(
             snapshot,
             rows,
@@ -2463,6 +2681,7 @@ class Study1Service:
             role_assignments,
             fact_assignments,
             initial_events,
+            protocol_snapshot,
         )
         return {
             "session": self.session_dto(snapshot),
@@ -2502,6 +2721,52 @@ class Study1Service:
             snapshot.get("task_definition_id"),
         )
 
+    def get_protocol_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        """Return the canonical protocol snapshot for a formal Session."""
+        return self.repository.get_protocol_snapshot(session_id)
+
+    def update_protocol_config(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        patch: dict[str, Any],
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        session = self.repository.get_session(session_id)
+        snapshot = self.repository.get_protocol_snapshot(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if snapshot is None:
+            raise Study1ServiceError(
+                "LEGACY_PROTOCOL", "Legacy Sessions do not have a formal protocol", 409
+            )
+        if snapshot.get("frozen") or session.get("status") != "waiting":
+            raise Study1ServiceError(
+                "CONFIGURATION_FROZEN", "Protocol configuration is frozen", 409
+            )
+        if not isinstance(patch, dict):
+            raise Study1ServiceError("INVALID_CONFIG", "Protocol patch must be an object", 400)
+        candidate = copy.deepcopy(snapshot.get("canonical_config") or {})
+        candidate.update(copy.deepcopy(patch))
+        try:
+            config = dict(normalize_protocol_config_v2(candidate))
+        except ProtocolConfigError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+        updated = copy.deepcopy(snapshot)
+        updated["canonical_config"] = config
+        task = self.repository.get_task_definition(
+            session.get("task_definition_id"), session.get("task_version")
+        ) if session.get("task_definition_id") else None
+        exported = self.repository.export_data(session_id)
+        updated["checksum"] = compute_protocol_checksum(
+            config,
+            task,
+            exported.get("role_assignments") or [],
+            exported.get("materials") or [],
+        )
+        return self.repository.update_protocol_snapshot(session_id, updated)
+
     def get_materials(self, session_id: str, role: Study1Role | str) -> list[dict[str, Any]]:
         role_value = Study1Role(role)
         if role_value not in HUMAN_ROLES:
@@ -2515,6 +2780,11 @@ class Study1Service:
     ) -> list[dict[str, Any]]:
         if self.repository.get_session(session_id) is None:
             raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        protocol = self.repository.get_protocol_snapshot(session_id)
+        if protocol and protocol.get("frozen"):
+            raise Study1ServiceError(
+                "CONFIGURATION_FROZEN", "Protocol configuration is frozen", 409
+            )
         rows = _normalize_materials(session_id, {Study1Role(role).value: items}, utc_now())
         self.repository.add_materials(rows)
         return rows
@@ -2799,6 +3069,21 @@ class Study1Service:
                     "Missing prerequisites: " + ", ".join(missing),
                     409,
                 )
+            protocol = self.repository.get_protocol_snapshot(session_id)
+            if protocol and not protocol.get("frozen"):
+                exported = self.repository.export_data(session_id)
+                task = self.repository.get_task_definition(
+                    current.get("task_definition_id"), current.get("task_version")
+                ) if current.get("task_definition_id") else None
+                frozen = freeze_protocol_snapshot(
+                    protocol,
+                    task=task,
+                    assignments=(exported.get("role_assignments") or [])
+                    + (exported.get("fact_assignments") or []),
+                    materials=exported.get("materials") or [],
+                    actor=actor,
+                )
+                self.repository.update_protocol_snapshot(session_id, frozen)
         snapshot, events = self.repository.control_session(
             session_id, action, actor, payload or {}
         )

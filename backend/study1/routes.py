@@ -148,6 +148,20 @@ def list_study1_sessions():
         return _service_error(error)
 
 
+@study1_bp.put("/api/study1/sessions/<session_id>/protocol-config")
+@require_study1_auth([Study1Role.RESEARCHER])
+def update_study1_protocol_config(session_id: str):
+    try:
+        result = get_service().update_protocol_config(
+            session_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+        )
+        return jsonify(result), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
 @study1_bp.post("/api/study1/invites/<token>/exchange")
 def exchange_study1_invite(token: str):
     try:
@@ -299,7 +313,9 @@ def get_study1_review(session_id: str):
 
 
 @study1_bp.post("/api/study1/sessions/<session_id>/ui-events")
-@require_study1_auth([Study1Role.PRINCIPAL])
+@require_study1_auth(
+    [Study1Role.PRINCIPAL, Study1Role.TEAMMATE_1, Study1Role.TEAMMATE_2]
+)
 def create_study1_ui_event(session_id: str):
     try:
         data = request.get_json(silent=True) or {}
