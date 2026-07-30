@@ -124,34 +124,85 @@ class AudioPipelineRouter:
         if not state:
             return
         state.accepting_input = False
-        for (current_session, runtime_id, speaker), detector in list(
-            self.detectors.items()
-        ):
-            if current_session != session_id or runtime_id != state.runtime_id:
-                continue
-            for utterance in detector.flush():
-                task = asyncio.create_task(
-                    self.pipeline.process_utterance(
-                        session_id,
-                        speaker,
-                        utterance.pcm_s16le,
-                        start_ms=utterance.start_ms,
-                        end_ms=utterance.end_ms,
-                    )
-                )
-                self.tasks.setdefault(session_id, set()).add(task)
-            self.detectors.pop((current_session, runtime_id, speaker), None)
-        pending = list(self.tasks.pop(session_id, set()))
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=False)
-        recording_rows = self._close_recorders(session_id, state.runtime_id)
+        first_error: BaseException | None = None
+        recording_rows: list[dict] = []
+
+        def remember(error: BaseException) -> None:
+            nonlocal first_error
+            if first_error is None:
+                first_error = error
+
         try:
-            await self.pipeline.finalize(session_id, phase_version)
+            for (current_session, runtime_id, speaker), detector in list(
+                self.detectors.items()
+            ):
+                if current_session != session_id or runtime_id != state.runtime_id:
+                    continue
+                try:
+                    for utterance in detector.flush():
+                        task = asyncio.create_task(
+                            self.pipeline.process_utterance(
+                                session_id,
+                                speaker,
+                                utterance.pcm_s16le,
+                                start_ms=utterance.start_ms,
+                                end_ms=utterance.end_ms,
+                            )
+                        )
+                        self.tasks.setdefault(session_id, set()).add(task)
+                except BaseException as error:
+                    remember(error)
+                finally:
+                    self.detectors.pop((current_session, runtime_id, speaker), None)
+
+            pending = list(self.tasks.pop(session_id, set()))
+            if pending:
+                try:
+                    results = await asyncio.gather(*pending, return_exceptions=True)
+                    for result in results:
+                        if isinstance(result, BaseException):
+                            remember(result)
+                except BaseException as error:
+                    remember(error)
+
+            try:
+                recording_rows = self._close_recorders(
+                    session_id, state.runtime_id
+                )
+            except BaseException as error:
+                remember(error)
+
+            try:
+                await self.pipeline.finalize(session_id, phase_version)
+            except BaseException as error:
+                remember(error)
+
+            try:
+                self._create_manifests(
+                    session_id, phase_version, state, recording_rows
+                )
+            except BaseException as error:
+                remember(error)
         finally:
-            self._create_manifests(
-                session_id, phase_version, state, recording_rows
-            )
             self.sessions.pop(session_id, None)
+            self.tasks.pop(session_id, None)
+            for key in [key for key in self.detectors if key[0] == session_id]:
+                self.detectors.pop(key, None)
+            for key, recorder in list(self.recorders.items()):
+                if key[0] != session_id:
+                    continue
+                self.recorders.pop(key, None)
+                try:
+                    recorder.close()
+                except BaseException as error:
+                    remember(error)
+            try:
+                self.pipeline.cancel_session(session_id)
+            except BaseException as error:
+                remember(error)
+
+        if first_error is not None:
+            raise first_error
 
     async def cancel(self, session_id: str) -> None:
         state = self.sessions.pop(session_id, None)
@@ -170,24 +221,31 @@ class AudioPipelineRouter:
 
     def _close_recorders(self, session_id: str, runtime_id: str) -> list[dict]:
         rows: list[dict] = []
+        first_error: BaseException | None = None
         for key, recorder in list(self.recorders.items()):
             if key[:2] != (session_id, runtime_id):
                 continue
-            recorder.close()
-            payload = recorder.path.read_bytes()
-            rows.append(
-                {
-                    "recording_id": recorder.path.name,
-                    "runtime_id": runtime_id,
-                    "speaker": key[2],
-                    "content_type": "audio/wav",
-                    "size": len(payload),
-                    "checksum": hashlib.sha256(payload).hexdigest(),
-                    "duration_ms": _wave_duration_ms(recorder.path),
-                    "consent_scope": "study1_audio_recording_and_research_export",
-                }
-            )
             self.recorders.pop(key, None)
+            try:
+                recorder.close()
+                payload = recorder.path.read_bytes()
+                rows.append(
+                    {
+                        "recording_id": recorder.path.name,
+                        "runtime_id": runtime_id,
+                        "speaker": key[2],
+                        "content_type": "audio/wav",
+                        "size": len(payload),
+                        "checksum": hashlib.sha256(payload).hexdigest(),
+                        "duration_ms": _wave_duration_ms(recorder.path),
+                        "consent_scope": "study1_audio_recording_and_research_export",
+                    }
+                )
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
         return sorted(rows, key=lambda row: row["speaker"])
 
     def _create_manifests(

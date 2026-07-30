@@ -48,6 +48,7 @@ class RuntimeCommands(Protocol):
     async def start_sync(self, session_id: str, phase_version: int): ...
     async def begin_handoff(self, session_id: str, phase_version: int): ...
     async def end_current(self, session_id: str, phase_version: int): ...
+    async def stop_session(self, session_id: str, phase_version: int): ...
     async def regenerate_summary(
         self, session_id: str, phase_version: int, payload: dict
     ): ...
@@ -70,8 +71,9 @@ class CommandService:
         row = self.repository.get_command(command_id)
         if row.status == "completed":
             return
+        if not self.repository.claim_command(command_id):
+            return
         envelope = CommandEnvelope.model_validate(row.envelope)
-        self.repository.mark_command_status(command_id, "processing")
         try:
             await self.dispatch(envelope)
         except Exception as error:
@@ -82,6 +84,7 @@ class CommandService:
         self.repository.mark_command_status(command_id, "completed")
 
     async def reconcile_pending(self) -> None:
+        self.repository.requeue_interrupted_commands()
         for row in self.repository.pending_commands():
             await self.execute(row.command_id)
 
@@ -101,11 +104,12 @@ class CommandService:
             await self.runtime.begin_handoff(
                 envelope.session_id, envelope.phase_version
             )
-        elif envelope.command in (
-            MediaCommand.END_CURRENT_MEETING,
-            MediaCommand.STOP_SESSION,
-        ):
+        elif envelope.command is MediaCommand.END_CURRENT_MEETING:
             await self.runtime.end_current(
+                envelope.session_id, envelope.phase_version
+            )
+        elif envelope.command is MediaCommand.STOP_SESSION:
+            await self.runtime.stop_session(
                 envelope.session_id, envelope.phase_version
             )
         elif envelope.command is MediaCommand.REGENERATE_SUMMARY:

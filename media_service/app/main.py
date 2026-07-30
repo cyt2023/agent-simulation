@@ -145,9 +145,10 @@ def create_app(
     def accept_command(envelope: CommandEnvelope, background_tasks: BackgroundTasks):
         try:
             result = app.state.command_service.accept(envelope)
-            background_tasks.add_task(
-                dispatch_with_error_event, result.command_id
-            )
+            if not result.duplicate:
+                background_tasks.add_task(
+                    dispatch_with_error_event, result.command_id
+                )
             return result
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error

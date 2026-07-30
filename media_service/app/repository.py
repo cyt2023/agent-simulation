@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from .db import Database
@@ -93,10 +93,33 @@ class MediaRepository:
             return list(
                 session.scalars(
                     select(MediaCommandRow)
-                    .where(MediaCommandRow.status.in_(("accepted", "processing")))
+                    .where(MediaCommandRow.status.in_(("accepted", "failed")))
                     .order_by(MediaCommandRow.received_at)
                 ).all()
             )
+
+    def requeue_interrupted_commands(self) -> int:
+        """Return commands left processing by a previous process to the queue."""
+        with self.database.session_factory.begin() as session:
+            result = session.execute(
+                update(MediaCommandRow)
+                .where(MediaCommandRow.status == "processing")
+                .values(status="accepted", error_code="PROCESS_RESTARTED")
+            )
+            return int(result.rowcount or 0)
+
+    def claim_command(self, command_id: str) -> bool:
+        """Atomically lease an executable command to exactly one worker."""
+        with self.database.session_factory.begin() as session:
+            result = session.execute(
+                update(MediaCommandRow)
+                .where(
+                    MediaCommandRow.command_id == command_id,
+                    MediaCommandRow.status.in_(("accepted", "failed")),
+                )
+                .values(status="processing", error_code=None)
+            )
+            return int(result.rowcount or 0) == 1
 
     def mark_command_status(
         self, command_id: str, status: str, *, error_code: str | None = None
@@ -366,6 +389,52 @@ class MediaRepository:
                 row.ended_at = datetime.now(timezone.utc)
             return row
 
+    def mark_runtime_handoff(
+        self, runtime_id: str, phase_version: int
+    ) -> MediaRuntimeRow:
+        with self.database.session_factory.begin() as session:
+            row = session.get(MediaRuntimeRow, runtime_id)
+            if not row:
+                raise KeyError(runtime_id)
+            row.state = RuntimeState.HANDING_OFF.value
+            row.runtime_config = {
+                **(row.runtime_config or {}),
+                "handoff_phase_version": phase_version,
+                "proxy_stopped_at": (row.runtime_config or {}).get(
+                    "proxy_stopped_at"
+                )
+                or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+            return row
+
+    def patch_runtime_config(
+        self, runtime_id: str, values: dict
+    ) -> MediaRuntimeRow:
+        with self.database.session_factory.begin() as session:
+            row = session.get(MediaRuntimeRow, runtime_id)
+            if not row:
+                raise KeyError(runtime_id)
+            row.runtime_config = {**(row.runtime_config or {}), **values}
+            return row
+
+    def finish_session_runtimes(
+        self, session_id: str, state: RuntimeState = RuntimeState.STOPPED
+    ) -> list[MediaRuntimeRow]:
+        with self.database.session_factory.begin() as session:
+            rows = list(
+                session.scalars(
+                    select(MediaRuntimeRow).where(
+                        MediaRuntimeRow.session_id == session_id,
+                        MediaRuntimeRow.ended_at.is_(None),
+                    )
+                ).all()
+            )
+            ended_at = datetime.now(timezone.utc)
+            for row in rows:
+                row.state = state.value
+                row.ended_at = ended_at
+            return rows
+
     def finish_runtime_with_event(
         self,
         runtime_id: str,
@@ -375,31 +444,94 @@ class MediaRepository:
         phase_version: int,
         event_type: str,
         payload: dict,
+        runtime_config_patch: dict | None = None,
     ) -> MediaRuntimeRow:
-        with self.database.session_factory.begin() as session:
+        return self._write_runtime_event(
+            runtime_id,
+            state=state,
+            session_id=session_id,
+            phase_version=phase_version,
+            event_type=event_type,
+            payload=payload,
+            ended=True,
+            runtime_config_patch=runtime_config_patch,
+        )
+
+    def transition_runtime_with_event(
+        self,
+        runtime_id: str,
+        *,
+        state: RuntimeState,
+        session_id: str,
+        phase_version: int,
+        event_type: str,
+        payload: dict,
+        runtime_config_patch: dict | None = None,
+    ) -> MediaRuntimeRow:
+        return self._write_runtime_event(
+            runtime_id,
+            state=state,
+            session_id=session_id,
+            phase_version=phase_version,
+            event_type=event_type,
+            payload=payload,
+            ended=False,
+            runtime_config_patch=runtime_config_patch,
+        )
+
+    def _write_runtime_event(
+        self,
+        runtime_id: str,
+        *,
+        state: RuntimeState,
+        session_id: str,
+        phase_version: int,
+        event_type: str,
+        payload: dict,
+        ended: bool,
+        runtime_config_patch: dict | None = None,
+    ) -> MediaRuntimeRow:
+        event_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"study1-media:{runtime_id}:{phase_version}:{event_type}",
+            )
+        )
+
+        def update_runtime(session):
             runtime = session.get(MediaRuntimeRow, runtime_id)
             if not runtime:
                 raise KeyError(runtime_id)
             runtime.state = state.value
-            runtime.ended_at = datetime.now(timezone.utc)
-            existing = session.scalars(
-                select(OutboxMessageRow).where(
-                    OutboxMessageRow.session_id == session_id,
-                    OutboxMessageRow.phase_version == phase_version,
-                    OutboxMessageRow.event_type == event_type,
-                )
-            ).all()
-            if not any(row.payload.get("runtime_id") == runtime_id for row in existing):
-                session.add(
-                    OutboxMessageRow(
-                        event_id=str(uuid.uuid4()),
-                        session_id=session_id,
-                        phase_version=phase_version,
-                        event_type=event_type,
-                        payload=payload,
-                    )
-                )
+            if ended:
+                runtime.ended_at = runtime.ended_at or datetime.now(timezone.utc)
+            if runtime_config_patch:
+                runtime.runtime_config = {
+                    **(runtime.runtime_config or {}),
+                    **runtime_config_patch,
+                }
             return runtime
+
+        try:
+            with self.database.session_factory.begin() as session:
+                runtime = update_runtime(session)
+                if session.get(OutboxMessageRow, event_id) is None:
+                    session.add(
+                        OutboxMessageRow(
+                            event_id=event_id,
+                            session_id=session_id,
+                            phase_version=phase_version,
+                            event_type=event_type,
+                            payload=payload,
+                        )
+                    )
+                return runtime
+        except IntegrityError:
+            # A competing process committed the deterministic event first.
+            with self.database.session_factory.begin() as session:
+                if session.get(OutboxMessageRow, event_id) is None:
+                    raise
+                return update_runtime(session)
 
     def mark_outbox_attempt(self, event_id: str, error: str) -> None:
         with self.database.session_factory.begin() as session:

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import re
 
 from livekit import api
 
 from .config import Settings
+from .room_policy import safe_session_part, stable_room_name
 from .schemas import MediaAccessResponse
 
 
@@ -18,10 +18,6 @@ _ROOM_ACCESS = {
     "HANDOFF": {"principal", "teammate_1", "teammate_2"},
     "SYNC_MEETING": {"principal", "teammate_1", "teammate_2"},
 }
-
-
-def _room_session_part(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]", "-", value)[:96]
 
 
 class MediaAccessService:
@@ -40,12 +36,7 @@ class MediaAccessService:
             raise AccessDenied(f"Role {role} cannot enter media for {phase}")
         if role == "proxy" and phase != "PROXY_MEETING":
             raise AccessDenied("Proxy cannot enter the synchronous room")
-        room_kind = "proxy" if phase == "PROXY_MEETING" else "sync"
-        room_name = (
-            f"study1-{_room_session_part(session_id)}-proxy-v{phase_version}"
-            if room_kind == "proxy"
-            else f"study1-{_room_session_part(session_id)}-sync"
-        )
+        room_name = stable_room_name(session_id)
         expires_at = datetime.now(timezone.utc) + timedelta(
             seconds=self.settings.livekit_token_ttl_seconds
         )
@@ -54,20 +45,20 @@ class MediaAccessService:
             role=role,
             participant_id=participant_id,
             expires_at=expires_at,
-            can_publish=True,
+            can_publish=phase != "HANDOFF",
         )
 
     def issue_recorder_access(
         self, session_id: str, phase_version: int
     ) -> MediaAccessResponse:
-        room_name = f"study1-{_room_session_part(session_id)}-sync"
+        room_name = stable_room_name(session_id)
         expires_at = datetime.now(timezone.utc) + timedelta(
             seconds=self.settings.livekit_token_ttl_seconds
         )
         return self._issue_token(
             room_name,
             role="recorder",
-            participant_id=f"recorder-{_room_session_part(session_id)}",
+            participant_id=f"recorder-{safe_session_part(session_id)}",
             expires_at=expires_at,
             can_publish=False,
         )

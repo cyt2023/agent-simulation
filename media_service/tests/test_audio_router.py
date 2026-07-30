@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -33,6 +34,7 @@ class StubPipeline:
 
     def cancel_session(self, session_id):
         self.cancelled.append(session_id)
+        self.sessions.pop(session_id, None)
 
     async def regenerate_summary(self, *args, **kwargs):
         pass
@@ -110,3 +112,63 @@ async def test_router_cancel_stops_session_before_proxy_disconnect(repository, t
 
     assert pipeline.cancelled == ["session-1"]
     assert "session-1" not in router.sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["task", "recorder", "pipeline", "manifest"])
+async def test_finalize_failure_always_releases_router_and_pipeline_state(
+    repository, tmp_path, monkeypatch, failure_point
+):
+    class FailingPipeline(StubPipeline):
+        async def finalize(self, session_id, phase_version):
+            if failure_point == "pipeline":
+                raise RuntimeError("pipeline finalize failed")
+            self.sessions.pop(session_id, None)
+
+    pipeline = FailingPipeline(repository)
+    router = AudioPipelineRouter(pipeline, tmp_path)
+    await router.start_session(
+        "session-1",
+        "runtime-1",
+        {},
+        proxy_enabled=True,
+        artifact_version="1",
+    )
+
+    if failure_point == "task":
+        async def fail_task():
+            raise RuntimeError("pending task failed")
+
+        task = asyncio.create_task(fail_task())
+        router.tasks["session-1"].add(task)
+    elif failure_point == "recorder":
+        monkeypatch.setattr(
+            router,
+            "_close_recorders",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("recorder close failed")),
+        )
+    elif failure_point == "manifest":
+        monkeypatch.setattr(
+            router,
+            "_create_manifests",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("manifest failed")),
+        )
+
+    with pytest.raises(RuntimeError):
+        await router.finalize("session-1", phase_version=5)
+
+    assert "session-1" not in router.sessions
+    assert "session-1" not in router.tasks
+    assert all(key[0] != "session-1" for key in router.detectors)
+    assert all(key[0] != "session-1" for key in router.recorders)
+    assert "session-1" not in pipeline.sessions
+    assert pipeline.cancelled == ["session-1"]
+
+    await router.start_session(
+        "session-1",
+        "runtime-2",
+        {},
+        proxy_enabled=True,
+        artifact_version="2",
+    )
+    assert router.sessions["session-1"].accepting_input is True
