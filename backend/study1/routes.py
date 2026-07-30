@@ -57,6 +57,70 @@ def researcher_login():
         return jsonify({"error": error.code, "message": str(error)}), error.status
 
 
+@study1_bp.post("/api/study1/task-definitions")
+@require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
+def create_study1_task_definition():
+    try:
+        task = get_service().create_task_definition(
+            g.study1_identity.as_actor(), request.get_json(silent=True) or {}
+        )
+        return jsonify(task), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.get("/api/study1/task-definitions")
+@require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
+def list_study1_task_definitions():
+    try:
+        tasks = get_service().list_task_definitions(request.args.get("status"))
+        return jsonify({"tasks": tasks}), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.get("/api/study1/task-definitions/<task_definition_id>")
+@require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
+def get_study1_task_definition(task_definition_id: str):
+    try:
+        return jsonify(
+            get_service().get_task_definition(
+                task_definition_id, request.args.get("version")
+            )
+        ), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.put("/api/study1/task-definitions/<task_definition_id>")
+@require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
+def replace_study1_task_definition(task_definition_id: str):
+    try:
+        task = get_service().replace_task_definition(
+            task_definition_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+            request.args.get("version"),
+        )
+        return jsonify(task), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/task-definitions/<task_definition_id>/validate")
+@require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
+def validate_study1_task_definition(task_definition_id: str):
+    try:
+        task = get_service().validate_task_definition(
+            task_definition_id,
+            g.study1_identity.as_actor(),
+            request.args.get("version"),
+        )
+        return jsonify(task), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
 @study1_bp.post("/api/study1/sessions")
 @require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
 def create_study1_session():
@@ -68,6 +132,7 @@ def create_study1_session():
             data.get("materials_by_role") or {},
             int(data.get("minimum_review_seconds") or 0),
             data.get("experiment_config") or {},
+            data.get("task_definition_id"),
         )
         return jsonify(result), 201
     except Study1ServiceError as error:

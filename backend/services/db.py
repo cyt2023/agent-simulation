@@ -235,8 +235,21 @@ def init_db() -> None:
     # Identifier is regex-validated; safe to interpolate as bare PostgreSQL identifier.
     with engine.begin() as conn:
         conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS {schema}'))
-    Base.metadata.create_all(bind=engine)
+    from study1.schema_migrations import (
+        STUDY1_ADDITIVE_TABLE_NAMES,
+        run_study1_migrations,
+    )
+
+    Base.metadata.create_all(
+        bind=engine,
+        tables=[
+            table
+            for table in Base.metadata.sorted_tables
+            if table.name not in STUDY1_ADDITIVE_TABLE_NAMES
+        ],
+    )
     _ensure_in_session_elapsed_seconds_column(engine)
+    run_study1_migrations(engine)
 
 
 def _parse_entry_timestamp(ts: Optional[str]) -> datetime:

@@ -27,10 +27,14 @@ from .models import (
     Study1ArtifactRow,
     Study1InviteRow,
     Study1IncidentRow,
+    Study1FactAssignmentRow,
     Study1MaterialRow,
     Study1Phase,
     Study1Role,
+    Study1RoleAssignmentRow,
     Study1SubmissionRow,
+    Study1TaskDefinitionRow,
+    Study1TaskFactRow,
 )
 from .media_gateway import (
     COMMANDS,
@@ -47,6 +51,7 @@ from .state_machine import (
     readiness,
     transition_phase,
 )
+from .task_registry import TaskDefinitionValidationError, validate_registered_task
 
 
 def utc_now() -> datetime:
@@ -216,6 +221,9 @@ class InMemoryStudy1Repository:
         self.submissions: list[dict[str, Any]] = []
         self.artifacts: list[dict[str, Any]] = []
         self.incidents: list[dict[str, Any]] = []
+        self.task_definitions: dict[tuple[str, str], dict[str, Any]] = {}
+        self.role_assignments: list[dict[str, Any]] = []
+        self.fact_assignments: list[dict[str, Any]] = []
         self.idempotency_keys: set[str] = set()
         self._lock = threading.RLock()
 
@@ -224,12 +232,114 @@ class InMemoryStudy1Repository:
         snapshot: dict[str, Any],
         invites: list[dict[str, Any]],
         materials: list[dict[str, Any]] | None = None,
+        role_assignments: list[dict[str, Any]] | None = None,
+        fact_assignments: list[dict[str, Any]] | None = None,
+        initial_events: list[dict[str, Any]] | None = None,
     ) -> None:
         with self._lock:
-            self.sessions[snapshot["session_id"]] = snapshot
+            self.sessions[snapshot["session_id"]] = copy.deepcopy(snapshot)
             for invite in invites:
-                self.invites[invite["token_hash"]] = invite
+                self.invites[invite["token_hash"]] = copy.deepcopy(invite)
             self.materials.extend(copy.deepcopy(materials or []))
+            self.role_assignments.extend(copy.deepcopy(role_assignments or []))
+            self.fact_assignments.extend(copy.deepcopy(fact_assignments or []))
+            self.events.extend(copy.deepcopy(initial_events or []))
+
+    def create_task_definition(self, task: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            key = (task["task_definition_id"], task["task_version"])
+            if key in self.task_definitions:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_EXISTS", "Task definition already exists", 409
+                )
+            self.task_definitions[key] = copy.deepcopy(task)
+            return copy.deepcopy(task)
+
+    def get_task_definition(
+        self, task_definition_id: str, task_version: str | None = None
+    ) -> dict[str, Any] | None:
+        """Resolve an exact version, or the newest definition for legacy callers."""
+        with self._lock:
+            if task_version is not None:
+                value = self.task_definitions.get(
+                    (task_definition_id, task_version)
+                )
+            else:
+                matches = [
+                    item
+                    for (logical_id, _version), item in self.task_definitions.items()
+                    if logical_id == task_definition_id
+                ]
+                value = max(
+                    matches,
+                    key=lambda item: (item["created_at"], item["task_version"]),
+                    default=None,
+                )
+            return copy.deepcopy(value) if value else None
+
+    def replace_task_definition(
+        self, task_definition_id: str, task: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self._lock:
+            key = (task_definition_id, task["task_version"])
+            current = self.task_definitions.get(key)
+            if current is None:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+                )
+            if current["status"] != "draft":
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_IMMUTABLE",
+                    "Validated task definitions cannot be modified",
+                    409,
+                )
+            self.task_definitions[key] = copy.deepcopy(task)
+            return copy.deepcopy(task)
+
+    def set_task_definition_status(
+        self,
+        task_definition_id: str,
+        task_version: str,
+        status: str,
+        content_checksum: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            task = self.task_definitions.get((task_definition_id, task_version))
+            if task is None:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+                )
+            if task["content_checksum"] != content_checksum:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_CHANGED",
+                    "Task definition changed before validation completed",
+                    409,
+                )
+            if task["status"] == status:
+                return copy.deepcopy(task)
+            if task["status"] != "draft":
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_IMMUTABLE",
+                    "Validated task definitions cannot be modified",
+                    409,
+                )
+            task["status"] = status
+            return copy.deepcopy(task)
+
+    def list_task_definitions(self, status: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            values = self.task_definitions.values()
+            return [
+                copy.deepcopy(item)
+                for item in sorted(
+                    values,
+                    key=lambda value: (
+                        value["task_definition_id"],
+                        value["task_version"],
+                    ),
+                )
+                if status is None or item["status"] == status
+            ]
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -455,6 +565,20 @@ class InMemoryStudy1Repository:
                 "materials": copy.deepcopy(
                     [item for item in self.materials if item["session_id"] == session_id]
                 ),
+                "role_assignments": copy.deepcopy(
+                    [
+                        item
+                        for item in self.role_assignments
+                        if item["session_id"] == session_id
+                    ]
+                ),
+                "fact_assignments": copy.deepcopy(
+                    [
+                        item
+                        for item in self.fact_assignments
+                        if item["session_id"] == session_id
+                    ]
+                ),
             }
 
     def record_media_command(
@@ -534,11 +658,180 @@ class SqlAlchemyStudy1Repository:
             )
         self.SessionLocal = get_session_factory()
 
+    def create_task_definition(self, task: dict[str, Any]) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            existing = db.scalar(
+                select(Study1TaskDefinitionRow).where(
+                    Study1TaskDefinitionRow.task_definition_id
+                    == task["task_definition_id"],
+                    Study1TaskDefinitionRow.task_version == task["task_version"],
+                )
+            )
+            if existing:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_EXISTS", "Task definition already exists", 409
+                )
+            db.add(_task_definition_orm(task))
+            for fact in task["facts"]:
+                db.add(
+                    _task_fact_orm(
+                        task["task_definition_id"], task["task_version"], fact
+                    )
+                )
+            db.commit()
+            return copy.deepcopy(task)
+
+    def get_task_definition(
+        self, task_definition_id: str, task_version: str | None = None
+    ) -> dict[str, Any] | None:
+        """Resolve an exact version, or the newest definition for legacy callers."""
+        with self.SessionLocal() as db:
+            query = select(Study1TaskDefinitionRow).where(
+                Study1TaskDefinitionRow.task_definition_id == task_definition_id
+            )
+            if task_version is not None:
+                query = query.where(
+                    Study1TaskDefinitionRow.task_version == task_version
+                )
+            row = db.scalar(
+                query.order_by(
+                    Study1TaskDefinitionRow.created_at.desc(),
+                    Study1TaskDefinitionRow.id.desc(),
+                )
+            )
+            if row is None:
+                return None
+            facts = db.scalars(
+                select(Study1TaskFactRow)
+                .where(
+                    Study1TaskFactRow.task_definition_id == task_definition_id,
+                    Study1TaskFactRow.task_version == row.task_version,
+                )
+                .order_by(Study1TaskFactRow.id.asc())
+            ).all()
+            return _task_definition_row_dict(row, facts)
+
+    def replace_task_definition(
+        self, task_definition_id: str, task: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            row = db.scalar(
+                select(Study1TaskDefinitionRow)
+                .where(
+                    Study1TaskDefinitionRow.task_definition_id == task_definition_id,
+                    Study1TaskDefinitionRow.task_version == task["task_version"],
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+                )
+            if row.status != "draft":
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_IMMUTABLE",
+                    "Validated task definitions cannot be modified",
+                    409,
+                )
+            row.task_version = task["task_version"]
+            row.title = task["title"]
+            row.candidate_ids = task["candidate_ids"]
+            row.status = task["status"]
+            row.content_checksum = task["content_checksum"]
+            old_facts = db.scalars(
+                select(Study1TaskFactRow).where(
+                    Study1TaskFactRow.task_definition_id == task_definition_id,
+                    Study1TaskFactRow.task_version == task["task_version"],
+                )
+            ).all()
+            for fact in old_facts:
+                db.delete(fact)
+            db.flush()
+            for fact in task["facts"]:
+                db.add(
+                    _task_fact_orm(task_definition_id, task["task_version"], fact)
+                )
+            db.commit()
+            return copy.deepcopy(task)
+
+    def set_task_definition_status(
+        self,
+        task_definition_id: str,
+        task_version: str,
+        status: str,
+        content_checksum: str,
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            row = db.scalar(
+                select(Study1TaskDefinitionRow)
+                .where(
+                    Study1TaskDefinitionRow.task_definition_id == task_definition_id,
+                    Study1TaskDefinitionRow.task_version == task_version,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+                )
+            if row.content_checksum != content_checksum:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_CHANGED",
+                    "Task definition changed before validation completed",
+                    409,
+                )
+            if row.status != status:
+                if row.status != "draft":
+                    raise Study1ServiceError(
+                        "TASK_DEFINITION_IMMUTABLE",
+                        "Validated task definitions cannot be modified",
+                        409,
+                    )
+                row.status = status
+            facts = db.scalars(
+                select(Study1TaskFactRow)
+                .where(
+                    Study1TaskFactRow.task_definition_id == task_definition_id,
+                    Study1TaskFactRow.task_version == task_version,
+                )
+                .order_by(Study1TaskFactRow.id.asc())
+            ).all()
+            db.commit()
+            return _task_definition_row_dict(row, facts)
+
+    def list_task_definitions(self, status: str | None = None) -> list[dict[str, Any]]:
+        with self.SessionLocal() as db:
+            query = select(Study1TaskDefinitionRow)
+            if status is not None:
+                query = query.where(Study1TaskDefinitionRow.status == status)
+            rows = db.scalars(
+                query.order_by(
+                    Study1TaskDefinitionRow.task_definition_id.asc(),
+                    Study1TaskDefinitionRow.task_version.asc(),
+                )
+            ).all()
+            values: list[dict[str, Any]] = []
+            for row in rows:
+                facts = db.scalars(
+                    select(Study1TaskFactRow)
+                    .where(
+                        Study1TaskFactRow.task_definition_id
+                        == row.task_definition_id,
+                        Study1TaskFactRow.task_version == row.task_version,
+                    )
+                    .order_by(Study1TaskFactRow.id.asc())
+                ).all()
+                values.append(_task_definition_row_dict(row, facts))
+            return values
+
     def create_session(
         self,
         snapshot: dict[str, Any],
         invites: list[dict[str, Any]],
         materials: list[dict[str, Any]] | None = None,
+        role_assignments: list[dict[str, Any]] | None = None,
+        fact_assignments: list[dict[str, Any]] | None = None,
+        initial_events: list[dict[str, Any]] | None = None,
     ) -> None:
         with self.SessionLocal() as db:
             db.add(
@@ -553,6 +846,12 @@ class SqlAlchemyStudy1Repository:
                 db.add(Study1InviteRow(**item))
             for item in materials or []:
                 db.add(Study1MaterialRow(**item))
+            for item in role_assignments or []:
+                db.add(Study1RoleAssignmentRow(**item))
+            for item in fact_assignments or []:
+                db.add(Study1FactAssignmentRow(**item))
+            for item in initial_events or []:
+                db.add(_event_orm(item))
             db.commit()
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
@@ -907,6 +1206,16 @@ class SqlAlchemyStudy1Repository:
                 .where(Study1MaterialRow.session_id == session_id)
                 .order_by(Study1MaterialRow.id.asc())
             ).all()
+            role_assignment_rows = db.scalars(
+                select(Study1RoleAssignmentRow)
+                .where(Study1RoleAssignmentRow.session_id == session_id)
+                .order_by(Study1RoleAssignmentRow.assignment_order.asc())
+            ).all()
+            fact_assignment_rows = db.scalars(
+                select(Study1FactAssignmentRow)
+                .where(Study1FactAssignmentRow.session_id == session_id)
+                .order_by(Study1FactAssignmentRow.id.asc())
+            ).all()
             return {
                 "session": dict(session_row.payload),
                 "events": [
@@ -940,6 +1249,12 @@ class SqlAlchemyStudy1Repository:
                     for row in incident_rows
                 ],
                 "materials": [_material_row_dict(row) for row in material_rows],
+                "role_assignments": [
+                    _role_assignment_row_dict(row) for row in role_assignment_rows
+                ],
+                "fact_assignments": [
+                    _fact_assignment_row_dict(row) for row in fact_assignment_rows
+                ],
             }
 
     def record_media_command(
@@ -1048,7 +1363,10 @@ class SqlAlchemyStudy1Repository:
                 raise Study1ServiceError(
                     "INVITE_ALREADY_USED", "Invite has already been redeemed", 409
                 )
-            if row.expires_at <= used_at:
+            expires_at = row.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= used_at:
                 raise Study1ServiceError("INVITE_EXPIRED", "Invite has expired", 410)
             row.used_at = used_at
             snapshot_row = db.scalar(
@@ -1073,6 +1391,87 @@ class SqlAlchemyStudy1Repository:
             )
             db.commit()
             return invite
+
+
+def _task_definition_orm(task: dict[str, Any]) -> Study1TaskDefinitionRow:
+    return Study1TaskDefinitionRow(
+        task_definition_id=task["task_definition_id"],
+        task_version=task["task_version"],
+        title=task["title"],
+        candidate_ids=copy.deepcopy(task["candidate_ids"]),
+        status=task["status"],
+        content_checksum=task["content_checksum"],
+        created_at=task["created_at"],
+        created_by=task["created_by"],
+    )
+
+
+def _task_fact_orm(
+    task_definition_id: str,
+    task_version: str,
+    fact: dict[str, Any],
+) -> Study1TaskFactRow:
+    return Study1TaskFactRow(
+        task_definition_id=task_definition_id,
+        task_version=task_version,
+        fact_id=fact["fact_id"],
+        candidate_id=fact["candidate_id"],
+        text=fact["text"],
+        valence=fact["valence"],
+        information_type=fact["information_type"],
+        visible_to_roles=copy.deepcopy(fact["visible_to_roles"]),
+    )
+
+
+def _task_definition_row_dict(
+    row: Study1TaskDefinitionRow, facts: list[Study1TaskFactRow]
+) -> dict[str, Any]:
+    return {
+        "task_definition_id": row.task_definition_id,
+        "task_version": row.task_version,
+        "title": row.title,
+        "candidate_ids": list(row.candidate_ids or []),
+        "facts": [
+            {
+                "fact_id": fact.fact_id,
+                "candidate_id": fact.candidate_id,
+                "text": fact.text,
+                "valence": fact.valence,
+                "information_type": fact.information_type,
+                "visible_to_roles": list(fact.visible_to_roles or []),
+            }
+            for fact in facts
+        ],
+        "status": row.status,
+        "content_checksum": row.content_checksum,
+        "created_at": row.created_at,
+        "created_by": row.created_by,
+    }
+
+
+def _role_assignment_row_dict(row: Study1RoleAssignmentRow) -> dict[str, Any]:
+    return {
+        "assignment_id": row.assignment_id,
+        "session_id": row.session_id,
+        "participant_slot_id": row.participant_slot_id,
+        "participant_id": row.participant_id,
+        "role": row.role,
+        "assignment_order": row.assignment_order,
+        "randomization_seed": row.randomization_seed,
+        "assigned_at": row.assigned_at,
+    }
+
+
+def _fact_assignment_row_dict(row: Study1FactAssignmentRow) -> dict[str, Any]:
+    return {
+        "assignment_id": row.assignment_id,
+        "session_id": row.session_id,
+        "task_definition_id": row.task_definition_id,
+        "task_version": row.task_version,
+        "fact_id": row.fact_id,
+        "role": row.role,
+        "assigned_at": row.assigned_at,
+    }
 
 
 def _invite_row_dict(row: Study1InviteRow) -> dict[str, Any]:
@@ -1754,6 +2153,116 @@ class Study1Service:
         self.tokens = token_manager or Study1TokenManager()
         self.media_gateway = media_gateway or create_media_gateway_from_env()
 
+    def create_task_definition(
+        self, actor: dict[str, Any], payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._require_researcher(actor)
+        canonical = self._validate_task_payload(payload)
+        task = {
+            **canonical,
+            "status": "draft",
+            "created_at": utc_now(),
+            "created_by": str(actor.get("participant_id") or "researcher"),
+        }
+        return self.repository.create_task_definition(task)
+
+    def replace_task_definition(
+        self,
+        task_definition_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+        task_version: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_researcher(actor)
+        replacement = copy.deepcopy(payload)
+        replacement["task_definition_id"] = task_definition_id
+        if task_version is not None:
+            clean_route_version = str(task_version).strip()
+            payload_version = str(replacement.get("task_version") or "").strip()
+            if payload_version and payload_version != clean_route_version:
+                raise Study1ServiceError(
+                    "TASK_VERSION_MISMATCH",
+                    "Payload task_version does not match the selected version",
+                    400,
+                )
+            replacement["task_version"] = clean_route_version
+        selected_version = str(replacement.get("task_version") or "").strip() or None
+        existing = self.repository.get_task_definition(
+            task_definition_id, selected_version
+        )
+        if existing is None:
+            raise Study1ServiceError(
+                "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+            )
+        if existing["status"] == "validated":
+            raise Study1ServiceError(
+                "TASK_DEFINITION_IMMUTABLE",
+                "Validated task definitions cannot be modified",
+                409,
+            )
+        canonical = self._validate_task_payload(replacement)
+        task = {
+            **canonical,
+            "status": "draft",
+            "created_at": existing["created_at"],
+            "created_by": existing["created_by"],
+        }
+        return self.repository.replace_task_definition(task_definition_id, task)
+
+    def validate_task_definition(
+        self,
+        task_definition_id: str,
+        actor: dict[str, Any],
+        task_version: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_researcher(actor)
+        task = self.repository.get_task_definition(task_definition_id, task_version)
+        if task is None:
+            raise Study1ServiceError(
+                "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+            )
+        if task["status"] == "validated":
+            return task
+        canonical = self._validate_task_payload(task)
+        return self.repository.set_task_definition_status(
+            task_definition_id,
+            task["task_version"],
+            "validated",
+            canonical["content_checksum"],
+        )
+
+    def list_task_definitions(
+        self, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        clean_status = str(status).strip() if status is not None else None
+        if clean_status not in (None, "draft", "validated"):
+            raise Study1ServiceError(
+                "INVALID_TASK_STATUS", "status must be draft or validated", 400
+            )
+        return self.repository.list_task_definitions(clean_status)
+
+    def get_task_definition(
+        self, task_definition_id: str, task_version: str | None = None
+    ) -> dict[str, Any]:
+        task = self.repository.get_task_definition(task_definition_id, task_version)
+        if task is None:
+            raise Study1ServiceError(
+                "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+            )
+        return task
+
+    @staticmethod
+    def _require_researcher(actor: dict[str, Any]) -> None:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+
+    @staticmethod
+    def _validate_task_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return validate_registered_task(payload)
+        except TaskDefinitionValidationError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+
     def create_session(
         self,
         session_name: str,
@@ -1761,21 +2270,43 @@ class Study1Service:
         materials_by_role: dict[str, list[dict[str, Any]]] | None = None,
         minimum_review_seconds: int = 0,
         experiment_config: dict[str, Any] | None = None,
+        task_definition_id: str | None = None,
     ) -> dict[str, Any]:
         clean_name = (session_name or "").strip()
         if not clean_name:
             raise Study1ServiceError(
                 "SESSION_NAME_REQUIRED", "session_name is required", 400
             )
-        config = _normalize_experiment_config(experiment_config or {})
+        registered_task: dict[str, Any] | None = None
+        raw_config = copy.deepcopy(experiment_config or {})
+        if task_definition_id is not None:
+            clean_task_id = str(task_definition_id).strip()
+            requested_version = (
+                str(raw_config.get("task_version") or "").strip() or None
+            )
+            registered_task = self.repository.get_task_definition(
+                clean_task_id, requested_version
+            )
+            if registered_task is None or registered_task.get("status") != "validated":
+                raise Study1ServiceError(
+                    "TASK_NOT_VALIDATED",
+                    "Formal sessions require a validated task definition",
+                    409,
+                )
+            raw_config.setdefault("role_assignment_mode", "randomized")
+            raw_config["task_version"] = registered_task["task_version"]
+            raw_config["task_instance_id"] = registered_task["task_definition_id"]
+        config = _normalize_experiment_config(raw_config)
         now = utc_now()
         session_id = str(uuid.uuid4())
+        participant_slot_ids = [str(uuid.uuid4()) for _ in HUMAN_ROLES]
         assigned_roles = list(HUMAN_ROLES)
         if config["role_assignment_mode"] == "randomized":
             random.Random(config["randomization_seed"]).shuffle(assigned_roles)
         participants = [
             {
                 "participant_id": str(uuid.uuid4()),
+                "participant_slot_id": participant_slot_ids[index - 1],
                 "role": role.value,
                 "online": False,
                 "assignment_order": index,
@@ -1816,6 +2347,11 @@ class Study1Service:
             "participants": participants,
             "created_at": utc_iso(now),
             "protocol_version": "study1-a-1.0",
+            "protocol_mode": "formal_v2" if registered_task else "legacy_protocol",
+            "formal_certifiable": bool(registered_task),
+            "task_definition_id": (
+                registered_task["task_definition_id"] if registered_task else None
+            ),
             "task_version": config["task_version"],
             "task_instance_id": config["task_instance_id"],
             "minimum_review_seconds": max(0, int(minimum_review_seconds)),
@@ -1861,8 +2397,73 @@ class Study1Service:
                     "created_at": now,
                 }
             )
-        materials = _normalize_materials(session_id, materials_by_role or {}, now)
-        self.repository.create_session(snapshot, rows, materials)
+        material_source = (
+            _registered_task_materials(registered_task)
+            if registered_task
+            else (materials_by_role or {})
+        )
+        materials = _normalize_materials(session_id, material_source, now)
+        role_assignments: list[dict[str, Any]] = []
+        fact_assignments: list[dict[str, Any]] = []
+        initial_events: list[dict[str, Any]] = []
+        if registered_task:
+            participant_by_role = {
+                participant["role"]: participant for participant in participants
+            }
+            for participant in participants:
+                assignment = {
+                    "assignment_id": str(uuid.uuid4()),
+                    "session_id": session_id,
+                    "participant_slot_id": participant["participant_slot_id"],
+                    "participant_id": participant["participant_id"],
+                    "role": participant["role"],
+                    "assignment_order": participant["assignment_order"],
+                    "randomization_seed": config["randomization_seed"],
+                    "assigned_at": now,
+                }
+                role_assignments.append(assignment)
+                initial_events.append(
+                    _assignment_event(
+                        snapshot,
+                        "role_assignment_created",
+                        participant["participant_id"],
+                        participant["role"],
+                        assignment,
+                        now,
+                    )
+                )
+            for fact in registered_task["facts"]:
+                for role in fact["visible_to_roles"]:
+                    assignment = {
+                        "assignment_id": str(uuid.uuid4()),
+                        "session_id": session_id,
+                        "task_definition_id": registered_task[
+                            "task_definition_id"
+                        ],
+                        "task_version": registered_task["task_version"],
+                        "fact_id": fact["fact_id"],
+                        "role": role,
+                        "assigned_at": now,
+                    }
+                    fact_assignments.append(assignment)
+                    initial_events.append(
+                        _assignment_event(
+                            snapshot,
+                            "fact_assignment_created",
+                            participant_by_role[role]["participant_id"],
+                            role,
+                            assignment,
+                            now,
+                        )
+                    )
+        self.repository.create_session(
+            snapshot,
+            rows,
+            materials,
+            role_assignments,
+            fact_assignments,
+            initial_events,
+        )
         return {
             "session": self.session_dto(snapshot),
             "invites": [invite.public_dict() for invite in created],
@@ -1898,6 +2499,7 @@ class Study1Service:
             materials_by_role,
             int(snapshot.get("minimum_review_seconds") or 0),
             config,
+            snapshot.get("task_definition_id"),
         )
 
     def get_materials(self, session_id: str, role: Study1Role | str) -> list[dict[str, Any]]:
@@ -2630,6 +3232,10 @@ class Study1Service:
             "phase_version": snapshot["phase_version"],
             "phase_started_at": snapshot["phase_started_at"],
             "remaining_seconds": _remaining_seconds(snapshot),
+            "protocol_mode": snapshot.get("protocol_mode", "legacy_protocol"),
+            "formal_certifiable": bool(snapshot.get("formal_certifiable", False)),
+            "task_definition_id": snapshot.get("task_definition_id"),
+            "task_version": snapshot.get("task_version"),
             **readiness(snapshot),
             "consent_version": (snapshot.get("experiment_config") or {}).get(
                 "consent_version", "study1-consent-v1"
@@ -2652,6 +3258,57 @@ class Study1Service:
                 },
             }
         return base
+
+
+def _registered_task_materials(
+    task: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    materials: dict[str, list[dict[str, Any]]] = {}
+    for role in (item.value for item in HUMAN_ROLES):
+        visible_facts = [
+            copy.deepcopy(fact)
+            for fact in task["facts"]
+            if role in fact["visible_to_roles"]
+        ]
+        materials[role] = [
+            {
+                "title": task["title"],
+                "content": "\n".join(fact["text"] for fact in visible_facts),
+                "metadata": {
+                    "task_definition_id": task["task_definition_id"],
+                    "task_version": task["task_version"],
+                    "candidate_ids": copy.deepcopy(task["candidate_ids"]),
+                    "facts": visible_facts,
+                },
+            }
+        ]
+    return materials
+
+
+def _assignment_event(
+    session: dict[str, Any],
+    event_type: str,
+    participant_id: str,
+    role: str,
+    assignment: dict[str, Any],
+    occurred_at: datetime,
+) -> dict[str, Any]:
+    payload = {
+        key: copy.deepcopy(value)
+        for key, value in assignment.items()
+        if key not in {"session_id", "assigned_at"}
+    }
+    return {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session["session_id"],
+        "participant_id": participant_id,
+        "role": role,
+        "phase": session["phase"],
+        "phase_version": session["phase_version"],
+        "event_type": event_type,
+        "occurred_at": utc_iso(occurred_at),
+        "payload": payload,
+    }
 
 
 def _normalize_materials(

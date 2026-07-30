@@ -3,6 +3,9 @@ import sys
 
 import pytest
 from flask import Flask
+from sqlalchemy import JSON, Column, DateTime, MetaData, String, Table, create_engine, event
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 
 BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,3 +41,69 @@ def study1_client(memory_service, monkeypatch):
         yield app.test_client()
     finally:
         set_service_for_testing(None)
+
+
+@pytest.fixture
+def study1_sqlite_engine():
+    """SQLite database with the production schema attached as a real namespace."""
+    from services.db import get_app_schema
+    from study1.models import (
+        Study1ArtifactRow,
+        Study1EventRow,
+        Study1IncidentRow,
+        Study1InviteRow,
+        Study1MaterialRow,
+        Study1SubmissionRow,
+    )
+
+    schema = get_app_schema()
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _attach_schema(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute(f'ATTACH DATABASE ":memory:" AS "{schema}"')
+        cursor.close()
+
+    legacy_metadata = MetaData()
+    Table(
+        "research_sessions",
+        legacy_metadata,
+        Column("session_id", String(36), primary_key=True),
+        Column("session_name", String(512), nullable=False),
+        Column("payload", JSON, nullable=False),
+        Column("updated_at", DateTime(timezone=True), nullable=False),
+        schema=schema,
+    )
+    legacy_metadata.create_all(engine)
+    for model in (
+        Study1InviteRow,
+        Study1EventRow,
+        Study1SubmissionRow,
+        Study1ArtifactRow,
+        Study1IncidentRow,
+        Study1MaterialRow,
+    ):
+        model.__table__.create(engine, checkfirst=True)
+
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
+def sql_service(study1_sqlite_engine, token_manager):
+    from study1.schema_migrations import run_study1_migrations
+    from study1.services import SqlAlchemyStudy1Repository, Study1Service
+
+    run_study1_migrations(study1_sqlite_engine)
+    repository = SqlAlchemyStudy1Repository.__new__(SqlAlchemyStudy1Repository)
+    repository.SessionLocal = sessionmaker(
+        bind=study1_sqlite_engine, autoflush=False, autocommit=False
+    )
+    return Study1Service(repository, token_manager)
