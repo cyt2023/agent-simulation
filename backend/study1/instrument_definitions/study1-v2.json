@@ -1,0 +1,51 @@
+{
+  "catalog_version": "study1-instruments-v2",
+  "instruments": [
+    {
+      "instrument_definition_id": "pre-individual-v2",
+      "instrument_version": "2.0",
+      "phase": "PRE_VOTE",
+      "applicable_roles": ["principal", "teammate_1", "teammate_2"],
+      "items": [
+        {"item_id": "candidate_id", "prompt": "Select one candidate.", "response_type": "text", "constraints": {"max_length": 128}, "required": true},
+        {"item_id": "rationale", "prompt": "Explain your judgment.", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "confidence", "prompt": "Rate your confidence.", "response_type": "integer", "constraints": {"min": 1, "max": 7}, "required": true}
+      ]
+    },
+    {
+      "instrument_definition_id": "tentative-individual-v2",
+      "instrument_version": "2.0",
+      "phase": "TENTATIVE_DECISION",
+      "applicable_roles": ["teammate_1", "teammate_2"],
+      "items": [
+        {"item_id": "candidate_id", "prompt": "Select the tentative candidate.", "response_type": "text", "constraints": {"max_length": 128}, "required": true},
+        {"item_id": "rationale", "prompt": "Explain the tentative decision.", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "confidence", "prompt": "Rate your confidence.", "response_type": "integer", "constraints": {"min": 1, "max": 7}, "required": true},
+        {"item_id": "decision_status", "prompt": "Describe the decision status.", "response_type": "enum", "constraints": {"values": ["open", "tentative", "settled"]}, "required": true}
+      ]
+    },
+    {
+      "instrument_definition_id": "final-individual-v2",
+      "instrument_version": "2.0",
+      "phase": "FINAL_DECISION",
+      "applicable_roles": ["principal", "teammate_1", "teammate_2"],
+      "items": [
+        {"item_id": "candidate_id", "prompt": "Select your final candidate.", "response_type": "text", "constraints": {"max_length": 128}, "required": true},
+        {"item_id": "rationale", "prompt": "Explain your final judgment.", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "confidence", "prompt": "Rate your confidence.", "response_type": "integer", "constraints": {"min": 1, "max": 7}, "required": true}
+      ]
+    },
+    {
+      "instrument_definition_id": "post-survey-v2",
+      "instrument_version": "2.0",
+      "phase": "POST_SURVEY",
+      "applicable_roles": ["principal", "teammate_1", "teammate_2"],
+      "items": [
+        {"item_id": "understanding", "prompt": "Rate your understanding.", "response_type": "integer", "constraints": {"min": 1, "max": 7}, "required": true},
+        {"item_id": "proxy_trust", "prompt": "Rate trust in the Proxy process.", "response_type": "integer", "constraints": {"min": 1, "max": 7}, "required": true},
+        {"item_id": "team_synchronization", "prompt": "Rate team synchronization.", "response_type": "integer", "constraints": {"min": 1, "max": 7}, "required": true},
+        {"item_id": "comments", "prompt": "Add any comments.", "response_type": "text", "constraints": {"max_length": 4000}, "required": false}
+      ]
+    }
+  ]
+}

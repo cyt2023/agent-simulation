@@ -190,7 +190,9 @@ def get_study1_me(session_id: str):
 def get_my_study1_materials(session_id: str):
     identity = g.study1_identity
     try:
-        materials = get_service().get_materials(session_id, identity.role)
+        materials = get_service().get_materials(
+            session_id, identity.role, enforce_phase=True
+        )
         return jsonify({"materials": materials}), 200
     except Study1ServiceError as error:
         return _service_error(error)
@@ -298,6 +300,64 @@ def _json_submission(value):
             else None
         ),
     }
+
+
+def _json_domain_record(value):
+    return {
+        key: (
+            item.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if isinstance(item, datetime)
+            else item
+        )
+        for key, item in value.items()
+    }
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/me/instrument")
+@require_study1_auth(HUMAN_ROLES)
+def get_study1_instrument(session_id: str):
+    try:
+        return jsonify(
+            get_service().get_current_instrument(
+                session_id, g.study1_identity.as_actor()
+            )
+        ), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/me/instrument")
+@require_study1_auth(HUMAN_ROLES)
+def submit_study1_instrument(session_id: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().submit_instrument_response(
+            session_id,
+            g.study1_identity.as_actor(),
+            str(data.get("instrument_definition_id") or ""),
+            str(data.get("instrument_version") or ""),
+            data.get("ordered_responses") or [],
+        )
+        return jsonify(_json_domain_record(result)), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/decisions/<decision_kind>")
+@require_study1_auth(HUMAN_ROLES)
+def create_study1_decision(session_id: str, decision_kind: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().create_individual_decision(
+            session_id,
+            g.study1_identity.as_actor(),
+            decision_kind.replace("-", "_"),
+            data.get("payload") or data,
+            str(data.get("instrument_version") or "2.0"),
+        )
+        return jsonify(_json_domain_record(result)), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
 
 
 @study1_bp.get("/api/study1/sessions/<session_id>/review")

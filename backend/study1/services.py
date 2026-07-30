@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from services.db import ResearchSessionRow, get_session_factory, is_db_configured
 
@@ -33,6 +34,8 @@ from .models import (
     Study1Role,
     Study1RoleAssignmentRow,
     Study1ProtocolSnapshotRow,
+    Study1DecisionRow,
+    Study1InstrumentResponseRow,
     Study1SubmissionRow,
     Study1TaskDefinitionRow,
     Study1TaskFactRow,
@@ -61,6 +64,14 @@ from .protocol_config import (
     formal_protocol_defaults,
     freeze_protocol_snapshot,
     normalize_protocol_config_v2,
+)
+from .action_policy import ActionPolicyViolation, authorize_action
+from .decisions import DecisionKind, DecisionValidationError, validate_individual_decision
+from .instruments import (
+    InstrumentValidationError,
+    instrument_for,
+    load_instrument_catalog,
+    validate_ordered_responses,
 )
 
 
@@ -236,6 +247,8 @@ class InMemoryStudy1Repository:
         self.role_assignments: list[dict[str, Any]] = []
         self.fact_assignments: list[dict[str, Any]] = []
         self.protocol_snapshots: dict[str, dict[str, Any]] = {}
+        self.decisions: list[dict[str, Any]] = []
+        self.instrument_responses: list[dict[str, Any]] = []
         self.idempotency_keys: set[str] = set()
         self._lock = threading.RLock()
 
@@ -477,6 +490,42 @@ class InMemoryStudy1Repository:
             self.submissions.append(revision)
             return copy.deepcopy(revision)
 
+    def create_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if any(
+                row["session_id"] == decision["session_id"]
+                and row["decision_kind"] == decision["decision_kind"]
+                and row.get("participant_id") == decision.get("participant_id")
+                for row in self.decisions
+            ):
+                raise Study1ServiceError("DECISION_ALREADY_SUBMITTED", "Decision already submitted", 409)
+            self.decisions.append(copy.deepcopy(decision))
+            return copy.deepcopy(decision)
+
+    def mark_completion(self, session_id: str, key: str) -> None:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            session.setdefault("completion", {})[key] = True
+
+    def list_decisions(self, session_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            return [copy.deepcopy(row) for row in self.decisions if row["session_id"] == session_id]
+
+    def create_instrument_response(self, response: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if any(
+                row["session_id"] == response["session_id"]
+                and row["participant_id"] == response["participant_id"]
+                and row["instrument_definition_id"] == response["instrument_definition_id"]
+                and row["instrument_version"] == response["instrument_version"]
+                for row in self.instrument_responses
+            ):
+                raise Study1ServiceError("INSTRUMENT_ALREADY_SUBMITTED", "Instrument already submitted", 409)
+            self.instrument_responses.append(copy.deepcopy(response))
+            return copy.deepcopy(response)
+
     def add_artifact_for_testing(self, artifact: dict[str, Any]) -> None:
         with self._lock:
             self.artifacts.append(copy.deepcopy(artifact))
@@ -623,6 +672,12 @@ class InMemoryStudy1Repository:
                 ),
                 "protocol_snapshot": copy.deepcopy(
                     self.protocol_snapshots.get(session_id)
+                ),
+                "decisions": copy.deepcopy(
+                    [item for item in self.decisions if item["session_id"] == session_id]
+                ),
+                "instrument_responses": copy.deepcopy(
+                    [item for item in self.instrument_responses if item["session_id"] == session_id]
                 ),
             }
 
@@ -1115,6 +1170,52 @@ class SqlAlchemyStudy1Repository:
             db.commit()
             return revision
 
+    def create_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
+        try:
+            with self.SessionLocal() as db:
+                db.add(Study1DecisionRow(**decision))
+                db.commit()
+                return copy.deepcopy(decision)
+        except IntegrityError as error:
+            raise Study1ServiceError(
+                "DECISION_ALREADY_SUBMITTED", "Decision already submitted", 409
+            ) from error
+
+    def mark_completion(self, session_id: str, key: str) -> None:
+        with self.SessionLocal() as db:
+            row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            snapshot = copy.deepcopy(row.payload)
+            snapshot.setdefault("completion", {})[key] = True
+            row.payload = snapshot
+            row.updated_at = utc_now()
+            db.commit()
+
+    def list_decisions(self, session_id: str) -> list[dict[str, Any]]:
+        with self.SessionLocal() as db:
+            rows = db.scalars(
+                select(Study1DecisionRow)
+                .where(Study1DecisionRow.session_id == session_id)
+                .order_by(Study1DecisionRow.created_at.asc())
+            ).all()
+            return [_decision_row_dict(row) for row in rows]
+
+    def create_instrument_response(self, response: dict[str, Any]) -> dict[str, Any]:
+        try:
+            with self.SessionLocal() as db:
+                db.add(Study1InstrumentResponseRow(**response))
+                db.commit()
+                return copy.deepcopy(response)
+        except IntegrityError as error:
+            raise Study1ServiceError(
+                "INSTRUMENT_ALREADY_SUBMITTED", "Instrument already submitted", 409
+            ) from error
+
     def open_review(
         self, session_id: str, identity: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1346,6 +1447,16 @@ class SqlAlchemyStudy1Repository:
                 .where(Study1FactAssignmentRow.session_id == session_id)
                 .order_by(Study1FactAssignmentRow.id.asc())
             ).all()
+            decision_rows = db.scalars(
+                select(Study1DecisionRow)
+                .where(Study1DecisionRow.session_id == session_id)
+                .order_by(Study1DecisionRow.created_at.asc())
+            ).all()
+            instrument_response_rows = db.scalars(
+                select(Study1InstrumentResponseRow)
+                .where(Study1InstrumentResponseRow.session_id == session_id)
+                .order_by(Study1InstrumentResponseRow.submitted_at.asc())
+            ).all()
             protocol_row = db.scalar(
                 select(Study1ProtocolSnapshotRow).where(
                     Study1ProtocolSnapshotRow.session_id == session_id
@@ -1395,6 +1506,11 @@ class SqlAlchemyStudy1Repository:
                     if protocol_row is not None
                     else None
                 ),
+                "decisions": [_decision_row_dict(row) for row in decision_rows],
+                "instrument_responses": [
+                    _instrument_response_row_dict(row)
+                    for row in instrument_response_rows
+                ],
             }
 
     def record_media_command(
@@ -1626,6 +1742,41 @@ def _protocol_snapshot_row_dict(row: Study1ProtocolSnapshotRow) -> dict[str, Any
         "frozen_at": utc_iso(row.frozen_at) if row.frozen_at else None,
         "frozen_by": row.frozen_by,
         "created_at": utc_iso(row.created_at) if row.created_at else None,
+    }
+
+
+def _decision_row_dict(row: Study1DecisionRow) -> dict[str, Any]:
+    return {
+        "decision_id": row.decision_id,
+        "session_id": row.session_id,
+        "decision_kind": row.decision_kind,
+        "participant_id": row.participant_id,
+        "role": row.role,
+        "candidate_id": row.candidate_id,
+        "rationale": row.rationale,
+        "confidence": row.confidence,
+        "ratings": dict(row.ratings or {}),
+        "decision_status": row.decision_status,
+        "phase": row.phase,
+        "instrument_version": row.instrument_version,
+        "source_revision_id": row.source_revision_id,
+        "locked": bool(row.locked),
+        "created_at": utc_iso(row.created_at) if row.created_at else None,
+    }
+
+
+def _instrument_response_row_dict(row: Study1InstrumentResponseRow) -> dict[str, Any]:
+    return {
+        "response_id": row.response_id,
+        "session_id": row.session_id,
+        "participant_id": row.participant_id,
+        "role": row.role,
+        "instrument_definition_id": row.instrument_definition_id,
+        "instrument_version": row.instrument_version,
+        "phase": row.phase,
+        "ordered_responses": copy.deepcopy(row.ordered_responses),
+        "response_checksum": row.response_checksum,
+        "submitted_at": utc_iso(row.submitted_at) if row.submitted_at else None,
     }
 
 
@@ -2325,6 +2476,17 @@ class Study1Service:
         self.tokens = token_manager or Study1TokenManager()
         self.media_gateway = media_gateway or create_media_gateway_from_env()
 
+    @staticmethod
+    def _authorize(session: dict[str, Any], action: str, role: str | None = None) -> None:
+        # Legacy Sessions retain their original behavior; formal Sessions use
+        # the canonical policy so every runtime entry point sees the same gate.
+        if session.get("protocol_mode") != "formal_v2":
+            return
+        try:
+            authorize_action(session, action, role)
+        except ActionPolicyViolation as error:
+            raise Study1ServiceError(error.code, str(error), error.status) from error
+
     def create_task_definition(
         self, actor: dict[str, Any], payload: dict[str, Any]
     ) -> dict[str, Any]:
@@ -2550,6 +2712,11 @@ class Study1Service:
             ),
             "task_version": config["task_version"],
             "task_instance_id": config["task_instance_id"],
+            "candidate_ids": (
+                copy.deepcopy(registered_task["candidate_ids"])
+                if registered_task
+                else []
+            ),
             "minimum_review_seconds": max(0, int(minimum_review_seconds)),
             "require_consent": config["require_consent"],
             "structured_instruments": config["structured_instruments"],
@@ -2767,24 +2934,37 @@ class Study1Service:
         )
         return self.repository.update_protocol_snapshot(session_id, updated)
 
-    def get_materials(self, session_id: str, role: Study1Role | str) -> list[dict[str, Any]]:
+    def get_materials(
+        self,
+        session_id: str,
+        role: Study1Role | str,
+        *,
+        enforce_phase: bool = False,
+    ) -> list[dict[str, Any]]:
         role_value = Study1Role(role)
         if role_value not in HUMAN_ROLES:
             raise Study1ServiceError(
                 "MATERIAL_ACCESS_FORBIDDEN", "Role cannot access participant materials", 403
             )
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if enforce_phase:
+            self._authorize(session, "material_read", role_value.value)
         return self.repository.list_materials(session_id, role_value.value)
 
     def add_materials(
         self, session_id: str, role: Study1Role | str, items: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        if self.repository.get_session(session_id) is None:
+        session = self.repository.get_session(session_id)
+        if session is None:
             raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
         protocol = self.repository.get_protocol_snapshot(session_id)
         if protocol and protocol.get("frozen"):
             raise Study1ServiceError(
                 "CONFIGURATION_FROZEN", "Protocol configuration is frozen", 409
             )
+        self._authorize(session, "material_write", Study1Role.RESEARCHER.value)
         rows = _normalize_materials(session_id, {Study1Role(role).value: items}, utc_now())
         self.repository.add_materials(rows)
         return rows
@@ -2857,6 +3037,7 @@ class Study1Service:
         session = self.repository.get_session(session_id)
         if session is None:
             raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        self._authorize(session, "submit", str(identity.get("role") or ""))
         if session.get("structured_instruments"):
             self._validate_structured_submission(
                 submission_type, instrument_version, payload
@@ -2885,6 +3066,111 @@ class Study1Service:
             payload,
             parsed_client_time,
         )
+
+    def create_individual_decision(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        kind: DecisionKind | str,
+        payload: dict[str, Any],
+        instrument_version: str = "2.0",
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if session.get("protocol_mode") != "formal_v2":
+            raise Study1ServiceError("FORMAL_PROTOCOL_REQUIRED", "Formal protocol required", 409)
+        self._authorize(session, "submit", str(identity.get("role") or ""))
+        if not any(
+            item.get("participant_id") == identity.get("participant_id")
+            and item.get("role") == identity.get("role")
+            for item in session.get("participants") or []
+        ):
+            raise Study1ServiceError("FORBIDDEN", "Participant is not assigned to this Session", 403)
+        try:
+            normalized = validate_individual_decision(kind, session, identity, payload)
+        except DecisionValidationError as error:
+            status = 403 if error.code == "FORBIDDEN" else 409 if error.code == "ACTION_NOT_ALLOWED_IN_PHASE" else 400
+            raise Study1ServiceError(error.code, str(error), status) from error
+        now = utc_now()
+        row = {
+            "decision_id": str(uuid.uuid4()),
+            "session_id": session_id,
+            "participant_id": identity["participant_id"],
+            "role": identity["role"],
+            **normalized,
+            "instrument_version": str(instrument_version or "2.0"),
+            "source_revision_id": None,
+            "locked": True,
+            "created_at": now,
+        }
+        created = self.repository.create_decision(row)
+        completion_prefix = {
+            DecisionKind.PRE_INDIVIDUAL.value: "pre_vote",
+            DecisionKind.TENTATIVE_INDIVIDUAL.value: "tentative_decision",
+            DecisionKind.FINAL_INDIVIDUAL.value: "final_decision",
+        }[normalized["decision_kind"]]
+        self.repository.mark_completion(session_id, f"{completion_prefix}:{identity['role']}")
+        return created
+
+    def get_current_instrument(
+        self, session_id: str, identity: dict[str, Any]
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if session.get("protocol_mode") != "formal_v2":
+            raise Study1ServiceError("FORMAL_PROTOCOL_REQUIRED", "Formal protocol required", 409)
+        catalog = load_instrument_catalog()
+        instrument = instrument_for(catalog, session["phase"], identity["role"])
+        if instrument is None:
+            raise Study1ServiceError(
+                "INSTRUMENT_NOT_AVAILABLE", "No instrument is available in the current phase", 404
+            )
+        return {
+            **instrument,
+            "catalog_version": catalog["catalog_version"],
+            "catalog_checksum": catalog["checksum"],
+            "candidate_ids": copy.deepcopy(session.get("candidate_ids") or []),
+        }
+
+    def submit_instrument_response(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        instrument_definition_id: str,
+        instrument_version: str,
+        ordered_responses: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        instrument = self.get_current_instrument(session_id, identity)
+        if (
+            instrument_definition_id != instrument["instrument_definition_id"]
+            or instrument_version != instrument["instrument_version"]
+        ):
+            raise Study1ServiceError(
+                "INSTRUMENT_VERSION_MISMATCH", "Instrument identifier or version does not match", 409
+            )
+        try:
+            normalized = validate_ordered_responses(instrument, ordered_responses)
+        except InstrumentValidationError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+        content = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        response = {
+            "response_id": str(uuid.uuid4()),
+            "session_id": session_id,
+            "participant_id": identity["participant_id"],
+            "role": identity["role"],
+            "instrument_definition_id": instrument_definition_id,
+            "instrument_version": instrument_version,
+            "phase": instrument["phase"],
+            "ordered_responses": normalized,
+            "response_checksum": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "submitted_at": utc_now(),
+        }
+        created = self.repository.create_instrument_response(response)
+        if instrument["phase"] == Study1Phase.POST_SURVEY.value:
+            self.repository.mark_completion(session_id, f"post_survey:{identity['role']}")
+        return created
 
     def _validate_structured_submission(
         self,
@@ -3026,6 +3312,10 @@ class Study1Service:
         reason: str | None = None,
         override: bool = False,
     ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        self._authorize(session, "advance", str(actor.get("role") or ""))
         try:
             snapshot, events = self.repository.transition(
                 session_id, target_phase, actor, reason, override
@@ -3087,6 +3377,16 @@ class Study1Service:
         snapshot, events = self.repository.control_session(
             session_id, action, actor, payload or {}
         )
+        if action == "terminate":
+            self.issue_media_command(
+                session_id,
+                actor,
+                "STOP_SESSION",
+                {"reason": str((payload or {}).get("reason") or "session_terminated")},
+                command_id=str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, f"study1:{session_id}:stop-session")
+                ),
+            )
         return {"session": self.session_dto(snapshot), "events": events}
 
     def add_incident(
@@ -3130,6 +3430,8 @@ class Study1Service:
         session = self.repository.get_session(session_id)
         if not session:
             raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if command != "STOP_SESSION":
+            self._authorize(session, "issue_media_command", str(actor.get("role") or ""))
         required = {
             "START_PROXY_MEETING": Study1Phase.PROXY_MEETING.value,
             "BEGIN_HANDOFF": Study1Phase.HANDOFF.value,
@@ -3230,6 +3532,7 @@ class Study1Service:
         if not session:
             raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
         role = str(identity.get("role") or "")
+        self._authorize(session, "issue_media_access", role)
         allowed = {
             Study1Phase.PROXY_MEETING.value: {
                 Study1Role.TEAMMATE_1.value,
