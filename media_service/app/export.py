@@ -53,6 +53,8 @@ def build_media_export(
     agent_turns = repository.list_session_agent_turns(session_id)
     incidents = repository.list_session_incidents(session_id)
     recording_tracks = repository.list_session_recording_tracks(session_id)
+    rtc_metrics = repository.list_session_rtc_metrics(session_id)
+    component_health = repository.list_component_health()
     status = {
         "session_id": session_id,
         "runtime_count": len(runtimes),
@@ -106,6 +108,8 @@ def build_media_export(
         archive.writestr("summary.json", _json_bytes(summaries))
         archive.writestr("summary_attempts.jsonl", _jsonl_bytes(summary_attempts))
         archive.writestr("agent_turns.jsonl", _jsonl_bytes(agent_turns))
+        archive.writestr("rtc_metrics.jsonl", _jsonl_bytes(rtc_metrics))
+        archive.writestr("component_health.jsonl", _jsonl_bytes(component_health))
         archive.writestr("recording_manifest.json", _json_bytes(recordings))
         archive.writestr("agent_log.jsonl", _jsonl_bytes(agent_segments))
         archive.writestr("incidents.jsonl", _jsonl_bytes(incidents))

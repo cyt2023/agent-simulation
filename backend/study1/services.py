@@ -5145,12 +5145,28 @@ class Study1Service:
         identity: dict[str, Any],
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if not session:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
         metric = normalize_rtc_metric(
             session_id, identity, payload or {}, received_at=utc_now()
         )
-        return self.repository.record_ui_event(
+        event = self.repository.record_ui_event(
             session_id, identity, "rtc_metric_sample", metric
         )
+        try:
+            self.media_gateway.report_rtc_metrics(
+                {
+                    "session_id": session_id,
+                    "phase_version": session["phase_version"],
+                    "participant_id": identity["participant_id"],
+                    "role": identity["role"],
+                    "samples": [metric],
+                }
+            )
+        except MediaGatewayError:
+            pass
+        return event
 
     def quality_snapshot(
         self, session_id: str, actor: dict[str, Any]

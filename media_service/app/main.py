@@ -19,11 +19,13 @@ from .commands import CommandService
 from .config import Settings
 from .db import Database
 from .export import build_media_export
+from .health import HealthService
 from .livekit_runtime import LiveKitRoomRuntime
 from .pipeline import ProxyMediaPipeline
 from .providers.factory import create_providers
 from .repository import MediaRepository
 from .release_handshake import ReleaseHandshakeError, validate_release_handshake
+from .rtc_metrics import RtcMetricsService
 from .runtime import RuntimeCoordinator
 from .schema_migrations import MEDIA_SCHEMA_VERSION
 from .schemas import (
@@ -32,6 +34,7 @@ from .schemas import (
     DeviceStatusRequest,
     MediaAccessRequest,
     MediaAccessResponse,
+    RtcMetricBatchRequest,
 )
 
 
@@ -142,6 +145,21 @@ def create_app(
             "schema_version": MEDIA_SCHEMA_VERSION,
         }
 
+    @app.get("/readyz")
+    def readyz():
+        components = HealthService(repository).snapshot()
+        failed = [
+            component
+            for component, snapshot in components.items()
+            if snapshot["status"] == "failed"
+        ]
+        return {
+            "service": "study1-media",
+            "status": "failed" if failed else "ready",
+            "failed_components": failed,
+            "components": components,
+        }
+
     @app.post(
         "/internal/commands",
         status_code=status.HTTP_202_ACCEPTED,
@@ -202,6 +220,21 @@ def create_app(
         )
         return {"accepted": True, "connection_id": row.connection_id}
 
+    @app.post(
+        "/internal/rtc-metrics",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_a_service)],
+    )
+    def rtc_metrics(payload: RtcMetricBatchRequest):
+        snapshot = RtcMetricsService(repository).record_batch(
+            session_id=payload.session_id,
+            phase_version=payload.phase_version,
+            participant_id=payload.participant_id,
+            role=payload.role,
+            samples=payload.samples,
+        )
+        return {"accepted": True, **snapshot}
+
     @app.get(
         "/internal/sessions/{session_id}/status",
         dependencies=[Depends(require_a_service)],
@@ -210,6 +243,9 @@ def create_app(
         runtimes = repository.list_session_runtimes(session_id)
         connections = repository.list_session_connections(session_id)
         artifacts = repository.list_session_artifacts(session_id)
+        components = HealthService(repository).snapshot()
+        rtc_snapshot = RtcMetricsService(repository).snapshot(session_id)
+        recording_tracks = repository.list_session_recording_tracks(session_id)
         active = next(
             (runtime for runtime in reversed(runtimes) if runtime.ended_at is None),
             None,
@@ -233,12 +269,21 @@ def create_app(
                 }
                 for row in latest_connections.values()
             ],
-            "asr": {"provider": resolved_settings.media_provider, "status": "ready"},
+            "components": components,
+            "rtc": rtc_snapshot,
+            "asr": {
+                "provider": resolved_settings.media_provider,
+                **components["asr"],
+            },
             "proxy": {
                 "active": bool(active and active.room_kind == "proxy"),
                 "prompt_version": resolved_settings.proxy_prompt_version,
+                **components["proxy"],
             },
-            "recording": {"status": "active" if active else "idle"},
+            "recording": {
+                "status": _recording_status(recording_tracks),
+                "track_count": len(recording_tracks),
+            },
             "artifacts": [
                 {"type": row.kind, "version": row.version, "checksum": row.checksum}
                 for row in artifacts
@@ -290,3 +335,13 @@ def create_app(
         return FileResponse(target, media_type="audio/wav", filename=recording_id)
 
     return app
+
+
+def _recording_status(recording_tracks) -> str:
+    if any(row.status == "recording" for row in recording_tracks):
+        return "active"
+    if any(row.status == "complete" for row in recording_tracks):
+        return "complete"
+    if recording_tracks:
+        return "degraded"
+    return "unknown"

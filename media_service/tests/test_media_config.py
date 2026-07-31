@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+import sys
+
 import pytest
 
 
@@ -47,6 +50,10 @@ def test_media_config_round_trips_with_canonical_checksum():
 
 def test_media_v2_event_catalog_is_accepted_by_platform_a():
     from media_service.app.media_config import MEDIA_V2_EVENT_TYPES
+
+    backend_root = Path(__file__).resolve().parents[2] / "backend"
+    if str(backend_root) not in sys.path:
+        sys.path.insert(0, str(backend_root))
     from study1.media_gateway import EVENT_TYPES
 
     assert MEDIA_V2_EVENT_TYPES <= EVENT_TYPES

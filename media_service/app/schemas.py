@@ -81,3 +81,13 @@ class DeviceStatusRequest(BaseModel):
     role: str
     state: str
     device: dict[str, Any] = Field(default_factory=dict)
+
+
+class RtcMetricBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    phase_version: int = Field(ge=1)
+    participant_id: str
+    role: str
+    samples: list[dict[str, Any]] = Field(default_factory=list)

@@ -15,8 +15,10 @@ from .models import (
     MediaAgentTurnRow,
     MediaConfigRow,
     MediaIncidentRow,
+    MediaComponentHealthRow,
     MediaRecordingTrackRow,
     MediaRetentionTombstoneRow,
+    MediaRtcMetricRow,
     MediaRuntimeRow,
     MediaSummaryAttemptRow,
     OutboxMessageRow,
@@ -783,6 +785,71 @@ class MediaRepository:
         with self.database.session_factory.begin() as session:
             session.add(row)
         return row
+
+    def record_rtc_metric(
+        self,
+        *,
+        session_id: str,
+        participant_id: str,
+        role: str,
+        observed_at: datetime,
+        payload: dict,
+    ) -> MediaRtcMetricRow:
+        row = MediaRtcMetricRow(
+            metric_id=str(uuid.uuid4()),
+            session_id=session_id,
+            participant_id=participant_id,
+            role=role,
+            observed_at=observed_at,
+            payload=payload,
+        )
+        with self.database.session_factory.begin() as session:
+            session.add(row)
+        return row
+
+    def list_session_rtc_metrics(self, session_id: str) -> list[MediaRtcMetricRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaRtcMetricRow)
+                    .where(MediaRtcMetricRow.session_id == session_id)
+                    .order_by(MediaRtcMetricRow.observed_at, MediaRtcMetricRow.metric_id)
+                ).all()
+            )
+
+    def record_component_health(
+        self,
+        *,
+        component: str,
+        status: str,
+        latency_ms: float | None = None,
+        error_code: str | None = None,
+        observed_at: datetime | None = None,
+        payload: dict | None = None,
+    ) -> MediaComponentHealthRow:
+        row = MediaComponentHealthRow(
+            health_id=str(uuid.uuid4()),
+            component=component,
+            status=status,
+            latency_ms=latency_ms,
+            error_code=error_code,
+            observed_at=observed_at or datetime.now(timezone.utc),
+            payload=payload or {},
+        )
+        with self.database.session_factory.begin() as session:
+            session.add(row)
+        return row
+
+    def list_component_health(self) -> list[MediaComponentHealthRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaComponentHealthRow).order_by(
+                        MediaComponentHealthRow.observed_at,
+                        MediaComponentHealthRow.health_id,
+                    )
+                ).all()
+            )
 
     def recording_track_started(
         self,
