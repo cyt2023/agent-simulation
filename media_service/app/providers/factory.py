@@ -52,20 +52,28 @@ def create_provider_bundle(settings: Settings, *, formal: bool = False) -> Provi
             raise ProviderCapabilityError(
                 "Formal Study 1 requires streaming ASR; whisper-1 is batch ASR"
             )
+        openai_base_url = settings.openai_base_url
         asr = (
             OpenAIRealtimeAsrProvider(settings.openai_asr_model, settings.openai_api_key)
             if formal
-            else OpenAIAsrProvider(settings.openai_asr_model, settings.openai_api_key)
+            else OpenAIAsrProvider(
+                settings.openai_asr_model,
+                settings.openai_api_key,
+                base_url=openai_base_url,
+            )
         )
         return ProviderBundle(
             asr,
             OpenAILanguageModelProvider(
-                settings.openai_llm_model, settings.openai_api_key
+                settings.openai_llm_model,
+                settings.openai_api_key,
+                base_url=openai_base_url,
             ),
             OpenAITtsProvider(
                 settings.openai_tts_model,
                 settings.openai_tts_voice,
                 settings.openai_api_key,
+                base_url=openai_base_url,
             ),
             ProviderCapabilities(
                 streaming_asr=formal,

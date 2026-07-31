@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     captions_enabled: bool = False
     media_provider: str = "mock"
     openai_api_key: str | None = None
+    openai_base_url: str | None = None
     openai_llm_model: str = "gpt-4o-mini"
     openai_asr_model: str = "whisper-1"
     openai_tts_model: str = "tts-1"

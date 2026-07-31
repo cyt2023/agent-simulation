@@ -38,6 +38,17 @@ def _data():
         "submissions": [],
         "artifacts": [
             {
+                "artifact_id": "summary-1",
+                "session_id": "s-export",
+                "type": "summary",
+                "version": "1",
+                "content": "Neutral summary text with no recommendation.",
+                "checksum": "summary-checksum",
+                "created_at": "2026-07-31T00:00:01Z",
+                "generator_version": "test-summary",
+                "metadata": {"summary_prompt_version": "neutral-summary-v1"},
+            },
+            {
                 "artifact_id": "transcript-1",
                 "session_id": "s-export",
                 "type": "transcript",
@@ -126,6 +137,8 @@ def test_export_contains_canonical_manifest_and_joinable_records():
             "media_manifest.json",
             "normalized/events.jsonl",
             "normalized/utterances.jsonl",
+            "normalized/transcripts.jsonl",
+            "normalized/summaries.jsonl",
             "normalized/markers.jsonl",
             "normalized/replay_plans.json",
             "normalized/decisions.jsonl",
@@ -133,12 +146,16 @@ def test_export_contains_canonical_manifest_and_joinable_records():
         } <= names
         manifest = json.loads(archive.read("export_manifest.json"))
         utterance = _jsonl(archive, "normalized/utterances.jsonl")[0]
+        transcript = _jsonl(archive, "normalized/transcripts.jsonl")[0]
+        summary = _jsonl(archive, "normalized/summaries.jsonl")[0]
         marker = _jsonl(archive, "normalized/markers.jsonl")[0]
         media_manifest = json.loads(archive.read("media_manifest.json"))
 
     assert manifest["schema_version"] == "study1-export-v2"
     assert manifest["build_versions"]["backend"] != ""
     assert utterance["clock_id"] == media_manifest["recordings"][0]["clock_id"]
+    assert transcript["content"][0]["segment_id"] == utterance["utterance_id"]
+    assert summary["content"] == "Neutral summary text with no recommendation."
     assert marker["segment_ids"] == [utterance["utterance_id"]]
 
 

@@ -56,3 +56,43 @@ def test_mock_bundle_declares_streaming_capabilities():
 
     assert bundle.capabilities.streaming_asr is True
     assert bundle.capabilities.streaming_tts is True
+
+
+def test_openai_bundle_passes_compatible_base_url(monkeypatch):
+    from media_service.app.providers import openai as openai_module
+    from media_service.app.providers.factory import create_provider_bundle
+
+    created_clients = []
+
+    class FakeAsyncOpenAI:
+        def __init__(self, *, api_key, base_url=None):
+            created_clients.append({"api_key": api_key, "base_url": base_url})
+
+    monkeypatch.setattr(openai_module, "AsyncOpenAI", FakeAsyncOpenAI)
+    settings = Settings(
+        media_database_url="sqlite+pysqlite:///:memory:",
+        a_to_b_service_token="a-secret",
+        study1_internal_api_key="b-secret",
+        livekit_api_key="devkey",
+        livekit_api_secret="test-livekit-secret-at-least-32-bytes",
+        media_provider="openai",
+        openai_api_key="compatible-key",
+        openai_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+
+    create_provider_bundle(settings, formal=False)
+
+    assert created_clients == [
+        {
+            "api_key": "compatible-key",
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        },
+        {
+            "api_key": "compatible-key",
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        },
+        {
+            "api_key": "compatible-key",
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        },
+    ]

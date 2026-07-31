@@ -112,6 +112,35 @@ def _normalized_utterances(artifacts: list[dict[str, Any]]) -> list[dict[str, An
     return utterances
 
 
+def _normalized_artifact_contents(
+    artifacts: list[dict[str, Any]], artifact_type: str
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        if artifact.get("type") != artifact_type:
+            continue
+        parsed_content = _artifact_content_json(artifact)
+        rows.append(
+            {
+                "artifact_id": artifact.get("artifact_id"),
+                "session_id": artifact.get("session_id"),
+                "type": artifact.get("type"),
+                "version": artifact.get("version"),
+                "content": (
+                    parsed_content
+                    if parsed_content is not None
+                    else artifact.get("content")
+                ),
+                "storage_uri": artifact.get("storage_uri"),
+                "checksum": artifact.get("checksum"),
+                "created_at": artifact.get("created_at"),
+                "generator_version": artifact.get("generator_version"),
+                "metadata": artifact.get("metadata") or {},
+            }
+        )
+    return rows
+
+
 def _media_manifest(
     artifacts: list[dict[str, Any]], utterances: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -345,6 +374,12 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
         "media_manifest.json": _json_bytes(media_manifest),
         "normalized/events.jsonl": _jsonl_bytes(events),
         "normalized/utterances.jsonl": _jsonl_bytes(utterances),
+        "normalized/transcripts.jsonl": _jsonl_bytes(
+            _normalized_artifact_contents(artifacts, "transcript")
+        ),
+        "normalized/summaries.jsonl": _jsonl_bytes(
+            _normalized_artifact_contents(artifacts, "summary")
+        ),
         "normalized/markers.jsonl": _jsonl_bytes(markers),
         "normalized/replay_plans.json": _json_bytes(replay_plans),
         "normalized/decisions.jsonl": _jsonl_bytes(decisions),
