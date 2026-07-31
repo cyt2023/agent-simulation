@@ -2,6 +2,15 @@
 
 Use this checklist before calling a release data-collection-ready.
 
+## Supporting Artifacts
+
+- Synthetic-audio pilot runner: `python scripts/run_study1_synthetic_audio_pilot.py --template stress --output-dir output/pilots/stress-01`
+- Failure scenarios: `docs/study1-pilot-failure-scenarios.md`
+- Stress template: `docs/study1-pilot-stress-template.md`
+- Stability template: `docs/study1-pilot-stability-template.md`
+- Usability template: `docs/study1-pilot-usability-template.md`
+- Full protocol template: `docs/study1-pilot-full-template.md`
+
 ## Automated Gates
 
 - Backend Study 1 tests pass.
