@@ -11,7 +11,7 @@ const definitions = {
     ['expected_information_shared', 'What information do you expect X to share?', 'textarea'],
     ['expected_recommendation', 'What recommendation do you expect X to make?', 'textarea'],
     ['expected_tentative_agreement', 'What, if anything, may X tentatively agree to?', 'textarea'],
-    ['confidence', 'Confidence in these expectations (1–7)', 'scale'],
+    ['confidence', 'Confidence in these expectations (1-7)', 'scale'],
   ],
   comprehension_measurement: [
     ['conclusion', 'What conclusion did the delegated discussion reach?', 'textarea'],
@@ -21,7 +21,7 @@ const definitions = {
     ['decision_status', 'Is the result a suggestion, tentative consensus, or final commitment?', 'textarea'],
     ['proxy_commitments', 'What commitments, if any, did X make?', 'textarea'],
     ['acceptance_intention', 'What do you intend to accept, reject, or revise?', 'textarea'],
-    ['confidence', 'Confidence in your understanding (1–7)', 'scale'],
+    ['confidence', 'Confidence in your understanding (1-7)', 'scale'],
   ],
   followup_task: [
     ['resource_allocation', 'Allocate the available resources.', 'textarea'],
@@ -29,10 +29,10 @@ const definitions = {
     ['implementation_plan', 'Provide a short implementation plan.', 'textarea'],
   ],
   post_survey: [
-    ['understanding', 'I understood what happened while I was absent (1–7).', 'scale'],
-    ['proxy_trust', 'I trust the proxy representation (1–7).', 'scale'],
-    ['team_synchronization', 'The team reached shared understanding (1–7).', 'scale'],
-    ['comments', 'Comments (enter “none” if there are no comments).', 'textarea'],
+    ['understanding', 'I understood what happened while I was absent (1-7).', 'scale'],
+    ['proxy_trust', 'I trust the proxy representation (1-7).', 'scale'],
+    ['team_synchronization', 'The team reached shared understanding (1-7).', 'scale'],
+    ['comments', 'Comments (enter "none" if there are no comments).', 'textarea'],
   ],
 }
 const fields = computed(() => definitions[props.instrument] || [])

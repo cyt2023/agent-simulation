@@ -57,12 +57,14 @@ const sharedArtifacts = ref({
 let errorTimer = null
 let noticeTimer = null
 
-const formalInstrumentPhases = new Set([
-  'PRE_VOTE',
-  'TENTATIVE_DECISION',
-  'FINAL_DECISION',
-  'POST_SURVEY',
-])
+const formalInstrumentRoles = {
+  PRE_VOTE: new Set(['principal', 'teammate_1', 'teammate_2']),
+  TENTATIVE_DECISION: new Set(['teammate_1', 'teammate_2']),
+  DELEGATION_EXPECTATION: new Set(['principal']),
+  COMPREHENSION_MEASUREMENT: new Set(['principal']),
+  FINAL_DECISION: new Set(['principal', 'teammate_1', 'teammate_2']),
+  POST_SURVEY: new Set(['principal', 'teammate_1', 'teammate_2']),
+}
 
 const phase = computed(() => session.value?.phase || 'SETUP')
 const role = computed(() => identity.value?.role || '')
@@ -80,6 +82,10 @@ const showMaterialReference = computed(() => (
   Boolean(capabilities.value.material_read)
   && materials.value.length > 0
   && !['MATERIAL_READING', 'PROXY_CONFIGURATION'].includes(phase.value)
+))
+const usesCurrentServerInstrument = computed(() => (
+  session.value?.protocol_mode === 'formal_v2'
+  && Boolean(formalInstrumentRoles[phase.value]?.has(role.value))
 ))
 
 async function reportRtcTelemetry(sample) {
@@ -163,7 +169,7 @@ async function refresh() {
 async function loadPhaseAssets() {
   if (!identity.value?.session_id) return
   const sessionId = identity.value.session_id
-  const shouldLoadInstrument = formalInstrumentPhases.has(phase.value)
+  const shouldLoadInstrument = usesCurrentServerInstrument.value
   const sharedArtifactKind = {
     FINAL_DECISION: 'team_final',
     FOLLOWUP_TASK: 'followup_task',
@@ -461,11 +467,20 @@ onUnmounted(() => {
         />
         <WaitingRoom v-else-if="phase === 'TENTATIVE_DECISION'" />
         <SurveyPhase
-          v-else-if="phase === 'DELEGATION_EXPECTATION' && role === 'principal'"
+          v-else-if="phase === 'DELEGATION_EXPECTATION' && role === 'principal' && !usesCurrentServerInstrument"
           title="Delegation expectation"
           instrument="delegation_expectation"
           :busy="busy"
           @submit="submit('delegation_expectation', $event)"
+        />
+        <InstrumentPhase
+          v-else-if="phase === 'DELEGATION_EXPECTATION' && role === 'principal'"
+          title="Delegation expectation"
+          :instrument="currentInstrument"
+          :busy="busy"
+          :locked="hasCompleted('delegation_expectation')"
+          :available="Boolean(capabilities.submit_delegation_expectation)"
+          @submit="submitInstrument"
         />
         <WaitingRoom v-else-if="phase === 'DELEGATION_EXPECTATION'" />
         <ReviewPhase
@@ -474,11 +489,20 @@ onUnmounted(() => {
         />
         <WaitingRoom v-else-if="phase === 'REVIEW'" />
         <SurveyPhase
-          v-else-if="phase === 'COMPREHENSION_MEASUREMENT' && role === 'principal'"
+          v-else-if="phase === 'COMPREHENSION_MEASUREMENT' && role === 'principal' && !usesCurrentServerInstrument"
           title="Comprehension measurement"
           instrument="comprehension_measurement"
           :busy="busy"
           @submit="submit('comprehension_measurement', $event)"
+        />
+        <InstrumentPhase
+          v-else-if="phase === 'COMPREHENSION_MEASUREMENT' && role === 'principal'"
+          title="Comprehension measurement"
+          :instrument="currentInstrument"
+          :busy="busy"
+          :locked="hasCompleted('comprehension_measurement')"
+          :available="Boolean(capabilities.submit_comprehension_measurement)"
+          @submit="submitInstrument"
         />
         <WaitingRoom v-else-if="phase === 'COMPREHENSION_MEASUREMENT'" />
         <section v-else-if="phase === 'FINAL_DECISION'" class="final-decision-grid">

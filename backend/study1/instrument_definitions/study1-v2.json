@@ -25,6 +25,34 @@
       ]
     },
     {
+      "instrument_definition_id": "delegation-expectation-v2",
+      "instrument_version": "2.0",
+      "phase": "DELEGATION_EXPECTATION",
+      "applicable_roles": ["principal"],
+      "items": [
+        {"item_id": "expected_information_shared", "prompt": "What information do you expect X to share?", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "expected_recommendation", "prompt": "What recommendation do you expect X to make?", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "expected_tentative_agreement", "prompt": "What, if anything, may X tentatively agree to?", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "confidence", "prompt": "Confidence in these expectations.", "response_type": "integer", "constraints": {"min": 1, "max": 7}, "required": true}
+      ]
+    },
+    {
+      "instrument_definition_id": "comprehension-measurement-v2",
+      "instrument_version": "2.0",
+      "phase": "COMPREHENSION_MEASUREMENT",
+      "applicable_roles": ["principal"],
+      "items": [
+        {"item_id": "conclusion", "prompt": "What conclusion did the delegated discussion reach?", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "reasons", "prompt": "What reasons support that conclusion?", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "member_positions", "prompt": "Describe T1, T2, and X positions separately.", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "disagreements", "prompt": "What disagreements or unresolved issues remain?", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "decision_status", "prompt": "Is the result a suggestion, tentative consensus, final commitment, or unresolved?", "response_type": "enum", "constraints": {"values": ["suggestion", "tentative_consensus", "final_commitment", "unresolved"]}, "required": true},
+        {"item_id": "proxy_commitments", "prompt": "What commitments, if any, did X make?", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "acceptance_intention", "prompt": "What do you intend to accept, reject, or revise?", "response_type": "text", "constraints": {"max_length": 4000}, "required": true},
+        {"item_id": "confidence", "prompt": "Confidence in your understanding.", "response_type": "integer", "constraints": {"min": 1, "max": 7}, "required": true}
+      ]
+    },
+    {
       "instrument_definition_id": "final-individual-v2",
       "instrument_version": "2.0",
       "phase": "FINAL_DECISION",

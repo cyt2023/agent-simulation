@@ -69,6 +69,7 @@ function session(phase, phaseVersion) {
     phase,
     phase_version: phaseVersion,
     status: 'running',
+    protocol_mode: 'formal_v2',
     ready_to_advance: false,
     remaining_seconds: 120,
     my_completed_actions: [],
@@ -326,6 +327,41 @@ describe('Study1Participant stable meeting ownership', () => {
         confidence: 4,
       },
     )
+  })
+
+  it('loads the principal delegation expectation from the server instrument catalog', async () => {
+    mocks.identity = {
+      participant_id: 'participant-p',
+      session_id: 'session-1',
+      role: 'principal',
+    }
+    mocks.session = session('DELEGATION_EXPECTATION', 7)
+    mocks.fetchCurrentInstrument.mockResolvedValue({
+      instrument_definition_id: 'delegation-expectation-v2',
+      instrument_version: '2.0',
+      phase: 'DELEGATION_EXPECTATION',
+      items: [
+        {
+          item_id: 'expected_information_shared',
+          prompt: 'Server prompt: describe expected information sharing.',
+          response_type: 'text',
+          constraints: { max_length: 4000 },
+          required: true,
+        },
+      ],
+    })
+    const wrapper = mount(Study1Participant, {
+      global: {
+        stubs: {
+          PhaseHeader: true,
+          Study1DeviceCheck: true,
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(mocks.fetchCurrentInstrument).toHaveBeenCalledWith('session-1')
+    expect(wrapper.text()).toContain('Server prompt: describe expected information sharing.')
   })
 
   it('renders the shared team final workflow separately from private final decisions', async () => {

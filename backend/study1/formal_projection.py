@@ -161,10 +161,18 @@ def project_formal_completion(
         if str(artifact.get("type") or "") == "summary":
             completion["summary_artifact_ready"] = True
 
+    instrument_completion_by_phase = {
+        Study1Phase.DELEGATION_EXPECTATION.value: "delegation_expectation",
+        Study1Phase.COMPREHENSION_MEASUREMENT.value: "comprehension_measurement",
+        Study1Phase.POST_SURVEY.value: "post_survey",
+    }
     for response in exported.get("instrument_responses") or []:
-        if str(response.get("phase") or "") == Study1Phase.POST_SURVEY.value:
+        completion_prefix = instrument_completion_by_phase.get(
+            str(response.get("phase") or "")
+        )
+        if completion_prefix:
             role = str(response.get("role") or "")
-            completion[f"post_survey:{role}"] = True
+            completion[f"{completion_prefix}:{role}"] = True
 
     return completion
 
@@ -320,6 +328,16 @@ def formal_capabilities(session: Mapping[str, Any], role: str) -> dict[str, bool
                 phase == Study1Phase.POST_SURVEY.value
                 and role_name in {item.value for item in HUMAN_ROLES}
                 and not completion.get(f"post_survey:{role_name}")
+            ),
+            "submit_delegation_expectation": (
+                phase == Study1Phase.DELEGATION_EXPECTATION.value
+                and role_name == Study1Role.PRINCIPAL.value
+                and not completion.get(f"delegation_expectation:{role_name}")
+            ),
+            "submit_comprehension_measurement": (
+                phase == Study1Phase.COMPREHENSION_MEASUREMENT.value
+                and role_name == Study1Role.PRINCIPAL.value
+                and not completion.get(f"comprehension_measurement:{role_name}")
             ),
         }
     )

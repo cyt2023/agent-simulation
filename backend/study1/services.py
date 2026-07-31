@@ -4324,8 +4324,16 @@ class Study1Service:
             "submitted_at": utc_now(),
         }
         created = self.repository.create_instrument_response(response)
-        if instrument["phase"] == Study1Phase.POST_SURVEY.value:
-            self.repository.mark_completion(session_id, f"post_survey:{identity['role']}")
+        completion_by_phase = {
+            Study1Phase.DELEGATION_EXPECTATION.value: "delegation_expectation",
+            Study1Phase.COMPREHENSION_MEASUREMENT.value: "comprehension_measurement",
+            Study1Phase.POST_SURVEY.value: "post_survey",
+        }
+        completion_prefix = completion_by_phase.get(instrument["phase"])
+        if completion_prefix:
+            self.repository.mark_completion(
+                session_id, f"{completion_prefix}:{identity['role']}"
+            )
         return created
 
     def get_shared_artifact(
