@@ -205,6 +205,7 @@ def _automated_gates() -> list[dict[str, str]]:
         {"name": "acceptance reconstruction", "command": "python -m pytest -p no:cacheprovider tests/acceptance -q"},
         {"name": "frontend tests", "command": "npm.cmd test -- --run"},
         {"name": "frontend build", "command": "npm.cmd run build"},
+        {"name": "frontend audio e2e", "command": "npm.cmd run test:e2e"},
     ]
 
 
