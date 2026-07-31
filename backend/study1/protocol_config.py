@@ -191,6 +191,11 @@ def normalize_protocol_config_v2(value: Mapping[str, Any]) -> ProtocolConfigV2:
         raise ProtocolConfigError("RESYNC_DISABLED", "Study 1 requires resync_enabled=false")
     if feature_flags.get("video_enabled") is not False:
         raise ProtocolConfigError("VIDEO_DISABLED", "Study 1 is audio-only")
+    if raw.get("module_id") is not None:
+        raise ProtocolConfigError(
+            "MODULE_ID_NOT_ALLOWED",
+            "Study 1 protocol does not permit extension module_id values",
+        )
 
     build_ids = raw.get("build_ids")
     if not isinstance(build_ids, Mapping):

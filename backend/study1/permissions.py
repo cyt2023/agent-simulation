@@ -6,7 +6,7 @@ import hmac
 import os
 from dataclasses import dataclass
 from functools import wraps
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from flask import g, jsonify, request
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -163,6 +163,25 @@ def require_researcher_scope(identity: Study1Identity, scope: str) -> None:
             f"Researcher scope required: {scope}",
             403,
         )
+
+
+def study2_data_available(
+    identity: Study1Identity | Mapping[str, Any],
+    session: Mapping[str, Any],
+    resource: str,
+) -> bool:
+    """Keep principal isolation enforceable outside the HTTP presentation layer."""
+
+    role = (
+        identity.role.value
+        if isinstance(identity, Study1Identity)
+        else getattr(identity.get("role"), "value", identity.get("role"))
+    )
+    return not (
+        resource == "utterances"
+        and role == Study1Role.PRINCIPAL.value
+        and session.get("phase") == "PROXY_MEETING"
+    )
 
 
 def require_study1_internal(function):
