@@ -725,6 +725,16 @@ class MediaRepository:
             row.ended_at = datetime.now(timezone.utc)
             return row
 
+    def list_session_agent_turns(self, session_id: str) -> list[MediaAgentTurnRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaAgentTurnRow)
+                    .where(MediaAgentTurnRow.session_id == session_id)
+                    .order_by(MediaAgentTurnRow.started_at)
+                ).all()
+            )
+
     def begin_summary_attempt(
         self,
         *,
