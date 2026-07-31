@@ -111,6 +111,24 @@ def test_release_manifest_records_release_self_checks():
     ]
 
 
+def test_release_manifest_ignores_untracked_files_for_dirty_worktree(monkeypatch):
+    from scripts.build_study1_release_manifest import _git_dirty
+
+    calls = []
+
+    class Result:
+        stdout = "?? tmp/\n"
+
+    def fake_run(args, check, capture_output, text, timeout):
+        calls.append(args)
+        return Result()
+
+    monkeypatch.setattr("scripts.build_study1_release_manifest.subprocess.run", fake_run)
+
+    assert _git_dirty() is False
+    assert calls == [["git", "status", "--porcelain", "--untracked-files=no"]]
+
+
 def test_a_adds_release_identity_to_media_commands(memory_service, monkeypatch):
     monkeypatch.setenv("STUDY1_RELEASE_ID", "study1-release-v1")
     monkeypatch.setenv("STUDY1_RELEASE_CHECKSUM", "abc123")

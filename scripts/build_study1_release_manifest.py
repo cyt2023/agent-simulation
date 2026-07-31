@@ -251,13 +251,18 @@ def _git_value(*args: str) -> str:
 def _git_dirty() -> bool:
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain", "--untracked-files=no"],
             check=True,
             capture_output=True,
             text=True,
             timeout=5,
         )
-        return bool(result.stdout.strip())
+        tracked_changes = [
+            line
+            for line in result.stdout.splitlines()
+            if line.strip() and not line.startswith("?? ")
+        ]
+        return bool(tracked_changes)
     except Exception:
         return False
 
