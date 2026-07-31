@@ -1,6 +1,11 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
-import { fetchReview, fetchStudy1Recording, logReviewUiEvent } from '../services/study1Api.js'
+import {
+  fetchReview,
+  fetchStudy1Recording,
+  logReviewUiEvent,
+  sendReviewEventBatch,
+} from '../services/study1Api.js'
 
 const props = defineProps({ sessionId: { type: String, required: true } })
 const loading = ref(true)
@@ -13,6 +18,9 @@ const replayingId = ref('')
 const transcriptExpanded = ref(false)
 const maxDepth = ref(0)
 const enteredAt = ref(0)
+const visitId = `review-${Date.now()}-${Math.random().toString(36).slice(2)}`
+let telemetrySequence = 0
+let heartbeatTimer = null
 let scrollTimer = null
 
 const transcriptSegments = computed(() => {
@@ -60,6 +68,21 @@ function log(eventType, payload = {}) {
   return logReviewUiEvent(props.sessionId, eventType, payload).catch(() => {})
 }
 
+function sendTelemetry(eventType, payload = {}) {
+  telemetrySequence += 1
+  return sendReviewEventBatch(props.sessionId, {
+    visit_id: visitId,
+    events: [
+      {
+        sequence_no: telemetrySequence,
+        event_type: eventType,
+        observed_at_ms: Date.now(),
+        payload,
+      },
+    ],
+  }).catch(() => {})
+}
+
 function markCritical(targetType, targetId) {
   const note = window.prompt('Optional note for this critical marker:', '') ?? ''
   log('critical_marker', { target_type: targetType, target_id: targetId, note })
@@ -77,6 +100,7 @@ async function replay(recordingId) {
 
 function toggleTranscript() {
   transcriptExpanded.value = !transcriptExpanded.value
+  sendTelemetry('transcript_toggle', { expanded: transcriptExpanded.value })
   log(transcriptExpanded.value ? 'transcript_expand' : 'transcript_collapse')
 }
 
@@ -97,13 +121,33 @@ function handleScroll() {
           })
           .map(segment => segment.id)
       : []
+    sendTelemetry('scroll', { max_depth: maxDepth.value, visible_segments: visible })
     log('scroll_depth', { max_depth: maxDepth.value, visible_segments: visible })
   }, 750)
 }
 
+function handleVisibilityChange() {
+  sendTelemetry('visibility', {
+    state: document.visibilityState === 'hidden' ? 'hidden' : 'visible',
+  })
+}
+
+function handleFocus() {
+  sendTelemetry('focus', { focused: true })
+}
+
+function handleBlur() {
+  sendTelemetry('focus', { focused: false })
+}
+
 onMounted(async () => {
   enteredAt.value = Date.now()
+  sendTelemetry('enter')
+  heartbeatTimer = window.setInterval(() => sendTelemetry('heartbeat'), 5000)
   window.addEventListener('scroll', handleScroll, { passive: true })
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+  window.addEventListener('focus', handleFocus)
+  window.addEventListener('blur', handleBlur)
   try {
     const result = await fetchReview(props.sessionId)
     summary.value = result.summary
@@ -123,7 +167,12 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('scroll', handleScroll)
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  window.removeEventListener('focus', handleFocus)
+  window.removeEventListener('blur', handleBlur)
+  if (heartbeatTimer) window.clearInterval(heartbeatTimer)
   if (scrollTimer) window.clearTimeout(scrollTimer)
+  sendTelemetry('leave')
   log('active_reading_time', {
     client_active_seconds: Math.max(0, Math.round((Date.now() - enteredAt.value) / 1000)),
     max_depth: maxDepth.value,
@@ -155,7 +204,7 @@ onUnmounted(() => {
           v-for="segment in transcriptSegments"
           :id="segment.id"
           :key="segment.id"
-          @mouseenter="log('transcript_segment_view', { segment_id: segment.sourceId })"
+          @mouseenter="sendTelemetry('segment_visible', { segment_id: segment.sourceId }); log('transcript_segment_view', { segment_id: segment.sourceId })"
         >
           {{ segment.text }}
           <button class="marker" @click="markCritical('transcript_segment', segment.sourceId)">Mark</button>

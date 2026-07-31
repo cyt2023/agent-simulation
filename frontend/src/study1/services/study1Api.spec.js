@@ -1,6 +1,10 @@
 import { beforeEach, expect, it, vi } from 'vitest'
 
-import { researcherLogin, requestStudy1Withdrawal } from './study1Api.js'
+import {
+  researcherLogin,
+  requestStudy1Withdrawal,
+  sendReviewEventBatch,
+} from './study1Api.js'
 
 
 beforeEach(() => {
@@ -45,4 +49,20 @@ it('posts withdrawal requests to the privacy endpoint', async () => {
     reason: 'Review withdrawal.',
     confirmation: true,
   })
+})
+
+
+it('posts review telemetry batches to the batch endpoint', async () => {
+  const fetchMock = vi.fn(async () => new Response(
+    JSON.stringify({ accepted: true }),
+    { status: 202, headers: { 'content-type': 'application/json' } },
+  ))
+  vi.stubGlobal('fetch', fetchMock)
+
+  await sendReviewEventBatch('session-1', {
+    visit_id: 'visit-1',
+    events: [{ sequence_no: 1, event_type: 'enter' }],
+  })
+
+  expect(fetchMock.mock.calls[0][0]).toBe('/api/study1/sessions/session-1/review-events/batch')
 })

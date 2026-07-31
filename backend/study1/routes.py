@@ -644,6 +644,24 @@ def replay_study1_recording(session_id: str, recording_id: str):
         )
     except Study1ServiceError as error:
         return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/review-events/batch")
+@require_study1_auth([Study1Role.PRINCIPAL])
+def create_study1_review_event_batch(session_id: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().record_review_event_batch(
+            session_id,
+            g.study1_identity.as_actor(),
+            str(data.get("visit_id") or ""),
+            data.get("events") or [],
+        )
+        return jsonify(result), 202
+    except ValueError as error:
+        return jsonify({"error": "INVALID_REVIEW_EVENT_BATCH", "message": str(error)}), 400
+    except Study1ServiceError as error:
+        return _service_error(error)
     except AuthenticationError as error:
         return jsonify({"error": error.code, "message": str(error)}), error.status
 

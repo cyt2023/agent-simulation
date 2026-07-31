@@ -87,6 +87,7 @@ from .privacy_service import (
     missing_required_consent_scopes,
     normalize_consent_submission,
 )
+from .review_telemetry import ReviewTelemetryAccumulator
 from .formal_projection import (
     formal_capabilities,
     formal_readiness,
@@ -775,6 +776,22 @@ class InMemoryStudy1Repository:
             )
             self.events.append(event)
             return copy.deepcopy(event)
+
+    def record_review_event_batch(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        visit_id: str,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            _validate_review_access(session, identity)
+            result = _record_review_event_batch(
+                session, identity, visit_id, events, utc_now()
+            )
+            self.events.append(result["event"])
+            return copy.deepcopy(result["response"])
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -1762,6 +1779,32 @@ class SqlAlchemyStudy1Repository:
             session_row.updated_at = utc_now()
             db.commit()
             return event
+
+    def record_review_event_batch(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        visit_id: str,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if not session_row:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            snapshot = copy.deepcopy(session_row.payload)
+            _validate_review_access(snapshot, identity)
+            result = _record_review_event_batch(
+                snapshot, identity, visit_id, events, utc_now()
+            )
+            db.add(_event_orm(result["event"]))
+            session_row.payload = snapshot
+            session_row.updated_at = utc_now()
+            db.commit()
+            return result["response"]
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self.SessionLocal() as db:
@@ -2835,6 +2878,48 @@ def _record_review_ui_event(
         if elapsed >= minimum:
             session["completion"]["minimum_review_time_met:principal"] = True
     return _ui_event(session, identity, event_type, safe_payload, now)
+
+
+def _record_review_event_batch(
+    session: dict[str, Any],
+    identity: dict[str, Any],
+    visit_id: str,
+    events: list[dict[str, Any]],
+    now: datetime,
+) -> dict[str, Any]:
+    state = session.setdefault("review_telemetry", {})
+    accumulator = ReviewTelemetryAccumulator(state)
+    summary = accumulator.record_batch(
+        {
+            "visit_id": visit_id,
+            "session_id": session["session_id"],
+            "participant_id": identity["participant_id"],
+            "role": identity["role"],
+        },
+        events if isinstance(events, list) else [],
+        received_at_ms=int(now.timestamp() * 1000),
+    )
+    session["completion"]["review_reading_recorded:principal"] = True
+    minimum = int(session.get("minimum_review_seconds") or 0)
+    if summary.active_seconds >= minimum:
+        session["completion"]["minimum_review_time_met:principal"] = True
+    response = {
+        "accepted": True,
+        "summary": summary.public_dict(),
+    }
+    event = _ui_event(
+        session,
+        identity,
+        "review_telemetry_batch",
+        {
+            "visit_id": visit_id,
+            "accepted_event_count": summary.event_count,
+            "duplicate_event_count": summary.duplicate_count,
+            "summary": summary.public_dict(),
+        },
+        now,
+    )
+    return {"response": response, "event": event}
 
 
 def _review_payload(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -4598,6 +4683,17 @@ class Study1Service:
     ) -> dict[str, Any]:
         return self.repository.record_ui_event(
             session_id, identity, event_type, payload
+        )
+
+    def record_review_event_batch(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        visit_id: str,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return self.repository.record_review_event_batch(
+            session_id, identity, visit_id, events
         )
 
     def exchange_invite(self, raw_token: str) -> dict[str, Any]:

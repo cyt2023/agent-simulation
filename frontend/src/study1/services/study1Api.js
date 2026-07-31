@@ -231,4 +231,11 @@ export function logReviewUiEvent(sessionId, eventType, payload = {}) {
   })
 }
 
+export function sendReviewEventBatch(sessionId, payload) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/review-events/batch`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
 export { request as study1Request }
