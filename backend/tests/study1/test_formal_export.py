@@ -131,6 +131,35 @@ def test_formal_export_includes_formal_records_and_ordered_instruments(memory_se
         assert schema["certification_status"] == "certifiable"
 
 
+def test_formal_export_missing_data_uses_projected_instrument_completion(memory_service):
+    session_id, actors = _formal_session(memory_service)
+    snapshot = memory_service.repository.sessions[session_id]
+    snapshot["phase"] = "DELEGATION_EXPECTATION"
+    snapshot["completion"] = {}
+    instrument = memory_service.get_current_instrument(session_id, actors["principal"])
+    memory_service.submit_instrument_response(
+        session_id,
+        actors["principal"],
+        instrument["instrument_definition_id"],
+        instrument["instrument_version"],
+        [
+            {"item_id": "expected_information_shared", "response": "X should share only authorized principal priorities."},
+            {"item_id": "expected_recommendation", "response": "X should not make a final recommendation."},
+            {"item_id": "expected_tentative_agreement", "response": "X may acknowledge a tentative preference."},
+            {"item_id": "confidence", "response": 5},
+        ],
+    )
+    export_buffer = memory_service.export_bundle(session_id)
+
+    with zipfile.ZipFile(export_buffer) as archive:
+        schema = json.loads(archive.read("schema_version.json"))
+        ordered = json.loads(archive.read("ordered_instruments.json"))
+
+    assert "delegation_expectation:principal" not in schema["missing_data"]["submissions"]
+    assert "2.0" in schema["instrument_versions"]
+    assert ordered["responses"][0]["instrument_definition_id"] == "delegation-expectation-v2"
+
+
 def test_legacy_export_is_marked_uncertifiable(memory_service):
     created = memory_service.create_session("Legacy export")
     export_buffer = memory_service.export_bundle(created["session"]["session_id"])

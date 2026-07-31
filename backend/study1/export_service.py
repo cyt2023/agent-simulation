@@ -189,12 +189,17 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
     submitted_keys = {
         (item["submission_type"], item["role"]) for item in originals
     }
+    completion = session.get("completion") or {}
     missing_submissions = []
     for submission_type, (_, roles) in SUBMISSION_RULES.items():
         if submission_type == "consent" and not session.get("require_consent"):
             continue
         for role in roles:
-            if (submission_type, role.value) not in submitted_keys:
+            if is_formal:
+                completed = bool(completion.get(f"{submission_type}:{role.value}"))
+            else:
+                completed = (submission_type, role.value) in submitted_keys
+            if not completed:
                 missing_submissions.append(f"{submission_type}:{role.value}")
     artifact_types = {item["type"] for item in artifacts}
     missing_artifacts = [
@@ -300,7 +305,12 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
         ),
         "phase_schema_version": PHASE_SCHEMA_VERSION,
         "instrument_versions": sorted(
-            {item["instrument_version"] for item in submissions}
+            {
+                str(item["instrument_version"])
+                for rows in (submissions, decisions, instrument_responses)
+                for item in rows
+                if item.get("instrument_version")
+            }
         ),
         "artifact_versions": sorted(
             {f"{item['type']}:{item['version']}" for item in artifacts}
