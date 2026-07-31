@@ -23,6 +23,7 @@ from .livekit_runtime import LiveKitRoomRuntime
 from .pipeline import ProxyMediaPipeline
 from .providers.factory import create_providers
 from .repository import MediaRepository
+from .release_handshake import ReleaseHandshakeError, validate_release_handshake
 from .runtime import RuntimeCoordinator
 from .schemas import (
     CommandAcceptance,
@@ -144,12 +145,22 @@ def create_app(
     )
     def accept_command(envelope: CommandEnvelope, background_tasks: BackgroundTasks):
         try:
+            validate_release_handshake(
+                envelope.payload,
+                expected_release_id=resolved_settings.study1_release_id,
+                expected_checksum=resolved_settings.study1_release_checksum,
+            )
             result = app.state.command_service.accept(envelope)
             if not result.duplicate:
                 background_tasks.add_task(
                     dispatch_with_error_event, result.command_id
                 )
             return result
+        except ReleaseHandshakeError as error:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": error.code, "message": str(error)},
+            ) from error
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 

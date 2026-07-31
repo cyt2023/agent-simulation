@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-simulation.local/schemas/study1-release-v1.json",
+  "title": "Study 1 Release Manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "release_id",
+    "created_at",
+    "source",
+    "build_versions",
+    "protocol",
+    "providers",
+    "prompts",
+    "sampling",
+    "version_catalog",
+    "acceptance",
+    "checksum"
+  ],
+  "properties": {
+    "schema_version": { "const": "study1-release-v1" },
+    "release_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "checksum": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "source": {
+      "type": "object",
+      "required": ["commit", "branch", "dirty_worktree"],
+      "properties": {
+        "commit": { "type": "string", "minLength": 1 },
+        "branch": { "type": "string", "minLength": 1 },
+        "dirty_worktree": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "build_versions": {
+      "type": "object",
+      "required": ["backend", "frontend", "media_service"],
+      "properties": {
+        "backend": { "type": "string", "minLength": 1 },
+        "frontend": { "type": "string", "minLength": 1 },
+        "media_service": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "protocol": {
+      "type": "object",
+      "required": [
+        "protocol_version",
+        "media_contract_version",
+        "phase_schema_version",
+        "task_version",
+        "task_instance_id",
+        "task_checksum",
+        "facts_checksum"
+      ],
+      "additionalProperties": true
+    },
+    "providers": { "type": "object" },
+    "prompts": { "type": "object" },
+    "sampling": { "type": "object" },
+    "version_catalog": { "type": "object" },
+    "acceptance": {
+      "type": "object",
+      "required": [
+        "requested_status",
+        "status",
+        "external_signoffs",
+        "missing_external_signoffs",
+        "automated_gates",
+        "technical_acceptance_only"
+      ],
+      "properties": {
+        "requested_status": {
+          "enum": ["technical_acceptance", "data_collection_ready"]
+        },
+        "status": {
+          "enum": ["technical_acceptance", "data_collection_ready"]
+        },
+        "technical_acceptance_only": { "type": "boolean" },
+        "missing_external_signoffs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "external_signoffs": {
+          "type": "object",
+          "required": [
+            "irb_approval",
+            "production_wss_turn",
+            "production_credentials",
+            "real_participant_pilots"
+          ],
+          "properties": {
+            "irb_approval": { "type": "boolean" },
+            "production_wss_turn": { "type": "boolean" },
+            "production_credentials": { "type": "boolean" },
+            "real_participant_pilots": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

@@ -118,6 +118,14 @@ def utc_iso(value: datetime | None = None) -> str:
     return (value or utc_now()).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def study1_release_identity_from_env() -> dict[str, str] | None:
+    release_id = os.environ.get("STUDY1_RELEASE_ID")
+    checksum = os.environ.get("STUDY1_RELEASE_CHECKSUM")
+    if not release_id and not checksum:
+        return None
+    return {"release_id": str(release_id or ""), "checksum": str(checksum or "")}
+
+
 def hash_invite_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -4711,6 +4719,9 @@ class Study1Service:
                 "END_CURRENT_MEETING requires an active meeting phase",
                 409,
             )
+        release_identity = study1_release_identity_from_env()
+        if release_identity:
+            command_payload["release"] = release_identity
         envelope = {
             "command_id": command_id or str(uuid.uuid4()),
             "session_id": session_id,

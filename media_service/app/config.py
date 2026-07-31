@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     azure_tts_deployment: str = "tts"
     proxy_prompt_version: str = "proxy-v1"
     summary_prompt_version: str = "neutral-summary-v1"
+    study1_release_id: str | None = None
+    study1_release_checksum: str | None = None
     callback_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     callback_poll_seconds: float = Field(default=2.0, ge=0.25, le=30)
 
