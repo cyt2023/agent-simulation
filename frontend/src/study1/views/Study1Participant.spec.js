@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   socketHandlers: {},
   stableSession: null,
   fetchMe: vi.fn(),
+  fetchMyMaterials: vi.fn(),
   fetchCurrentInstrument: vi.fn(),
   submitIndividualDecision: vi.fn(),
   submitInstrumentResponse: vi.fn(),
@@ -39,7 +40,7 @@ vi.mock('../services/study1Api.js', () => ({
   fetchMarkers: mocks.fetchMarkers,
   createMarker: mocks.createMarker,
   fetchMe: mocks.fetchMe,
-  fetchMyMaterials: vi.fn(async () => ({ materials: [] })),
+  fetchMyMaterials: mocks.fetchMyMaterials,
   getStudy1Identity: () => mocks.identity,
   logReviewUiEvent: mocks.logReviewUiEvent,
   requestStudy1Withdrawal: mocks.requestStudy1Withdrawal,
@@ -82,6 +83,7 @@ function session(phase, phaseVersion) {
       submit_post_survey: true,
       submit_delegation_expectation: true,
       submit_comprehension_measurement: true,
+      material_read: false,
     },
   }
 }
@@ -108,6 +110,7 @@ describe('Study1Participant stable meeting ownership', () => {
       identity: mocks.identity,
       session: mocks.session,
     }))
+    mocks.fetchMyMaterials.mockResolvedValue({ materials: [] })
     mocks.fetchCurrentInstrument.mockResolvedValue({
       instrument_definition_id: 'pre-individual-v2',
       instrument_version: '2.0',
@@ -191,6 +194,41 @@ describe('Study1Participant stable meeting ownership', () => {
       sample,
     )
     wrapper.unmount()
+  })
+
+  it('reloads and displays private materials during teammate proxy deliberation', async () => {
+    mocks.session = {
+      ...session('PROXY_MEETING', 5),
+      capabilities: {
+        ...session('PROXY_MEETING', 5).capabilities,
+        material_read: true,
+      },
+    }
+    mocks.fetchMyMaterials.mockResolvedValue({
+      materials: [
+        {
+          material_id: 'material-t1',
+          title: 'T1 private evidence',
+          content: 'Only T1 can use this hidden profile fact.',
+        },
+      ],
+    })
+    const wrapper = mount(Study1Participant, {
+      global: {
+        stubs: {
+          PhaseHeader: true,
+          Study1MeetingWorkspace: {
+            name: 'Study1MeetingWorkspace',
+            template: '<div data-test="meeting-workspace"><slot /></div>',
+          },
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(mocks.fetchMyMaterials).toHaveBeenCalledWith('session-1')
+    expect(wrapper.text()).toContain('Your private material reference')
+    expect(wrapper.text()).toContain('Only T1 can use this hidden profile fact.')
   })
 
   it('lets participants submit withdrawal requests after completion', async () => {

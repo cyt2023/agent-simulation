@@ -76,6 +76,11 @@ const currentCandidates = computed(() => (
   || currentInstrument.value?.candidates
   || []
 ))
+const showMaterialReference = computed(() => (
+  Boolean(capabilities.value.material_read)
+  && materials.value.length > 0
+  && !['MATERIAL_READING', 'PROXY_CONFIGURATION'].includes(phase.value)
+))
 
 async function reportRtcTelemetry(sample) {
   const sessionId = identity.value?.session_id
@@ -147,11 +152,10 @@ async function refresh() {
   const result = await fetchMe(identity.value.session_id)
   identity.value = result.identity
   session.value = result.session
-  if (
-    phase.value === 'MATERIAL_READING'
-    || (phase.value === 'PROXY_CONFIGURATION' && role.value === 'principal')
-  ) {
+  if (capabilities.value.material_read) {
     materials.value = (await fetchMyMaterials(identity.value.session_id)).materials
+  } else {
+    materials.value = []
   }
   await loadPhaseAssets()
 }
@@ -372,6 +376,17 @@ onUnmounted(() => {
         :remaining-seconds="session.remaining_seconds"
         @error="showTransientError($event)"
       >
+        <section v-if="showMaterialReference" class="material-reference">
+          <h2>Your private material reference</h2>
+          <p>Only the material assigned to your role is shown here.</p>
+          <article v-for="material in materials" :key="material.material_id">
+            <h3>{{ material.title }}</h3>
+            <p v-if="material.content">{{ material.content }}</p>
+            <a v-else-if="material.storage_uri" :href="material.storage_uri" target="_blank" rel="noopener">
+              Open assigned document
+            </a>
+          </article>
+        </section>
         <VotePhase
           v-if="phase === 'TENTATIVE_DECISION'"
           title="Tentative decision"
@@ -393,6 +408,17 @@ onUnmounted(() => {
         </p>
       </Study1MeetingWorkspace>
       <div v-else class="card">
+        <section v-if="showMaterialReference" class="material-reference">
+          <h2>Your private material reference</h2>
+          <p>Only the material assigned to your role is shown here.</p>
+          <article v-for="material in materials" :key="material.material_id">
+            <h3>{{ material.title }}</h3>
+            <p v-if="material.content">{{ material.content }}</p>
+            <a v-else-if="material.storage_uri" :href="material.storage_uri" target="_blank" rel="noopener">
+              Open assigned document
+            </a>
+          </article>
+        </section>
         <section v-if="phase === 'SETUP'">
           <ConsentPhase
             :role="role"
@@ -521,6 +547,10 @@ onUnmounted(() => {
 .role-label { color:#667482; font-size:.85rem; text-transform:capitalize; }
 .meeting-guidance { margin:0; color:#5f6f79; line-height:1.55; }
 .final-decision-grid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:1.25rem; }
+.material-reference { margin:0 0 1rem; padding:1rem; border:1px solid #d7e0e7; border-radius:10px; background:#fff; }
+.material-reference h2 { margin-top:0; }
+.material-reference article { margin-top:.8rem; padding-top:.8rem; border-top:1px solid #e5ebf0; }
+.material-reference p { white-space:pre-wrap; line-height:1.55; }
 .message { padding:.75rem 1rem; border-radius:8px; animation:message-in .18s ease-out; }
 .error { background:#fff0f0; color:#9b2828; }
 .success { background:#e9f7ef; color:#17633c; }

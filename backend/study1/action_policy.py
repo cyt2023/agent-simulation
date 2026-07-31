@@ -34,6 +34,7 @@ MATERIAL_PHASES_BY_ROLE = {
     Study1Role.PRINCIPAL.value: frozenset(
         {
             Study1Phase.MATERIAL_READING.value,
+            Study1Phase.PRE_VOTE.value,
             Study1Phase.PROXY_CONFIGURATION.value,
             Study1Phase.HANDOFF.value,
             Study1Phase.SYNC_MEETING.value,
@@ -44,6 +45,9 @@ MATERIAL_PHASES_BY_ROLE = {
     Study1Role.TEAMMATE_1.value: frozenset(
         {
             Study1Phase.MATERIAL_READING.value,
+            Study1Phase.PRE_VOTE.value,
+            Study1Phase.PROXY_MEETING.value,
+            Study1Phase.TENTATIVE_DECISION.value,
             Study1Phase.HANDOFF.value,
             Study1Phase.SYNC_MEETING.value,
             Study1Phase.FINAL_DECISION.value,
@@ -53,6 +57,9 @@ MATERIAL_PHASES_BY_ROLE = {
     Study1Role.TEAMMATE_2.value: frozenset(
         {
             Study1Phase.MATERIAL_READING.value,
+            Study1Phase.PRE_VOTE.value,
+            Study1Phase.PROXY_MEETING.value,
+            Study1Phase.TENTATIVE_DECISION.value,
             Study1Phase.HANDOFF.value,
             Study1Phase.SYNC_MEETING.value,
             Study1Phase.FINAL_DECISION.value,
