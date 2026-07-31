@@ -3,11 +3,53 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 import json
 
-from .base import AsrResult
+from ..audio_format import PcmFrame
+from .base import AsrEvent, AsrResult
+
+
+class MockAsrSession:
+    def __init__(self, utterance_id: str, provider_version: str):
+        self.utterance_id = utterance_id
+        self.provider_version = provider_version
+        self.frames: list[PcmFrame] = []
+        self._committed = False
+
+    async def push(self, frame: PcmFrame) -> None:
+        self.frames.append(frame)
+
+    async def commit(self) -> None:
+        self._committed = True
+
+    async def events(self):
+        if not self._committed:
+            return
+        total = sum(len(frame.data) for frame in self.frames)
+        text = f"[streamed audio {total} bytes]"
+        yield AsrEvent(
+            utterance_id=self.utterance_id,
+            kind="partial",
+            text=text,
+            start_ms=0,
+            end_ms=max(20, total // 96),
+            confidence=None,
+            provider_version=self.provider_version,
+        )
+        yield AsrEvent(
+            utterance_id=self.utterance_id,
+            kind="final",
+            text=text,
+            start_ms=0,
+            end_ms=max(20, total // 96),
+            confidence=1.0,
+            provider_version=self.provider_version,
+        )
 
 
 class MockAsrProvider:
     version = "mock-asr-v1"
+
+    async def open_asr_session(self, *, utterance_id: str) -> MockAsrSession:
+        return MockAsrSession(utterance_id, self.version)
 
     async def transcribe(
         self, audio: AsyncIterator[bytes], *, speaker: str
