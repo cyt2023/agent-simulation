@@ -481,3 +481,55 @@ class Study1InstrumentResponseRow(Base):
             name="uq_study1_instrument_response_actor",
         ),
     )
+
+
+class Study1MarkerRow(Base):
+    __tablename__ = "study1_markers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    marker_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
+    session_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    marker_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    participant_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    participant_visible: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
+    start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    segment_ids: Mapped[list[str]] = mapped_column(JSON_VALUE, nullable=False)
+    recording_ids: Mapped[list[str]] = mapped_column(JSON_VALUE, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    marker_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON_VALUE, nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_study1_markers_session_range", "session_id", "start_ms", "end_ms"),
+    )
+
+
+class Study1ReplayPlanRow(Base):
+    __tablename__ = "study1_replay_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    replay_plan_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
+    session_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    context_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_marker_ids: Mapped[list[str]] = mapped_column(JSON_VALUE, nullable=False)
+    items: Mapped[list[dict[str, Any]]] = mapped_column(JSON_VALUE, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    generator_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    replay_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON_VALUE, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "version", name="uq_study1_replay_plan_version"
+        ),
+    )

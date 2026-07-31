@@ -60,6 +60,8 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
     incidents = data.get("incidents") or []
     artifacts = data.get("artifacts") or []
     materials = data.get("materials") or []
+    markers = data.get("markers") or []
+    replay_plans = data.get("replay_plans") or []
 
     originals = [
         item for item in submissions if not item.get("previous_submission_id")
@@ -259,6 +261,8 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
         )
         archive.writestr("artifacts_manifest.json", _json_bytes(artifact_manifest))
         archive.writestr("materials_assignment.json", _json_bytes(material_assignment))
+        archive.writestr("markers.jsonl", _jsonl_bytes(markers))
+        archive.writestr("replay_plans.json", _json_bytes(replay_plans))
         if is_formal:
             task_definition = data.get("task_definition") or {
                 "task_definition_id": session.get("task_definition_id"),

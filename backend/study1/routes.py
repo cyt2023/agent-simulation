@@ -646,6 +646,58 @@ def replay_study1_recording(session_id: str, recording_id: str):
         return _service_error(error)
 
 
+@study1_bp.get("/api/study1/sessions/<session_id>/markers")
+@require_study1_auth([*HUMAN_ROLES, Study1Role.RESEARCHER])
+def list_study1_markers(session_id: str):
+    try:
+        markers = get_service().list_markers(
+            session_id, g.study1_identity.as_actor()
+        )
+        return jsonify({"markers": [_json_domain_record(item) for item in markers]}), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/markers")
+@require_study1_auth([*HUMAN_ROLES, Study1Role.RESEARCHER])
+def create_study1_marker(session_id: str):
+    try:
+        marker = get_service().create_marker(
+            session_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+        )
+        return jsonify(_json_domain_record(marker)), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/replay-plans")
+@require_study1_auth([Study1Role.RESEARCHER])
+def list_study1_replay_plans(session_id: str):
+    try:
+        plans = get_service().list_replay_plans(
+            session_id, g.study1_identity.as_actor()
+        )
+        return jsonify({"replay_plans": [_json_domain_record(item) for item in plans]}), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/replay-plans")
+@require_study1_auth([Study1Role.RESEARCHER])
+def create_study1_replay_plan(session_id: str):
+    try:
+        plan = get_service().generate_replay_plan(
+            session_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+        )
+        return jsonify(_json_domain_record(plan)), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
 @study1_bp.post("/api/study1/sessions/<session_id>/summary-actions")
 @require_study1_auth([Study1Role.RESEARCHER])
 def create_study1_summary_action(session_id: str):

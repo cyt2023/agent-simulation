@@ -203,6 +203,8 @@ def test_complete_mock_study1_flow_and_export(memory_service):
             "incidents.csv",
             "artifacts_manifest.json",
             "materials_assignment.json",
+            "markers.jsonl",
+            "replay_plans.json",
             "schema_version.json",
             "integrity_report.json",
         }

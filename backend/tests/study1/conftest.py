@@ -52,7 +52,9 @@ def study1_sqlite_engine():
         Study1EventRow,
         Study1IncidentRow,
         Study1InviteRow,
+        Study1MarkerRow,
         Study1MaterialRow,
+        Study1ReplayPlanRow,
         Study1SubmissionRow,
     )
 
@@ -87,6 +89,8 @@ def study1_sqlite_engine():
         Study1ArtifactRow,
         Study1IncidentRow,
         Study1MaterialRow,
+        Study1MarkerRow,
+        Study1ReplayPlanRow,
     ):
         model.__table__.create(engine, checkfirst=True)
 

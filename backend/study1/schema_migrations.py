@@ -16,7 +16,9 @@ from .models import (
     Study1InstrumentDefinitionRow,
     Study1InstrumentItemRow,
     Study1InstrumentResponseRow,
+    Study1MarkerRow,
     Study1ProtocolSnapshotRow,
+    Study1ReplayPlanRow,
     Study1RoleAssignmentRow,
     Study1SchemaVersionRow,
     Study1SharedArtifactRow,
@@ -42,6 +44,8 @@ STUDY1_ADDITIVE_TABLES = (
     Study1InstrumentDefinitionRow.__table__,
     Study1InstrumentItemRow.__table__,
     Study1InstrumentResponseRow.__table__,
+    Study1MarkerRow.__table__,
+    Study1ReplayPlanRow.__table__,
 )
 STUDY1_ADDITIVE_TABLE_NAMES = frozenset(
     table.name for table in STUDY1_ADDITIVE_TABLES

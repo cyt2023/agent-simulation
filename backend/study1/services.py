@@ -29,11 +29,13 @@ from .models import (
     Study1InviteRow,
     Study1IncidentRow,
     Study1FactAssignmentRow,
+    Study1MarkerRow,
     Study1MaterialRow,
     Study1Phase,
     Study1Role,
     Study1RoleAssignmentRow,
     Study1ProtocolSnapshotRow,
+    Study1ReplayPlanRow,
     Study1DecisionRow,
     Study1InstrumentResponseRow,
     Study1SharedArtifactRow,
@@ -88,6 +90,12 @@ from .summary_service import (
     SummaryQaService,
     build_summary_failure_action,
 )
+from .marker_service import (
+    MarkerValidationError,
+    marker_visible_to_actor,
+    normalize_marker,
+)
+from .replay_service import ReplayValidationError, build_replay_plan
 from .privacy_service import (
     missing_required_consent_scopes,
     normalize_consent_submission,
@@ -276,6 +284,8 @@ class InMemoryStudy1Repository:
         self.shared_artifacts: dict[tuple[str, str], dict[str, Any]] = {}
         self.shared_revisions: list[dict[str, Any]] = []
         self.shared_confirmations: list[dict[str, Any]] = []
+        self.markers: list[dict[str, Any]] = []
+        self.replay_plans: list[dict[str, Any]] = []
         self.idempotency_keys: set[str] = set()
         self._lock = threading.RLock()
 
@@ -798,6 +808,95 @@ class InMemoryStudy1Repository:
             self.events.append(result["event"])
             return copy.deepcopy(result["response"])
 
+    def create_marker(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            marker = normalize_marker(
+                session_id=session_id,
+                actor=actor,
+                payload=payload,
+                created_at=utc_now(),
+            )
+            self.markers.append(copy.deepcopy(marker))
+            self.events.append(_marker_event(session, actor, marker))
+            return copy.deepcopy(marker)
+
+    def list_markers(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            if session_id not in self.sessions:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            markers = [
+                item
+                for item in self.markers
+                if item["session_id"] == session_id and marker_visible_to_actor(item, actor)
+            ]
+            return copy.deepcopy(
+                sorted(markers, key=lambda item: (item["start_ms"], item["created_at"]))
+            )
+
+    def create_replay_plan(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            marker_ids = _normalize_optional_string_set(payload.get("marker_ids"))
+            markers = [
+                marker
+                for marker in self.markers
+                if marker["session_id"] == session_id
+                and (not marker_ids or marker["marker_id"] in marker_ids)
+            ]
+            plan = build_replay_plan(
+                session_id=session_id,
+                markers=copy.deepcopy(markers),
+                existing_count=len(
+                    [
+                        item
+                        for item in self.replay_plans
+                        if item["session_id"] == session_id
+                    ]
+                ),
+                created_by=str(actor.get("participant_id") or actor.get("role") or ""),
+                context_seconds=int(payload.get("context_seconds", 10)),
+                created_at=utc_now(),
+            )
+            self.replay_plans.append(copy.deepcopy(plan))
+            self.events.append(_replay_plan_event(session, actor, plan))
+            return copy.deepcopy(plan)
+
+    def list_replay_plans(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            if actor.get("role") != Study1Role.RESEARCHER.value:
+                raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+            if session_id not in self.sessions:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            return copy.deepcopy(
+                [
+                    item
+                    for item in sorted(
+                        self.replay_plans,
+                        key=lambda row: (row["session_id"], row["created_at"]),
+                    )
+                    if item["session_id"] == session_id
+                ]
+            )
+
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
             return [copy.deepcopy(value) for value in self.sessions.values()]
@@ -941,6 +1040,16 @@ class InMemoryStudy1Repository:
                             )
                             for revision in self.shared_revisions
                         )
+                    ]
+                ),
+                "markers": copy.deepcopy(
+                    [item for item in self.markers if item["session_id"] == session_id]
+                ),
+                "replay_plans": copy.deepcopy(
+                    [
+                        item
+                        for item in self.replay_plans
+                        if item["session_id"] == session_id
                     ]
                 ),
             }
@@ -1811,6 +1920,150 @@ class SqlAlchemyStudy1Repository:
             db.commit()
             return result["response"]
 
+    def create_marker(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row or session_row.payload.get("experiment_type") != "study1":
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            marker = normalize_marker(
+                session_id=session_id,
+                actor=actor,
+                payload=payload,
+                created_at=utc_now(),
+            )
+            db.add(
+                Study1MarkerRow(
+                    marker_id=marker["marker_id"],
+                    session_id=marker["session_id"],
+                    marker_type=marker["marker_type"],
+                    source=marker["source"],
+                    participant_id=marker["participant_id"],
+                    role=marker["role"],
+                    participant_visible=marker["participant_visible"],
+                    start_ms=marker["start_ms"],
+                    end_ms=marker["end_ms"],
+                    segment_ids=marker["segment_ids"],
+                    recording_ids=marker["recording_ids"],
+                    reason=marker["reason"],
+                    created_at=marker["created_at"],
+                    marker_metadata=marker["metadata"],
+                )
+            )
+            db.add(_event_orm(_marker_event(session_row.payload, actor, marker)))
+            db.commit()
+            return marker
+
+    def list_markers(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row or session_row.payload.get("experiment_type") != "study1":
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            rows = db.scalars(
+                select(Study1MarkerRow)
+                .where(Study1MarkerRow.session_id == session_id)
+                .order_by(Study1MarkerRow.start_ms.asc(), Study1MarkerRow.created_at.asc())
+            ).all()
+            return [
+                marker
+                for marker in (_marker_row_dict(row) for row in rows)
+                if marker_visible_to_actor(marker, actor)
+            ]
+
+    def create_replay_plan(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row or session_row.payload.get("experiment_type") != "study1":
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            marker_ids = _normalize_optional_string_set(payload.get("marker_ids"))
+            marker_query = select(Study1MarkerRow).where(
+                Study1MarkerRow.session_id == session_id
+            )
+            if marker_ids:
+                marker_query = marker_query.where(
+                    Study1MarkerRow.marker_id.in_(marker_ids)
+                )
+            marker_rows = db.scalars(
+                marker_query.order_by(
+                    Study1MarkerRow.start_ms.asc(), Study1MarkerRow.created_at.asc()
+                )
+            ).all()
+            existing_count = len(
+                db.scalars(
+                    select(Study1ReplayPlanRow.replay_plan_id).where(
+                        Study1ReplayPlanRow.session_id == session_id
+                    )
+                ).all()
+            )
+            plan = build_replay_plan(
+                session_id=session_id,
+                markers=[_marker_row_dict(row) for row in marker_rows],
+                existing_count=existing_count,
+                created_by=str(actor.get("participant_id") or actor.get("role") or ""),
+                context_seconds=int(payload.get("context_seconds", 10)),
+                created_at=utc_now(),
+            )
+            db.add(
+                Study1ReplayPlanRow(
+                    replay_plan_id=plan["replay_plan_id"],
+                    session_id=session_id,
+                    version=plan["version"],
+                    context_seconds=plan["context_seconds"],
+                    source_marker_ids=plan["source_marker_ids"],
+                    items=plan["items"],
+                    created_by=plan["created_by"],
+                    created_at=plan["created_at"],
+                    generator_version=plan["generator_version"],
+                    replay_metadata=plan["metadata"],
+                )
+            )
+            db.add(_event_orm(_replay_plan_event(session_row.payload, actor, plan)))
+            db.commit()
+            return plan
+
+    def list_replay_plans(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row or session_row.payload.get("experiment_type") != "study1":
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            rows = db.scalars(
+                select(Study1ReplayPlanRow)
+                .where(Study1ReplayPlanRow.session_id == session_id)
+                .order_by(Study1ReplayPlanRow.created_at.asc())
+            ).all()
+            return [_replay_plan_row_dict(row) for row in rows]
+
     def list_sessions(self) -> list[dict[str, Any]]:
         with self.SessionLocal() as db:
             rows = db.scalars(select(ResearchSessionRow)).all()
@@ -2020,6 +2273,16 @@ class SqlAlchemyStudy1Repository:
                 )
                 .order_by(Study1SharedConfirmationRow.confirmed_at.asc())
             ).all() if shared_revision_ids else []
+            marker_rows = db.scalars(
+                select(Study1MarkerRow)
+                .where(Study1MarkerRow.session_id == session_id)
+                .order_by(Study1MarkerRow.start_ms.asc(), Study1MarkerRow.created_at.asc())
+            ).all()
+            replay_plan_rows = db.scalars(
+                select(Study1ReplayPlanRow)
+                .where(Study1ReplayPlanRow.session_id == session_id)
+                .order_by(Study1ReplayPlanRow.created_at.asc())
+            ).all()
             protocol_row = db.scalar(
                 select(Study1ProtocolSnapshotRow).where(
                     Study1ProtocolSnapshotRow.session_id == session_id
@@ -2083,6 +2346,10 @@ class SqlAlchemyStudy1Repository:
                 "shared_confirmations": [
                     _shared_confirmation_row_dict(row)
                     for row in shared_confirmation_rows
+                ],
+                "markers": [_marker_row_dict(row) for row in marker_rows],
+                "replay_plans": [
+                    _replay_plan_row_dict(row) for row in replay_plan_rows
                 ],
             }
 
@@ -2603,6 +2870,41 @@ def _artifact_row_dict(row: Study1ArtifactRow) -> dict[str, Any]:
     }
 
 
+def _marker_row_dict(row: Study1MarkerRow) -> dict[str, Any]:
+    return {
+        "marker_id": row.marker_id,
+        "session_id": row.session_id,
+        "marker_type": row.marker_type,
+        "type": row.marker_type,
+        "source": row.source,
+        "participant_id": row.participant_id,
+        "role": row.role,
+        "participant_visible": bool(row.participant_visible),
+        "start_ms": row.start_ms,
+        "end_ms": row.end_ms,
+        "segment_ids": list(row.segment_ids or []),
+        "recording_ids": list(row.recording_ids or []),
+        "reason": row.reason,
+        "created_at": utc_iso(row.created_at),
+        "metadata": dict(row.marker_metadata or {}),
+    }
+
+
+def _replay_plan_row_dict(row: Study1ReplayPlanRow) -> dict[str, Any]:
+    return {
+        "replay_plan_id": row.replay_plan_id,
+        "session_id": row.session_id,
+        "version": row.version,
+        "context_seconds": row.context_seconds,
+        "source_marker_ids": list(row.source_marker_ids or []),
+        "items": copy.deepcopy(row.items or []),
+        "created_by": row.created_by,
+        "created_at": utc_iso(row.created_at),
+        "generator_version": row.generator_version,
+        "metadata": dict(row.replay_metadata or {}),
+    }
+
+
 def _submission_orm_fields(value: dict[str, Any]) -> dict[str, Any]:
     payload = copy.deepcopy(value["payload"])
     payload["_submission_type"] = value["submission_type"]
@@ -2925,6 +3227,58 @@ def _record_review_event_batch(
         now,
     )
     return {"response": response, "event": event}
+
+
+def _normalize_optional_string_set(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if not isinstance(value, list):
+        raise ReplayValidationError(
+            "INVALID_REPLAY_MARKERS", "marker_ids must be a list"
+        )
+    return {item for item in (str(item).strip() for item in value) if item}
+
+
+def _marker_event(
+    session: dict[str, Any],
+    actor: dict[str, Any],
+    marker: dict[str, Any],
+) -> dict[str, Any]:
+    return _status_event(
+        session,
+        actor,
+        "marker_created",
+        {
+            "marker_id": marker["marker_id"],
+            "marker_type": marker["marker_type"],
+            "source": marker["source"],
+            "participant_visible": marker["participant_visible"],
+            "start_ms": marker["start_ms"],
+            "end_ms": marker["end_ms"],
+            "segment_ids": list(marker.get("segment_ids") or []),
+            "recording_ids": list(marker.get("recording_ids") or []),
+        },
+    )
+
+
+def _replay_plan_event(
+    session: dict[str, Any],
+    actor: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    return _status_event(
+        session,
+        actor,
+        "replay_plan_created",
+        {
+            "replay_plan_id": plan["replay_plan_id"],
+            "version": plan["version"],
+            "context_seconds": plan["context_seconds"],
+            "source_marker_ids": list(plan.get("source_marker_ids") or []),
+            "item_count": len(plan.get("items") or []),
+            "generator_version": plan["generator_version"],
+        },
+    )
 
 
 def _review_payload(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -4775,6 +5129,41 @@ class Study1Service:
         return self.repository.record_review_event_batch(
             session_id, identity, visit_id, events
         )
+
+    def create_marker(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return self.repository.create_marker(session_id, actor, payload or {})
+        except MarkerValidationError as error:
+            status = 403 if error.code == "FORBIDDEN" else 400
+            raise Study1ServiceError(error.code, str(error), status) from error
+
+    def list_markers(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        return self.repository.list_markers(session_id, actor)
+
+    def generate_replay_plan(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        try:
+            return self.repository.create_replay_plan(session_id, actor, payload or {})
+        except ReplayValidationError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+
+    def list_replay_plans(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        return self.repository.list_replay_plans(session_id, actor)
 
     def exchange_invite(self, raw_token: str) -> dict[str, Any]:
         if not raw_token:
