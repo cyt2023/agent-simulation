@@ -36,6 +36,15 @@ DECISION_POLICY = {
     ),
 }
 
+TENTATIVE_DECISION_STATUSES = {"open", "tentative", "settled"}
+PROXY_AUTHORITY_BELIEFS = {"yes", "no", "uncertain"}
+
+
+def _payload_or_rating(payload: Mapping[str, Any], ratings: Mapping[str, Any], key: str) -> Any:
+    if key in payload:
+        return payload.get(key)
+    return ratings.get(key)
+
 
 def validate_individual_decision(
     kind: DecisionKind | str,
@@ -81,14 +90,45 @@ def validate_individual_decision(
             raise DecisionValidationError("INVALID_CONFIDENCE", "confidence must be 1 to 7") from error
         if confidence < 1 or confidence > 7:
             raise DecisionValidationError("INVALID_CONFIDENCE", "confidence must be 1 to 7")
+    ratings = dict(payload.get("ratings") or {})
+    decision_status = str(payload.get("decision_status") or "").strip() or None
+    if decision_kind is DecisionKind.TENTATIVE_INDIVIDUAL:
+        if decision_status not in TENTATIVE_DECISION_STATUSES:
+            raise DecisionValidationError(
+                "INVALID_DECISION_STATUS",
+                "tentative decisions require decision_status to be open, tentative, or settled",
+            )
+        proxy_authority_belief = str(
+            _payload_or_rating(payload, ratings, "proxy_authority_belief") or ""
+        ).strip()
+        if proxy_authority_belief not in PROXY_AUTHORITY_BELIEFS:
+            raise DecisionValidationError(
+                "INVALID_PROXY_AUTHORITY_BELIEF",
+                "proxy_authority_belief must be yes, no, or uncertain",
+            )
+        expected_principal_acceptance = _payload_or_rating(
+            payload, ratings, "expected_principal_acceptance"
+        )
+        try:
+            expected_principal_acceptance = int(expected_principal_acceptance)
+        except (TypeError, ValueError) as error:
+            raise DecisionValidationError(
+                "INVALID_EXPECTED_PRINCIPAL_ACCEPTANCE",
+                "expected_principal_acceptance must be 1 to 7",
+            ) from error
+        if expected_principal_acceptance < 1 or expected_principal_acceptance > 7:
+            raise DecisionValidationError(
+                "INVALID_EXPECTED_PRINCIPAL_ACCEPTANCE",
+                "expected_principal_acceptance must be 1 to 7",
+            )
+        ratings["proxy_authority_belief"] = proxy_authority_belief
+        ratings["expected_principal_acceptance"] = expected_principal_acceptance
     return {
         "decision_kind": decision_kind.value,
         "candidate_id": candidate_id,
         "rationale": rationale,
         "confidence": confidence,
-        "ratings": dict(payload.get("ratings") or {}),
-        "decision_status": (
-            str(payload.get("decision_status") or "").strip() or None
-        ),
+        "ratings": ratings,
+        "decision_status": decision_status,
         "phase": required_phase,
     }
