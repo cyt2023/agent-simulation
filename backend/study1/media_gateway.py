@@ -158,6 +158,13 @@ class MockMediaGateway:
             "service_status": "mock",
             "runtime_state": "IDLE",
             "mode": "mock",
+            "components": {
+                "recorder": {"status": "unknown"},
+                "asr": {"status": "unknown"},
+                "llm": {"status": "unknown"},
+                "tts": {"status": "unknown"},
+                "proxy": {"status": "unknown"},
+            },
         }
 
     def export_bundle(self, session_id: str) -> None:

@@ -60,11 +60,11 @@ def test_incident_updates_dashboard_and_event_log(memory_service):
     incident = memory_service.add_incident(
         session_id,
         RESEARCHER,
-        "network",
+        "participant_disconnect",
         "warning",
         "Participant briefly disconnected",
     )
     dashboard = memory_service.researcher_dashboard(session_id)
-    assert incident["category"] == "network"
+    assert incident["category"] == "participant_disconnect"
     assert dashboard["incident_count"] == 1
     assert memory_service.repository.events[-1]["event_type"] == "incident_created"

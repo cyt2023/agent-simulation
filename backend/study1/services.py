@@ -90,6 +90,8 @@ from .summary_service import (
     SummaryQaService,
     build_summary_failure_action,
 )
+from .incident_codes import IncidentCodeError, incident_definition
+from .quality_service import build_quality_snapshot, normalize_rtc_metric
 from .marker_service import (
     MarkerValidationError,
     marker_visible_to_actor,
@@ -3432,18 +3434,25 @@ def _new_incident(
         raise Study1ServiceError(
             "INCIDENT_DESCRIPTION_REQUIRED", "Incident description is required", 400
         )
+    try:
+        definition = incident_definition(category)
+    except IncidentCodeError as error:
+        raise Study1ServiceError(error.code, str(error), 400) from error
     allowed_severity = {"info", "warning", "critical"}
     if severity not in allowed_severity:
         raise Study1ServiceError("INVALID_INCIDENT_SEVERITY", "Invalid severity", 400)
+    enriched_metadata = copy.deepcopy(metadata or {})
+    enriched_metadata.setdefault("incident_label", definition.label)
+    enriched_metadata.setdefault("incident_component", definition.component)
     return {
         "incident_id": str(uuid.uuid4()),
         "session_id": session_id,
-        "category": (category or "other")[:64],
+        "category": definition.code,
         "severity": severity,
         "description": clean_description,
         "created_at": utc_now(),
         "created_by": actor.get("participant_id") or "researcher",
-        "metadata": copy.deepcopy(metadata or {}),
+        "metadata": enriched_metadata,
     }
 
 
@@ -5117,6 +5126,40 @@ class Study1Service:
     ) -> dict[str, Any]:
         return self.repository.record_ui_event(
             session_id, identity, event_type, payload
+        )
+
+    def record_quality_metrics(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        metric = normalize_rtc_metric(
+            session_id, identity, payload or {}, received_at=utc_now()
+        )
+        return self.repository.record_ui_event(
+            session_id, identity, "rtc_metric_sample", metric
+        )
+
+    def quality_snapshot(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        data = self.repository.export_data(session_id)
+        try:
+            media_status = self.media_gateway.get_status(session_id)
+        except MediaGatewayError as error:
+            media_status = {
+                "service_status": "unavailable",
+                "last_error": str(error),
+                "components": {},
+            }
+        return build_quality_snapshot(
+            session_id=session_id,
+            data=data,
+            media_status=media_status,
+            now=utc_now(),
         )
 
     def record_review_event_batch(

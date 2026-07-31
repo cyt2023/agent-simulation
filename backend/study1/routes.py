@@ -477,7 +477,7 @@ def create_study1_incident(session_id: str):
         incident = get_service().add_incident(
             session_id,
             g.study1_identity.as_actor(),
-            str(data.get("category") or "other"),
+            str(data.get("category") or ""),
             str(data.get("severity") or "warning"),
             str(data.get("description") or ""),
             data.get("metadata") or {},
@@ -603,6 +603,33 @@ def report_study1_media_device(session_id: str):
                 request.get_json(silent=True) or {},
             )
         ), 202
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/quality-metrics")
+@require_study1_auth(HUMAN_ROLES)
+def create_study1_quality_metrics(session_id: str):
+    try:
+        event = get_service().record_quality_metrics(
+            session_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+        )
+        return jsonify({"event_id": event["event_id"]}), 202
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/quality")
+@require_study1_auth([Study1Role.RESEARCHER])
+def get_study1_quality(session_id: str):
+    try:
+        return jsonify(
+            get_service().quality_snapshot(
+                session_id, g.study1_identity.as_actor()
+            )
+        ), 200
     except Study1ServiceError as error:
         return _service_error(error)
 
