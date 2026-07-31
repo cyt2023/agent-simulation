@@ -13,6 +13,12 @@ from typing import Any
 from .models import HUMAN_ROLES, PHASE_SCHEMA_VERSION
 from .formal_projection import formal_readiness, project_formal_session
 from .instruments import load_instrument_catalog
+from .export_schema import (
+    CANONICAL_EXPORT_SCHEMA_VERSION,
+    build_export_manifest,
+    checksum_bytes,
+)
+from .integrity_service import build_integrity_report
 from .services import SUBMISSION_RULES, readiness, utc_iso
 
 EXPORT_SCHEMA_VERSION = "1.0"
@@ -47,6 +53,116 @@ def _csv_bytes(fieldnames: list[str], rows: list[dict[str, Any]]) -> bytes:
     return stream.getvalue().encode("utf-8-sig")
 
 
+def _artifact_content_json(artifact: dict[str, Any]) -> Any:
+    try:
+        return json.loads(artifact.get("content") or "")
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def _latest_artifact(artifacts: list[dict[str, Any]], artifact_type: str) -> dict[str, Any] | None:
+    matches = [item for item in artifacts if item.get("type") == artifact_type]
+    return matches[-1] if matches else None
+
+
+def _normalized_utterances(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    transcript = _latest_artifact(artifacts, "transcript")
+    if not transcript:
+        return []
+    parsed = _artifact_content_json(transcript)
+    if isinstance(parsed, list):
+        rows = parsed
+    else:
+        rows = [
+            {
+                "segment_id": f"legacy-line-{index}",
+                "speaker": "unknown",
+                "text": line,
+                "start_ms": None,
+                "end_ms": None,
+            }
+            for index, line in enumerate(
+                str(transcript.get("content") or "").splitlines(), start=1
+            )
+            if line.strip()
+        ]
+    utterances: list[dict[str, Any]] = []
+    for index, row in enumerate(rows, start=1):
+        utterance_id = str(
+            row.get("utterance_id") or row.get("segment_id") or f"utterance-{index}"
+        )
+        recording_id = row.get("recording_id")
+        clock_id = row.get("clock_id") or (
+            f"clock:{recording_id}" if recording_id else "room-clock-unknown"
+        )
+        utterances.append(
+            {
+                "utterance_id": utterance_id,
+                "segment_id": utterance_id,
+                "session_id": transcript.get("session_id"),
+                "speaker": row.get("speaker") or row.get("role") or "unknown",
+                "text": row.get("text") or row.get("content") or "",
+                "start_ms": row.get("start_ms"),
+                "end_ms": row.get("end_ms"),
+                "recording_id": recording_id,
+                "clock_id": clock_id,
+                "source_artifact_id": transcript.get("artifact_id"),
+            }
+        )
+    return utterances
+
+
+def _media_manifest(
+    artifacts: list[dict[str, Any]], utterances: list[dict[str, Any]]
+) -> dict[str, Any]:
+    transcript = _latest_artifact(artifacts, "transcript") or {}
+    metadata = transcript.get("metadata") or {}
+    manifest = metadata.get("recording_manifest")
+    if isinstance(manifest, list) and manifest:
+        recordings = manifest
+    else:
+        recordings = []
+        seen: set[str] = set()
+        for utterance in utterances:
+            recording_id = utterance.get("recording_id")
+            if not recording_id or recording_id in seen:
+                continue
+            seen.add(recording_id)
+            recordings.append(
+                {
+                    "recording_id": recording_id,
+                    "clock_id": utterance.get("clock_id") or f"clock:{recording_id}",
+                    "content_type": "audio/wav",
+                    "status": "metadata_only",
+                }
+            )
+    return {
+        "schema_version": "study1-media-manifest-v1",
+        "recordings": recordings,
+        "utterance_count": len(utterances),
+    }
+
+
+def _normalized_review_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        event
+        for event in events
+        if (event.get("payload") or {}).get("ui_event_type")
+        in {
+            "review_page_enter",
+            "review_page_leave",
+            "summary_visible",
+            "transcript_expand",
+            "transcript_collapse",
+            "transcript_segment_view",
+            "scroll_depth",
+            "active_reading_time",
+            "review_telemetry_batch",
+            "recording_replay",
+        }
+    ]
+
+
 def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
     raw_session = data["session"]
     is_formal = raw_session.get("protocol_mode") == "formal_v2"
@@ -62,6 +178,10 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
     materials = data.get("materials") or []
     markers = data.get("markers") or []
     replay_plans = data.get("replay_plans") or []
+    decisions = data.get("decisions") or []
+    instrument_responses = data.get("instrument_responses") or []
+    utterances = _normalized_utterances(artifacts)
+    media_manifest = _media_manifest(artifacts, utterances)
 
     originals = [
         item for item in submissions if not item.get("previous_submission_id")
@@ -193,31 +313,55 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
         },
         "generated_at": utc_iso(),
     }
-    integrity_report = {
-        "complete": not (
-            missing_submissions
-            or missing_artifacts
-            or incidents
-            or schema["missing_data"]["current_phase_prerequisites"]
-        ),
-        "missing_submissions": missing_submissions,
-        "missing_artifacts": missing_artifacts,
-        "missing_current_phase_prerequisites": schema["missing_data"][
+    generated_at = utc_iso()
+    integrity_report = build_integrity_report(
+        missing_submissions=missing_submissions,
+        missing_artifacts=missing_artifacts,
+        missing_current_phase_prerequisites=schema["missing_data"][
             "current_phase_prerequisites"
         ],
-        "incident_count": len(incidents),
-        "disconnect_events": [
-            event
-            for event in events
-            if event.get("event_type") in ("participant_disconnected", "media_disconnected")
-        ],
-        "override_count": len(override_events),
-        "configuration_checksum": session.get("configuration_checksum"),
-        "generated_at": utc_iso(),
+        incidents=incidents,
+        override_events=override_events,
+        media_manifest=media_manifest,
+        configuration_checksum=session.get("configuration_checksum"),
+        generated_at=generated_at,
+    )
+    integrity_report["disconnect_events"] = [
+        event
+        for event in events
+        if event.get("event_type") in ("participant_disconnected", "media_disconnected")
+    ]
+    canonical_files = {
+        "media_manifest.json": _json_bytes(media_manifest),
+        "normalized/events.jsonl": _jsonl_bytes(events),
+        "normalized/utterances.jsonl": _jsonl_bytes(utterances),
+        "normalized/markers.jsonl": _jsonl_bytes(markers),
+        "normalized/replay_plans.json": _json_bytes(replay_plans),
+        "normalized/decisions.jsonl": _jsonl_bytes(decisions),
+        "normalized/instrument_responses.jsonl": _jsonl_bytes(instrument_responses),
+        "normalized/review_events.jsonl": _jsonl_bytes(
+            _normalized_review_events(events)
+        ),
+        "normalized/incidents.jsonl": _jsonl_bytes(incidents),
+        "normalized/materials.jsonl": _jsonl_bytes(materials),
+        "normalized/artifacts.jsonl": _jsonl_bytes(artifact_manifest),
+        "normalized/summary_qa.jsonl": _jsonl_bytes(
+            [item for item in artifacts if item.get("type") == "summary_qa"]
+        ),
     }
+    export_manifest = build_export_manifest(
+        session=session,
+        file_checksums={
+            name: checksum_bytes(payload) for name, payload in canonical_files.items()
+        },
+        formal_certifiable=bool(is_formal and session.get("formal_certifiable", False)),
+    )
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("export_manifest.json", _json_bytes(export_manifest))
+        for name, payload in canonical_files.items():
+            archive.writestr(name, payload)
         archive.writestr("session.json", _json_bytes(session))
         archive.writestr(
             "participants.csv",

@@ -194,7 +194,8 @@ def test_complete_mock_study1_flow_and_export(memory_service):
 
     export_buffer = memory_service.export_bundle(session_id)
     with zipfile.ZipFile(export_buffer) as archive:
-        assert set(archive.namelist()) == {
+        names = set(archive.namelist())
+        assert {
             "session.json",
             "participants.csv",
             "phase_events.csv",
@@ -207,7 +208,13 @@ def test_complete_mock_study1_flow_and_export(memory_service):
             "replay_plans.json",
             "schema_version.json",
             "integrity_report.json",
-        }
+        } <= names
+        assert {
+            "export_manifest.json",
+            "media_manifest.json",
+            "normalized/events.jsonl",
+            "normalized/utterances.jsonl",
+        } <= names
         schema = json.loads(archive.read("schema_version.json"))
         assert schema["protocol_version"] == "study1-a-1.0"
         assert schema["phase_schema_version"] == "1.0"
