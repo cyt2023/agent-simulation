@@ -88,6 +88,29 @@ def test_release_manifest_records_audio_e2e_gate():
     assert "npm.cmd run test:e2e" in commands
 
 
+def test_release_manifest_records_release_self_checks():
+    from scripts.build_study1_release_manifest import build_release_manifest
+
+    manifest = build_release_manifest(
+        {
+            "release_id": "study1-release-v1",
+            "backend_build": "backend-sha",
+            "frontend_build": "frontend-sha",
+            "media_build": "media-sha",
+        }
+    )
+
+    commands = [
+        gate["command"]
+        for gate in manifest["acceptance"]["automated_gates"]
+    ]
+
+    assert commands[:2] == [
+        "python scripts/build_study1_release_manifest.py --output release/study1-release-manifest.json",
+        "python scripts/verify_study1_release.py release/study1-release-manifest.json",
+    ]
+
+
 def test_a_adds_release_identity_to_media_commands(memory_service, monkeypatch):
     monkeypatch.setenv("STUDY1_RELEASE_ID", "study1-release-v1")
     monkeypatch.setenv("STUDY1_RELEASE_CHECKSUM", "abc123")

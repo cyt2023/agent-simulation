@@ -200,6 +200,14 @@ def _database_revisions(value: Mapping[str, Any]) -> dict[str, str]:
 
 def _automated_gates() -> list[dict[str, str]]:
     return [
+        {
+            "name": "release manifest build",
+            "command": "python scripts/build_study1_release_manifest.py --output release/study1-release-manifest.json",
+        },
+        {
+            "name": "release manifest verification",
+            "command": "python scripts/verify_study1_release.py release/study1-release-manifest.json",
+        },
         {"name": "backend study1 tests", "command": "python -m pytest -p no:cacheprovider backend/tests/study1 -q"},
         {"name": "media tests", "command": "python -m pytest -p no:cacheprovider media_service/tests -q"},
         {"name": "acceptance reconstruction", "command": "python -m pytest -p no:cacheprovider tests/acceptance -q"},
