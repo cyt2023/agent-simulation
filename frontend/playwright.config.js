@@ -1,4 +1,12 @@
 import { defineConfig, devices } from '@playwright/test'
+import { existsSync } from 'node:fs'
+import { selectBrowserChannel } from './playwright.browserChannel.js'
+
+const browserChannel = selectBrowserChannel({ exists: existsSync })
+const chromiumUse = {
+  ...devices['Desktop Chrome'],
+  ...(browserChannel ? { channel: browserChannel } : {}),
+}
 
 export default defineConfig({
   testDir: './e2e',
@@ -16,6 +24,6 @@ export default defineConfig({
     timeout: 60_000,
   },
   projects: [
-    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+    { name: 'chromium', use: chromiumUse },
   ],
 })

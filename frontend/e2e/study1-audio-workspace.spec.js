@@ -92,7 +92,7 @@ for (const viewport of [
     await expect(page.getByText('T1 private material')).toBeVisible()
     await expect(page.locator('video')).toHaveCount(0)
     await expect(page.getByText(/camera|video/i)).toHaveCount(0)
-    await expect(page.getByText('Microphone')).toBeVisible()
+    await expect(page.locator('label[for="study1-microphone"]')).toHaveText('Microphone')
     await expect(page.getByRole('button', { name: /join audio/i })).toBeVisible()
 
     await page.screenshot({

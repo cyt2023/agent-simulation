@@ -27,9 +27,10 @@ summary governance, review telemetry, export integrity, release checksum,
 audio-only meeting layout, researcher panels, and export reconstruction.
 
 If Playwright browsers are already installed, the install command can be
-skipped. If the browser download cannot complete on the local network, the e2e
-check remains unverified until the same command succeeds in CI or on a prepared
-test machine.
+skipped. On developer machines, the Playwright config also uses an installed
+Chrome or Edge browser when available, so the e2e check can still run when the
+Chromium download is blocked by the local network. CI should still install the
+bundled Chromium browser unless `PLAYWRIGHT_BROWSER_CHANNEL` is set explicitly.
 
 ## Required External Signoffs
 
