@@ -13,6 +13,8 @@ import wave
 
 from .audio import PcmWaveRecorder
 from .pipeline import ProxyMediaPipeline
+from .room_policy import stable_room_name
+from .timeline import RoomClock, recording_track_manifest
 from .voice_activity import VoiceActivityBuffer
 
 
@@ -20,6 +22,8 @@ from .voice_activity import VoiceActivityBuffer
 class RouterSession:
     runtime_id: str
     artifact_version: str
+    room_name: str
+    room_clock: RoomClock
     accepting_input: bool = True
 
 
@@ -44,6 +48,7 @@ class AudioPipelineRouter:
         self.sessions: dict[str, RouterSession] = {}
         self.detectors: dict[tuple[str, str, str], VoiceActivityBuffer] = {}
         self.recorders: dict[tuple[str, str, str], PcmWaveRecorder] = {}
+        self.recording_track_starts: dict[tuple[str, str, str], int] = {}
         self.tasks: dict[str, set[asyncio.Task]] = {}
 
     async def start_session(
@@ -62,10 +67,16 @@ class AudioPipelineRouter:
             proxy_enabled=proxy_enabled,
             artifact_version=artifact_version,
         )
+        room_name, room_clock = _resolve_room_timeline(
+            self.pipeline, session_id, runtime_id
+        )
         self.sessions.setdefault(
             session_id,
             RouterSession(
-                runtime_id=runtime_id, artifact_version=artifact_version
+                runtime_id=runtime_id,
+                artifact_version=artifact_version,
+                room_name=room_name,
+                room_clock=room_clock,
             ),
         )
         self.tasks.setdefault(session_id, set())
@@ -84,6 +95,23 @@ class AudioPipelineRouter:
                 sample_rate=sample_rate,
             )
             self.recorders[key] = recorder
+            room_start_ms = state.room_clock.now_room_ms()
+            self.recording_track_starts[key] = room_start_ms
+            self.pipeline.repository.recording_track_started(
+                track_id=recorder.path.name,
+                session_id=session_id,
+                runtime_id=state.runtime_id,
+                participant_id=speaker,
+                role=speaker,
+                room_name=state.room_name,
+                clock_id=state.room_clock.clock_id,
+                room_start_ms=room_start_ms,
+                started_at=state.room_clock.to_utc(room_start_ms),
+                codec="pcm_s16le",
+                sample_rate_hz=sample_rate,
+                content_type="audio/wav",
+                consent_scope="study1_audio_recording_and_research_export",
+            )
         return recorder
 
     async def handle_frame(self, session_id: str, speaker: str, frame) -> None:
@@ -223,6 +251,7 @@ class AudioPipelineRouter:
                 if key[0] != session_id:
                     continue
                 self.recorders.pop(key, None)
+                self.recording_track_starts.pop(key, None)
                 try:
                     recorder.close()
                 except BaseException as error:
@@ -253,6 +282,7 @@ class AudioPipelineRouter:
     def _close_recorders(self, session_id: str, runtime_id: str) -> list[dict]:
         rows: list[dict] = []
         first_error: BaseException | None = None
+        state = self.sessions.get(session_id)
         for key, recorder in list(self.recorders.items()):
             if key[:2] != (session_id, runtime_id):
                 continue
@@ -260,24 +290,26 @@ class AudioPipelineRouter:
             try:
                 recorder.close()
                 payload = recorder.path.read_bytes()
-                rows.append(
-                    {
-                        "recording_id": recorder.path.name,
-                        "runtime_id": runtime_id,
-                        "speaker": key[2],
-                        "content_type": "audio/wav",
-                        "size": len(payload),
-                        "checksum": hashlib.sha256(payload).hexdigest(),
-                        "duration_ms": _wave_duration_ms(recorder.path),
-                        "consent_scope": "study1_audio_recording_and_research_export",
-                    }
+                duration_ms = _wave_duration_ms(recorder.path)
+                room_start_ms = self.recording_track_starts.pop(key, 0)
+                room_end_ms = room_start_ms + duration_ms
+                clock = state.room_clock if state else RoomClock.start(session_id)
+                track = self.pipeline.repository.recording_track_finished(
+                    recorder.path.name,
+                    room_end_ms=room_end_ms,
+                    ended_at=clock.to_utc(room_end_ms),
+                    checksum=hashlib.sha256(payload).hexdigest(),
+                    storage_uri=f"{session_id}/{recorder.path.name}",
+                    size_bytes=len(payload),
+                    duration_ms=duration_ms,
                 )
+                rows.append(recording_track_manifest(track))
             except BaseException as error:
                 if first_error is None:
                     first_error = error
         if first_error is not None:
             raise first_error
-        return sorted(rows, key=lambda row: row["speaker"])
+        return sorted(rows, key=lambda row: row["role"])
 
     def _create_manifests(
         self,
@@ -333,6 +365,21 @@ def _wave_duration_ms(path: Path) -> int:
     with wave.open(str(path), "rb") as stream:
         frame_rate = stream.getframerate()
         return round(stream.getnframes() * 1000 / frame_rate) if frame_rate else 0
+
+
+def _resolve_room_timeline(pipeline, session_id: str, runtime_id: str):
+    repository = pipeline.repository
+    runtime = repository.active_runtime(session_id)
+    room_name = runtime.room_name if runtime else stable_room_name(session_id)
+    clock_payload = None
+    if runtime and runtime.runtime_id == runtime_id:
+        clock_payload = (runtime.runtime_config or {}).get("room_clock")
+    if clock_payload:
+        return room_name, RoomClock.from_snapshot(clock_payload)
+    clock = RoomClock.start(session_id)
+    if runtime and runtime.runtime_id == runtime_id:
+        repository.patch_runtime_config(runtime_id, {"room_clock": clock.snapshot()})
+    return room_name, clock
 
 
 def _accepts_keyword(callback, keyword: str) -> bool:

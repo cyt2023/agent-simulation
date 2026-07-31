@@ -15,6 +15,7 @@ from .models import (
     MediaAgentTurnRow,
     MediaConfigRow,
     MediaIncidentRow,
+    MediaRecordingTrackRow,
     MediaRetentionTombstoneRow,
     MediaRuntimeRow,
     MediaSummaryAttemptRow,
@@ -622,6 +623,21 @@ class MediaRepository:
                 ).all()
             )
 
+    def list_session_recording_tracks(
+        self, session_id: str
+    ) -> list[MediaRecordingTrackRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaRecordingTrackRow)
+                    .where(MediaRecordingTrackRow.session_id == session_id)
+                    .order_by(
+                        MediaRecordingTrackRow.room_start_ms,
+                        MediaRecordingTrackRow.track_id,
+                    )
+                ).all()
+            )
+
     def preflight_ready_roles(self, session_id: str) -> set[str]:
         latest: dict[str, MediaConnectionRow] = {}
         for row in self.list_session_connections(session_id):
@@ -767,6 +783,71 @@ class MediaRepository:
         with self.database.session_factory.begin() as session:
             session.add(row)
         return row
+
+    def recording_track_started(
+        self,
+        *,
+        track_id: str,
+        session_id: str,
+        runtime_id: str,
+        participant_id: str,
+        role: str,
+        room_name: str,
+        clock_id: str,
+        room_start_ms: int,
+        started_at: datetime,
+        codec: str,
+        sample_rate_hz: int,
+        content_type: str,
+        consent_scope: str,
+    ) -> MediaRecordingTrackRow:
+        row = MediaRecordingTrackRow(
+            track_id=track_id,
+            session_id=session_id,
+            runtime_id=runtime_id,
+            participant_id=participant_id,
+            role=role,
+            room_name=room_name,
+            clock_id=clock_id,
+            room_start_ms=room_start_ms,
+            started_at=started_at,
+            codec=codec,
+            sample_rate_hz=sample_rate_hz,
+            content_type=content_type,
+            consent_scope=consent_scope,
+            status="recording",
+        )
+        with self.database.session_factory.begin() as session:
+            existing = session.get(MediaRecordingTrackRow, track_id)
+            if existing:
+                return existing
+            session.add(row)
+            return row
+
+    def recording_track_finished(
+        self,
+        track_id: str,
+        *,
+        room_end_ms: int,
+        ended_at: datetime,
+        checksum: str,
+        storage_uri: str,
+        size_bytes: int,
+        duration_ms: int,
+        status: str = "complete",
+    ) -> MediaRecordingTrackRow:
+        with self.database.session_factory.begin() as session:
+            row = session.get(MediaRecordingTrackRow, track_id)
+            if not row:
+                raise KeyError(track_id)
+            row.room_end_ms = room_end_ms
+            row.ended_at = ended_at
+            row.checksum = checksum
+            row.storage_uri = storage_uri
+            row.size_bytes = size_bytes
+            row.duration_ms = duration_ms
+            row.status = status
+            return row
 
     def finish_summary_attempt(
         self,

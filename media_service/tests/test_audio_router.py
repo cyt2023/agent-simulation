@@ -140,7 +140,8 @@ async def test_router_records_human_and_proxy_tracks_and_emits_manifests(
         "agent_log_manifest",
     ]
     recordings = json.loads(artifacts[0].content)
-    assert {item["speaker"] for item in recordings} == {"teammate_1", "proxy"}
+    assert {item["role"] for item in recordings} == {"teammate_1", "proxy"}
+    assert all(item["clock_id"] == "room-clock-session-1" for item in recordings)
     agent_log = json.loads(artifacts[1].content)
     assert agent_log[0]["segment_id"] == "proxy-segment-1"
     artifact_messages = [
