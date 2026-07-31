@@ -15,6 +15,7 @@ _INITIAL_STATE = {
     MediaCommand.START_SYNC_MEETING: RuntimeState.PREPARING,
     MediaCommand.REGENERATE_SUMMARY: RuntimeState.PROCESSING,
     MediaCommand.STOP_SESSION: RuntimeState.STOPPED,
+    MediaCommand.PURGE_SESSION_MEDIA: RuntimeState.PROCESSING,
 }
 
 
@@ -40,6 +41,16 @@ def semantic_key(command: CommandEnvelope) -> str:
                 "REGENERATE_SUMMARY requires reason, source_transcript_checksum, and source_summary_version"
             )
         return f"{command.session_id}:summary:{checksum}:{version}"
+    if command.command is MediaCommand.PURGE_SESSION_MEDIA:
+        payload = command.payload
+        retention_job_id = str(payload.get("retention_job_id") or "")
+        manifest_checksum = str(payload.get("manifest_checksum") or "")
+        reason = str(payload.get("reason") or "").strip()
+        if not retention_job_id or not manifest_checksum or not reason:
+            raise ValueError(
+                "PURGE_SESSION_MEDIA requires retention_job_id, manifest_checksum, and reason"
+            )
+        return f"{command.session_id}:purge:{retention_job_id}:{manifest_checksum}"
     return f"{command.session_id}:{command.phase_version}:{command.command.value}"
 
 
@@ -49,6 +60,9 @@ class RuntimeCommands(Protocol):
     async def begin_handoff(self, session_id: str, phase_version: int): ...
     async def end_current(self, session_id: str, phase_version: int): ...
     async def stop_session(self, session_id: str, phase_version: int): ...
+    async def purge_session_media(
+        self, session_id: str, phase_version: int, payload: dict
+    ): ...
     async def regenerate_summary(
         self, session_id: str, phase_version: int, payload: dict
     ): ...
@@ -111,6 +125,10 @@ class CommandService:
         elif envelope.command is MediaCommand.STOP_SESSION:
             await self.runtime.stop_session(
                 envelope.session_id, envelope.phase_version
+            )
+        elif envelope.command is MediaCommand.PURGE_SESSION_MEDIA:
+            await self.runtime.purge_session_media(
+                envelope.session_id, envelope.phase_version, envelope.payload
             )
         elif envelope.command is MediaCommand.REGENERATE_SUMMARY:
             await self.runtime.regenerate_summary(

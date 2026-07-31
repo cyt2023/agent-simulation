@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   stableSession: null,
   fetchMe: vi.fn(),
   logReviewUiEvent: vi.fn(),
+  requestStudy1Withdrawal: vi.fn(),
   useStableAudioSession: vi.fn(),
 }))
 
@@ -29,6 +30,7 @@ vi.mock('../services/study1Api.js', () => ({
   fetchMyMaterials: vi.fn(async () => ({ materials: [] })),
   getStudy1Identity: () => mocks.identity,
   logReviewUiEvent: mocks.logReviewUiEvent,
+  requestStudy1Withdrawal: mocks.requestStudy1Withdrawal,
 }))
 
 vi.mock('../services/study1Socket.js', () => ({
@@ -73,6 +75,7 @@ describe('Study1Participant stable meeting ownership', () => {
     }
     mocks.useStableAudioSession.mockReturnValue(mocks.stableSession)
     mocks.logReviewUiEvent.mockResolvedValue({ event_id: 'event-1' })
+    mocks.requestStudy1Withdrawal.mockResolvedValue({ accepted: true })
     mocks.fetchMe.mockImplementation(async () => ({
       identity: mocks.identity,
       session: mocks.session,
@@ -140,5 +143,35 @@ describe('Study1Participant stable meeting ownership', () => {
       sample,
     )
     wrapper.unmount()
+  })
+
+  it('lets participants submit withdrawal requests after completion', async () => {
+    mocks.identity = {
+      participant_id: 'participant-p',
+      session_id: 'session-1',
+      role: 'principal',
+    }
+    mocks.session = session('COMPLETED', 14)
+    const wrapper = mount(Study1Participant, {
+      global: {
+        stubs: {
+          PhaseHeader: true,
+          CompletionPhase: true,
+          Study1DeviceCheck: true,
+        },
+      },
+    })
+    await flushPromises()
+
+    await wrapper.get('[data-test="withdrawal-reason"]').setValue('Please review withdrawal.')
+    await wrapper.get('[data-test="confirm-withdrawal"]').setValue(true)
+    await wrapper.get('[data-test="submit-withdrawal"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.requestStudy1Withdrawal).toHaveBeenCalledWith('session-1', {
+      request_type: 'withdrawal',
+      reason: 'Please review withdrawal.',
+      confirmation: true,
+    })
   })
 })

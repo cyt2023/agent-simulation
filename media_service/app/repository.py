@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import uuid
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .db import Database
@@ -13,6 +13,7 @@ from .models import (
     MediaCommandRow,
     MediaConnectionRow,
     MediaIncidentRow,
+    MediaRetentionTombstoneRow,
     MediaRuntimeRow,
     OutboxMessageRow,
     TranscriptSegmentRow,
@@ -652,5 +653,101 @@ class MediaRepository:
                     select(MediaIncidentRow)
                     .where(MediaIncidentRow.session_id == session_id)
                     .order_by(MediaIncidentRow.created_at)
+                ).all()
+            )
+
+    def purge_session_media(
+        self,
+        session_id: str,
+        *,
+        retention_job_id: str,
+        manifest_checksum: str,
+        reason: str,
+        phase_version: int = 1,
+    ) -> MediaRetentionTombstoneRow:
+        tombstone_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"study1-media-retention:{session_id}:{retention_job_id}",
+            )
+        )
+        event_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"study1-media-purged:{session_id}:{retention_job_id}:{manifest_checksum}",
+            )
+        )
+        with self.database.session_factory.begin() as session:
+            existing = session.get(MediaRetentionTombstoneRow, tombstone_id)
+            if existing:
+                return existing
+            purged_counts = {
+                "transcript_segments": len(
+                    session.scalars(
+                        select(TranscriptSegmentRow).where(
+                            TranscriptSegmentRow.session_id == session_id
+                        )
+                    ).all()
+                ),
+                "artifacts": len(
+                    session.scalars(
+                        select(MediaArtifactRow).where(
+                            MediaArtifactRow.session_id == session_id
+                        )
+                    ).all()
+                ),
+                "incidents": len(
+                    session.scalars(
+                        select(MediaIncidentRow).where(
+                            MediaIncidentRow.session_id == session_id
+                        )
+                    ).all()
+                ),
+            }
+            session.execute(
+                delete(TranscriptSegmentRow).where(
+                    TranscriptSegmentRow.session_id == session_id
+                )
+            )
+            session.execute(
+                delete(MediaArtifactRow).where(MediaArtifactRow.session_id == session_id)
+            )
+            session.execute(
+                delete(MediaIncidentRow).where(MediaIncidentRow.session_id == session_id)
+            )
+            tombstone = MediaRetentionTombstoneRow(
+                tombstone_id=tombstone_id,
+                session_id=session_id,
+                retention_job_id=retention_job_id,
+                manifest_checksum=manifest_checksum,
+                reason=reason,
+                purged_counts=purged_counts,
+            )
+            session.add(tombstone)
+            if session.get(OutboxMessageRow, event_id) is None:
+                session.add(
+                    OutboxMessageRow(
+                        event_id=event_id,
+                        session_id=session_id,
+                        phase_version=max(1, int(phase_version or 1)),
+                        event_type="MEDIA_PURGED",
+                        payload={
+                            "retention_job_id": retention_job_id,
+                            "manifest_checksum": manifest_checksum,
+                            "purged_counts": purged_counts,
+                        },
+                    )
+                )
+            return tombstone
+
+    def list_session_retention_tombstones(
+        self, session_id: str
+    ) -> list[MediaRetentionTombstoneRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaRetentionTombstoneRow)
+                    .where(MediaRetentionTombstoneRow.session_id == session_id)
+                    .order_by(MediaRetentionTombstoneRow.created_at)
                 ).all()
             )

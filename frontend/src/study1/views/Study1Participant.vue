@@ -12,6 +12,7 @@ import CompletionPhase from '../components/CompletionPhase.vue'
 import Study1MeetingWorkspace from '../components/Study1MeetingWorkspace.vue'
 import Study1DeviceCheck from '../components/Study1DeviceCheck.vue'
 import ConsentPhase from '../components/ConsentPhase.vue'
+import WithdrawalPhase from '../components/WithdrawalPhase.vue'
 import { useStableAudioSession } from '../composables/useStableAudioSession.js'
 import {
   clearStudy1Auth,
@@ -21,6 +22,7 @@ import {
   fetchMyMaterials,
   getStudy1Identity,
   logReviewUiEvent,
+  requestStudy1Withdrawal,
 } from '../services/study1Api.js'
 import {
   joinStudy1Session,
@@ -166,6 +168,20 @@ async function submit(type, payload) {
     await createSubmission(identity.value.session_id, type, payload, '2.0')
     showTransientNotice('Saved and locked. Please wait for the researcher.')
     await refresh()
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function submitWithdrawal(payload) {
+  busy.value = true
+  clearError()
+  clearNotice()
+  try {
+    await requestStudy1Withdrawal(identity.value.session_id, payload)
+    showTransientNotice('Withdrawal request submitted for privacy review.')
   } catch (reason) {
     showError(reason)
   } finally {
@@ -340,7 +356,15 @@ onUnmounted(() => {
           :busy="busy"
           @submit="submit('post_survey', $event)"
         />
-        <CompletionPhase v-else-if="phase === 'COMPLETED'" />
+        <section v-else-if="phase === 'COMPLETED'">
+          <CompletionPhase />
+          <WithdrawalPhase
+            :session-id="identity.session_id"
+            :role="role"
+            :busy="busy"
+            @submit="submitWithdrawal"
+          />
+        </section>
       </div>
     </template>
   </main>

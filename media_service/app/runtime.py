@@ -53,6 +53,8 @@ class MediaLifecycle(Protocol):
         self, session_id: str, phase_version: int, payload: dict
     ) -> None: ...
 
+    async def purge_session_media(self, session_id: str, payload: dict) -> None: ...
+
 
 def room_name(session_id: str, room_kind: str, phase_version: int) -> str:
     return stable_room_name(session_id)
@@ -439,6 +441,22 @@ class RuntimeCoordinator:
         if not self.lifecycle:
             return
         await self.lifecycle.regenerate_summary(session_id, phase_version, payload)
+
+    async def purge_session_media(
+        self, session_id: str, phase_version: int, payload: dict
+    ) -> None:
+        runtime = self.repository.active_runtime(session_id)
+        if runtime:
+            await self.stop_session(session_id, phase_version)
+        if self.lifecycle and hasattr(self.lifecycle, "purge_session_media"):
+            await self.lifecycle.purge_session_media(session_id, payload)
+        self.repository.purge_session_media(
+            session_id,
+            retention_job_id=str(payload.get("retention_job_id") or ""),
+            manifest_checksum=str(payload.get("manifest_checksum") or ""),
+            reason=str(payload.get("reason") or "Retention purge"),
+            phase_version=phase_version,
+        )
 
     async def participant_state_changed(
         self,

@@ -114,6 +114,19 @@ class MediaIncidentRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class MediaRetentionTombstoneRow(Base):
+    __tablename__ = "retention_tombstones"
+    __table_args__ = ({"schema": "media"},)
+
+    tombstone_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    retention_job_id: Mapped[str] = mapped_column(String(128), index=True)
+    manifest_checksum: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(Text)
+    purged_counts: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class OutboxMessageRow(Base):
     __tablename__ = "outbox"
     __table_args__ = ({"schema": "media"},)

@@ -100,6 +100,13 @@ export function fetchStudy1PrivacyScopes() {
   return request('/api/study1/privacy/scopes')
 }
 
+export function requestStudy1Withdrawal(sessionId, payload) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/privacy/withdrawal-requests`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
 export function createStudy1Session(payload) {
   return request('/api/study1/sessions', {
     method: 'POST',

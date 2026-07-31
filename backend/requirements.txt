@@ -12,5 +12,6 @@ PyPDF2>=3.0.0
 pdfplumber>=0.10.0
 PyYAML>=6.0.0
 pytest>=8.0.0
+cryptography>=42.0.0
 # Optional: anthropic>=0.18.0  # Uncomment if using Claude
 
