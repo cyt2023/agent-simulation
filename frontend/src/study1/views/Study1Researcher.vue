@@ -2,6 +2,10 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import PhaseHeader from '../components/PhaseHeader.vue'
 import Study1FilePicker from '../components/Study1FilePicker.vue'
+import MediaHealthPanel from '../components/MediaHealthPanel.vue'
+import ProtocolIntegrityPanel from '../components/ProtocolIntegrityPanel.vue'
+import ResearcherReplayList from '../components/ResearcherReplayList.vue'
+import SummaryQaPanel from '../components/SummaryQaPanel.vue'
 import {
   addStudy1Incident,
   addTranscriptCorrection,
@@ -30,7 +34,6 @@ import {
   canEndMeeting,
   startCommandForPhase,
 } from '../services/mediaControls.js'
-import { displayMicrophoneLabel } from '../services/uiLabels.js'
 import {
   joinStudy1Session,
   leaveStudy1Session,
@@ -64,60 +67,9 @@ const replayPlans = ref([])
 const invites = ref([])
 const busy = ref(false)
 const error = ref('')
-const researcherMarker = ref({
-  type: 'technical',
-  start_second: 0,
-  end_second: 0,
-  reason: '',
-  participant_visible: false,
-})
-const replayPlanForm = ref({
-  marker_ids: '',
-  context_seconds: 10,
-})
-const summaryQaForm = ref({
-  summary_artifact_id: '',
-  omission_error: false,
-  misattribution_error: false,
-  hallucination_error: false,
-  decision_status_error: false,
-  action_item_error: false,
-  note: '',
-})
 let refreshTimer = null
 
 const nextPhase = computed(() => dashboard.value?.next_phase || null)
-const researcherMarkerTypes = [
-  { value: 'technical', label: 'Technical' },
-  { value: 'other', label: 'Other' },
-  { value: 'confusing', label: 'Confusing' },
-  { value: 'unexpected', label: 'Unexpected' },
-  { value: 'uncomfortable', label: 'Uncomfortable' },
-  { value: 'key_decision', label: 'Key decision' },
-]
-const canSubmitResearcherMarker = computed(() => (
-  !busy.value
-  && researcherMarker.value.type
-  && researcherMarker.value.reason.trim()
-  && Number(researcherMarker.value.start_second) >= 0
-  && Number(researcherMarker.value.end_second) >= Number(researcherMarker.value.start_second)
-))
-const summaryQaNeedsNote = computed(() => (
-  summaryQaForm.value.omission_error
-  || summaryQaForm.value.misattribution_error
-  || summaryQaForm.value.hallucination_error
-  || summaryQaForm.value.decision_status_error
-  || summaryQaForm.value.action_item_error
-))
-const canSubmitReplayPlan = computed(() => (
-  !busy.value
-  && replayPlanForm.value.marker_ids.trim()
-))
-const canSubmitSummaryQa = computed(() => (
-  !busy.value
-  && summaryQaForm.value.summary_artifact_id.trim()
-  && (!summaryQaNeedsNote.value || summaryQaForm.value.note.trim())
-))
 
 async function login() {
   busy.value = true
@@ -313,19 +265,12 @@ async function addIncident() {
   }
 }
 
-async function submitResearcherMarker() {
-  if (!selectedSessionId.value || !canSubmitResearcherMarker.value) return
+async function submitResearcherMarker(payload) {
+  if (!selectedSessionId.value) return
   busy.value = true
   error.value = ''
   try {
-    await createMarker(selectedSessionId.value, {
-      type: researcherMarker.value.type,
-      start_ms: Math.round(Number(researcherMarker.value.start_second) * 1000),
-      end_ms: Math.round(Number(researcherMarker.value.end_second) * 1000),
-      reason: researcherMarker.value.reason.trim(),
-      participant_visible: Boolean(researcherMarker.value.participant_visible),
-    })
-    researcherMarker.value.reason = ''
+    await createMarker(selectedSessionId.value, payload)
     await refreshDashboard()
   } catch (failure) {
     error.value = failure.message
@@ -334,19 +279,12 @@ async function submitResearcherMarker() {
   }
 }
 
-async function submitReplayPlan() {
-  if (!selectedSessionId.value || !canSubmitReplayPlan.value) return
+async function submitReplayPlan(payload) {
+  if (!selectedSessionId.value) return
   busy.value = true
   error.value = ''
   try {
-    await createReplayPlan(selectedSessionId.value, {
-      marker_ids: replayPlanForm.value.marker_ids
-        .split(',')
-        .map(item => item.trim())
-        .filter(Boolean),
-      context_seconds: Number(replayPlanForm.value.context_seconds) || 0,
-    })
-    replayPlanForm.value.marker_ids = ''
+    await createReplayPlan(selectedSessionId.value, payload)
     await refreshDashboard()
   } catch (failure) {
     error.value = failure.message
@@ -355,22 +293,15 @@ async function submitReplayPlan() {
   }
 }
 
-async function submitSummaryQaForm() {
-  if (!selectedSessionId.value || !canSubmitSummaryQa.value) return
+async function submitSummaryQaForm(payload) {
+  if (!selectedSessionId.value) return
   busy.value = true
   error.value = ''
   try {
     await submitSummaryQa(
       selectedSessionId.value,
-      summaryQaForm.value.summary_artifact_id.trim(),
-      {
-        omission_error: Boolean(summaryQaForm.value.omission_error),
-        misattribution_error: Boolean(summaryQaForm.value.misattribution_error),
-        hallucination_error: Boolean(summaryQaForm.value.hallucination_error),
-        decision_status_error: Boolean(summaryQaForm.value.decision_status_error),
-        action_item_error: Boolean(summaryQaForm.value.action_item_error),
-        note: summaryQaForm.value.note.trim(),
-      },
+      payload.summary_artifact_id,
+      payload.ratings,
     )
     await refreshDashboard()
   } catch (failure) {
@@ -582,173 +513,22 @@ onUnmounted(() => {
           </table>
           <p><strong>Not submitted:</strong> {{ dashboard.not_submitted.join(', ') || 'none' }}</p>
         </section>
-        <section class="panel media-operations">
-          <div class="panel-heading">
-            <div>
-              <h2>Meeting and Proxy service</h2>
-              <p>{{ mediaStatus?.service_status || 'checking' }}</p>
-            </div>
-            <span class="service-state" :data-state="mediaStatus?.service_status">
-              {{ mediaStatus?.runtime_state || 'IDLE' }}
-            </span>
-          </div>
-          <dl class="media-grid">
-            <div><dt>Room</dt><dd>{{ mediaStatus?.room_kind || 'none' }}<small>{{ mediaStatus?.room_name || 'none' }}</small></dd></div>
-            <div><dt>ASR</dt><dd>{{ mediaStatus?.components?.asr?.status || 'unknown' }}<small>{{ mediaStatus?.components?.asr?.last_error_code || 'none' }}</small></dd></div>
-            <div><dt>Proxy</dt><dd>{{ mediaStatus?.components?.proxy?.status || 'unknown' }}<small>{{ mediaStatus?.components?.proxy?.last_error_code || 'none' }}</small></dd></div>
-            <div><dt>Recording</dt><dd>{{ mediaStatus?.components?.recorder?.status || 'unknown' }}<small>{{ mediaStatus?.pending_callback_count || 0 }} callbacks pending</small></dd></div>
-          </dl>
-          <table v-if="mediaStatus?.connections?.length">
-            <thead><tr><th>Media participant</th><th>Role</th><th>Connection</th><th>Device</th></tr></thead>
-            <tbody>
-              <tr v-for="(connection, index) in mediaStatus.connections" :key="connection.participant_id">
-                <td>{{ connection.participant_id }}</td>
-                <td>{{ connection.role }}</td>
-                <td>{{ connection.state }}</td>
-                <td>{{ displayMicrophoneLabel(connection.device?.label, index) }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <p v-if="mediaStatus?.error" class="error">{{ mediaStatus.error }}</p>
-        </section>
-        <section class="panel audit-panel">
-          <h2>Markers and replay</h2>
-          <form class="audit-form" @submit.prevent="submitResearcherMarker">
-            <h3>Create researcher marker</h3>
-            <div class="audit-form-grid">
-              <label>
-                Marker type
-                <select v-model="researcherMarker.type" data-test="researcher-marker-type">
-                  <option v-for="type in researcherMarkerTypes" :key="type.value" :value="type.value">
-                    {{ type.label }}
-                  </option>
-                </select>
-              </label>
-              <label>
-                Start second
-                <input v-model.number="researcherMarker.start_second" data-test="researcher-marker-start" type="number" min="0">
-              </label>
-              <label>
-                End second
-                <input v-model.number="researcherMarker.end_second" data-test="researcher-marker-end" type="number" min="0">
-              </label>
-            </div>
-            <label>
-              Reason
-              <textarea v-model="researcherMarker.reason" data-test="researcher-marker-reason" rows="3" />
-            </label>
-            <label class="toggle-row">
-              <input v-model="researcherMarker.participant_visible" data-test="researcher-marker-visible" type="checkbox">
-              Visible to participants
-            </label>
-            <button data-test="researcher-marker-submit" :disabled="!canSubmitResearcherMarker" type="submit">
-              Save researcher marker
-            </button>
-          </form>
-          <form class="audit-form replay-form" @submit.prevent="submitReplayPlan">
-            <h3>Create replay plan</h3>
-            <div class="audit-form-grid">
-              <label>
-                Marker IDs
-                <input
-                  v-model="replayPlanForm.marker_ids"
-                  data-test="researcher-replay-marker-ids"
-                  placeholder="marker-1, marker-2"
-                >
-              </label>
-              <label>
-                Context seconds
-                <input
-                  v-model.number="replayPlanForm.context_seconds"
-                  data-test="researcher-replay-context"
-                  type="number"
-                  min="0"
-                  max="300"
-                >
-              </label>
-            </div>
-            <button data-test="researcher-replay-submit" :disabled="!canSubmitReplayPlan" type="submit">
-              Generate replay plan
-            </button>
-          </form>
-          <form class="audit-form summary-qa-form" @submit.prevent="submitSummaryQaForm">
-            <h3>Summary QA</h3>
-            <div class="audit-form-grid">
-              <label>
-                Summary artifact ID
-                <input v-model="summaryQaForm.summary_artifact_id" data-test="summary-qa-artifact-id">
-              </label>
-              <label class="toggle-row">
-                <input v-model="summaryQaForm.omission_error" data-test="summary-qa-omission" type="checkbox">
-                Omission error
-              </label>
-              <label class="toggle-row">
-                <input v-model="summaryQaForm.misattribution_error" data-test="summary-qa-misattribution" type="checkbox">
-                Misattribution error
-              </label>
-              <label class="toggle-row">
-                <input v-model="summaryQaForm.hallucination_error" data-test="summary-qa-hallucination" type="checkbox">
-                Hallucination error
-              </label>
-              <label class="toggle-row">
-                <input v-model="summaryQaForm.decision_status_error" data-test="summary-qa-decision-status" type="checkbox">
-                Decision status error
-              </label>
-              <label class="toggle-row">
-                <input v-model="summaryQaForm.action_item_error" data-test="summary-qa-action-item" type="checkbox">
-                Action item error
-              </label>
-            </div>
-            <label>
-              Note
-              <textarea v-model="summaryQaForm.note" data-test="summary-qa-note" rows="3" />
-            </label>
-            <button data-test="summary-qa-submit" :disabled="!canSubmitSummaryQa" type="submit">
-              Save summary QA
-            </button>
-          </form>
-          <div class="audit-grid">
-            <div>
-              <h3>Markers</h3>
-              <p>{{ markers.length }} marker(s) captured for this session.</p>
-            </div>
-            <div>
-              <h3>Replay plans</h3>
-              <p>{{ replayPlans.length }} replay plan(s) generated for this session.</p>
-            </div>
-          </div>
-          <div class="quality-grid">
-            <div>
-              <h3>Quality snapshot</h3>
-              <p>RTC status: {{ qualitySnapshot?.rtc?.status || 'unknown' }}</p>
-              <p>Fresh participants: {{ qualitySnapshot?.rtc?.fresh_participant_count ?? 0 }}</p>
-              <p>Stale participants: {{ qualitySnapshot?.rtc?.stale_participant_count ?? 0 }}</p>
-            </div>
-            <div>
-              <h3>Components</h3>
-              <ul class="component-list">
-                <li v-for="component in ['recorder', 'asr', 'llm', 'tts', 'proxy']" :key="component">
-                  <strong>{{ component }}</strong>
-                  <span>{{ qualitySnapshot?.components?.[component]?.status || mediaStatus?.components?.[component]?.status || 'unknown' }}</span>
-                </li>
-              </ul>
-            </div>
-          </div>
-          <ul v-if="markers.length" class="audit-list">
-            <li v-for="marker in markers" :key="marker.marker_id">
-              <strong>{{ marker.type || marker.marker_type }}</strong>
-              <span>{{ Math.round((marker.start_ms || 0) / 1000) }}s - {{ Math.round((marker.end_ms || 0) / 1000) }}s</span>
-              <p>{{ marker.reason }}</p>
-            </li>
-          </ul>
-          <ul v-if="replayPlans.length" class="audit-list">
-            <li v-for="plan in replayPlans" :key="plan.replay_plan_id">
-              <strong>Replay plan {{ plan.version }}</strong>
-              <span>{{ plan.items?.length || 0 }} item(s)</span>
-              <p>{{ plan.items?.map(item => `${item.start_second}-${item.end_second}s`).join(', ') }}</p>
-            </li>
-          </ul>
-        </section>
+        <MediaHealthPanel
+          :media-status="mediaStatus"
+          :quality-snapshot="qualitySnapshot"
+        />
+        <ResearcherReplayList
+          :busy="busy"
+          :markers="markers"
+          :replay-plans="replayPlans"
+          @create-marker="submitResearcherMarker"
+          @create-replay-plan="submitReplayPlan"
+        />
+        <SummaryQaPanel
+          :busy="busy"
+          @submit="submitSummaryQaForm"
+        />
+        <ProtocolIntegrityPanel :dashboard="dashboard" />
         <section class="controls" aria-label="Session controls">
           <div class="primary-controls">
             <button
@@ -863,28 +643,7 @@ th,td { text-align:left; border-bottom:1px solid #dde4ea; padding:.65rem; }
 .control-button--media:not(:disabled):hover { background:#493b78; }
 .supporting-controls { display:flex; align-items:center; justify-content:space-between; gap:.85rem; padding-top:.85rem; border-top:1px solid #dce3e9; }
 .secondary-controls button,.safety-controls button { padding:.48rem .7rem; font-size:.86rem; font-weight:650; }
-.panel-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; }
-.panel-heading h2,.panel-heading p { margin:0; }
-.panel-heading p { margin-top:.25rem; color:#667786; text-transform:capitalize; }
-.service-state { padding:.35rem .55rem; border:1px solid #c6d0d8; border-radius:6px; color:#536471; font-size:.78rem; }
-.service-state[data-state="ok"] { border-color:#70a883; background:#edf8f1; color:#17633c; }
-.media-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1rem; margin:1.25rem 0; }
-.media-grid div { min-width:0; border-left:3px solid #cad5dc; padding-left:.75rem; }
-.media-grid dt { color:#667786; font-size:.75rem; font-weight:700; text-transform:uppercase; }
-.media-grid dd { margin:.25rem 0 0; font-weight:700; overflow-wrap:anywhere; }
-.media-grid small { display:block; margin-top:.2rem; color:#70808c; font-weight:400; }
-.audit-form { display:grid; gap:1rem; margin-bottom:1.25rem; padding:1rem; border:1px solid #dce3e9; border-radius:10px; background:#fff; }
-.audit-form h3 { margin:0; }
-.audit-form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:1rem; }
-.toggle-row { display:flex; align-items:center; gap:.55rem; font-weight:600; }
-.audit-grid,.quality-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:1rem; }
-.audit-grid h3,.quality-grid h3 { margin:0 0 .5rem; font-size:1rem; }
-.component-list,.audit-list { display:grid; gap:.65rem; margin:0; padding:0; list-style:none; }
-.component-list li,.audit-list li { padding:.75rem; border:1px solid #dce3e9; border-radius:8px; background:#fff; display:grid; gap:.25rem; }
-.component-list strong,.audit-list strong { text-transform:capitalize; }
-.component-list span,.audit-list span { color:#667786; font-size:.85rem; }
 @media (max-width:720px) {
-  .media-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
   .primary-controls { display:grid; grid-template-columns:1fr; }
   .control-button--major { width:100%; }
   .supporting-controls { align-items:flex-start; flex-direction:column; }

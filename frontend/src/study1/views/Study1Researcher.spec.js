@@ -125,7 +125,7 @@ it('shows markers, replay, and quality controls after selecting a session', asyn
   expect(fetchMediaStatus).toHaveBeenCalledWith('session-1')
   expect(fetchQualitySnapshot).toHaveBeenCalledWith('session-1')
   expect(wrapper.text()).toContain('Markers and replay')
-  expect(wrapper.text()).toContain('Quality snapshot')
+  expect(wrapper.text()).toContain('p95 RTT 240 ms')
   wrapper.unmount()
 })
 

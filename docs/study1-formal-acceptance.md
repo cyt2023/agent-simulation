@@ -18,11 +18,18 @@ python -m pytest -p no:cacheprovider backend/tests/study1 media_service/tests te
 cd frontend
 npm.cmd test -- --run
 npm.cmd run build
+npx.cmd playwright install chromium
+npm.cmd run test:e2e
 ```
 
 These checks verify role permissions, phase control, media command contracts,
-summary governance, review telemetry, export integrity, release checksum, and
-export reconstruction.
+summary governance, review telemetry, export integrity, release checksum,
+audio-only meeting layout, researcher panels, and export reconstruction.
+
+If Playwright browsers are already installed, the install command can be
+skipped. If the browser download cannot complete on the local network, the e2e
+check remains unverified until the same command succeeds in CI or on a prepared
+test machine.
 
 ## Required External Signoffs
 
