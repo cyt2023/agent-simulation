@@ -9,8 +9,12 @@ from sqlalchemy.pool import StaticPool
 
 
 BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if BACKEND_ROOT not in sys.path:
-    sys.path.insert(0, BACKEND_ROOT)
+REPOSITORY_ROOT = os.path.dirname(BACKEND_ROOT)
+for path in (BACKEND_ROOT, REPOSITORY_ROOT):
+    while path in sys.path:
+        sys.path.remove(path)
+sys.path.insert(0, BACKEND_ROOT)
+sys.path.insert(0, REPOSITORY_ROOT)
 
 
 @pytest.fixture

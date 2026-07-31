@@ -4,11 +4,14 @@ import { useRoute, useRouter } from 'vue-router'
 import PhaseHeader from '../components/PhaseHeader.vue'
 import MaterialPhase from '../components/MaterialPhase.vue'
 import VotePhase from '../components/VotePhase.vue'
+import InstrumentPhase from '../components/InstrumentPhase.vue'
+import SharedArtifactPhase from '../components/SharedArtifactPhase.vue'
 import ProxyConfigPhase from '../components/ProxyConfigPhase.vue'
 import WaitingRoom from '../components/WaitingRoom.vue'
 import ReviewPhase from '../components/ReviewPhase.vue'
 import SurveyPhase from '../components/SurveyPhase.vue'
 import CompletionPhase from '../components/CompletionPhase.vue'
+import MarkerPhase from '../components/MarkerPhase.vue'
 import Study1MeetingWorkspace from '../components/Study1MeetingWorkspace.vue'
 import Study1DeviceCheck from '../components/Study1DeviceCheck.vue'
 import ConsentPhase from '../components/ConsentPhase.vue'
@@ -16,13 +19,19 @@ import WithdrawalPhase from '../components/WithdrawalPhase.vue'
 import { useStableAudioSession } from '../composables/useStableAudioSession.js'
 import {
   clearStudy1Auth,
+  confirmSharedArtifactRevision,
   createSubmission,
+  createSharedArtifactRevision,
   exchangeInvite,
+  fetchCurrentInstrument,
   fetchMe,
   fetchMyMaterials,
+  fetchSharedArtifact,
   getStudy1Identity,
   logReviewUiEvent,
   requestStudy1Withdrawal,
+  submitIndividualDecision,
+  submitInstrumentResponse,
 } from '../services/study1Api.js'
 import {
   joinStudy1Session,
@@ -40,14 +49,33 @@ const notice = ref('')
 const session = ref(null)
 const identity = ref(getStudy1Identity())
 const materials = ref([])
+const currentInstrument = ref(null)
+const sharedArtifacts = ref({
+  team_final: null,
+  followup_task: null,
+})
 let errorTimer = null
 let noticeTimer = null
+
+const formalInstrumentPhases = new Set([
+  'PRE_VOTE',
+  'TENTATIVE_DECISION',
+  'FINAL_DECISION',
+  'POST_SURVEY',
+])
 
 const phase = computed(() => session.value?.phase || 'SETUP')
 const role = computed(() => identity.value?.role || '')
 const isParticipant = computed(() => ['principal', 'teammate_1', 'teammate_2'].includes(role.value))
+const capabilities = computed(() => session.value?.capabilities || {})
 const completedActions = computed(() => new Set(session.value?.my_completed_actions || []))
 const hasCompleted = type => completedActions.value.has(`${type}:${role.value}`)
+const hasAnyCompleted = types => types.some(type => hasCompleted(type))
+const currentCandidates = computed(() => (
+  currentInstrument.value?.candidate_ids
+  || currentInstrument.value?.candidates
+  || []
+))
 
 async function reportRtcTelemetry(sample) {
   const sessionId = identity.value?.session_id
@@ -125,6 +153,28 @@ async function refresh() {
   ) {
     materials.value = (await fetchMyMaterials(identity.value.session_id)).materials
   }
+  await loadPhaseAssets()
+}
+
+async function loadPhaseAssets() {
+  if (!identity.value?.session_id) return
+  const sessionId = identity.value.session_id
+  const shouldLoadInstrument = formalInstrumentPhases.has(phase.value)
+  const sharedArtifactKind = {
+    FINAL_DECISION: 'team_final',
+    FOLLOWUP_TASK: 'followup_task',
+  }[phase.value]
+
+  currentInstrument.value = shouldLoadInstrument
+    ? await fetchCurrentInstrument(sessionId)
+    : null
+
+  if (sharedArtifactKind) {
+    sharedArtifacts.value = {
+      ...sharedArtifacts.value,
+      [sharedArtifactKind]: await fetchSharedArtifact(sessionId, sharedArtifactKind),
+    }
+  }
 }
 
 async function bootstrap() {
@@ -182,6 +232,71 @@ async function submitWithdrawal(payload) {
   try {
     await requestStudy1Withdrawal(identity.value.session_id, payload)
     showTransientNotice('Withdrawal request submitted for privacy review.')
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function submitDecision(decisionKind, payload) {
+  busy.value = true
+  clearError()
+  clearNotice()
+  try {
+    await submitIndividualDecision(identity.value.session_id, decisionKind, payload)
+    showTransientNotice('Saved and locked. Please wait for the researcher.')
+    await refresh()
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function submitInstrument(payload) {
+  busy.value = true
+  clearError()
+  clearNotice()
+  try {
+    await submitInstrumentResponse(
+      identity.value.session_id,
+      payload.instrument_definition_id,
+      payload.instrument_version,
+      payload.ordered_responses,
+    )
+    showTransientNotice('Saved and locked. Please wait for the researcher.')
+    await refresh()
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function saveSharedArtifact(kind, payload) {
+  busy.value = true
+  clearError()
+  clearNotice()
+  try {
+    await createSharedArtifactRevision(identity.value.session_id, kind, payload)
+    showTransientNotice('Shared revision saved.')
+    await refresh()
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function confirmSharedArtifact(kind, revisionId) {
+  busy.value = true
+  clearError()
+  clearNotice()
+  try {
+    await confirmSharedArtifactRevision(identity.value.session_id, kind, revisionId)
+    showTransientNotice('Shared revision confirmed.')
+    await refresh()
   } catch (reason) {
     showError(reason)
   } finally {
@@ -261,8 +376,11 @@ onUnmounted(() => {
           v-if="phase === 'TENTATIVE_DECISION'"
           title="Tentative decision"
           variant="tentative"
+          :candidates="currentCandidates"
           :busy="busy"
-          @submit="submit('tentative_decision', $event)"
+          :locked="hasAnyCompleted(['tentative_individual', 'tentative_decision'])"
+          :available="Boolean(capabilities.submit_tentative_individual)"
+          @submit="submitDecision('tentative_individual', $event)"
         />
         <WaitingRoom
           v-else-if="['DELEGATION_EXPECTATION', 'REVIEW', 'COMPREHENSION_MEASUREMENT'].includes(phase)"
@@ -296,9 +414,11 @@ onUnmounted(() => {
           v-else-if="phase === 'PRE_VOTE'"
           title="Initial judgment"
           variant="pre"
+          :candidates="currentCandidates"
           :busy="busy"
-          :locked="hasCompleted(role === 'principal' ? 'proxy_config' : 'proxy_ready')"
-          @submit="submit('pre_vote', $event)"
+          :locked="hasAnyCompleted(['pre_individual', 'pre_vote'])"
+          :available="Boolean(capabilities.submit_pre_individual)"
+          @submit="submitDecision('pre_individual', $event)"
         />
         <ProxyConfigPhase
           v-else-if="phase === 'PROXY_CONFIGURATION'"
@@ -335,29 +455,53 @@ onUnmounted(() => {
           @submit="submit('comprehension_measurement', $event)"
         />
         <WaitingRoom v-else-if="phase === 'COMPREHENSION_MEASUREMENT'" />
-        <VotePhase
-          v-else-if="phase === 'FINAL_DECISION'"
-          title="Final decision"
-          variant="final"
-          :busy="busy"
-          @submit="submit('final_decision', $event)"
-        />
-        <SurveyPhase
+        <section v-else-if="phase === 'FINAL_DECISION'" class="final-decision-grid">
+          <SharedArtifactPhase
+            title="Shared team final decision"
+            kind="team_final"
+            :role="role"
+            :candidates="currentCandidates"
+            :artifact="sharedArtifacts.team_final"
+            :busy="busy"
+            :can-edit="Boolean(capabilities.edit_team_final)"
+            :can-confirm="Boolean(capabilities.confirm_team_final)"
+            @edit="saveSharedArtifact('team_final', $event)"
+            @confirm="confirmSharedArtifact('team_final', $event)"
+          />
+          <VotePhase
+            title="Private final decision"
+            variant="final"
+            :candidates="currentCandidates"
+            :busy="busy"
+            :locked="hasAnyCompleted(['final_individual', 'final_decision'])"
+            :available="Boolean(capabilities.submit_final_individual)"
+            @submit="submitDecision('final_individual', $event)"
+          />
+        </section>
+        <SharedArtifactPhase
           v-else-if="phase === 'FOLLOWUP_TASK'"
           title="Follow-up collaboration task"
-          instrument="followup_task"
+          kind="followup_task"
+          :role="role"
+          :artifact="sharedArtifacts.followup_task"
           :busy="busy"
-          @submit="submit('followup_task', $event)"
+          :can-edit="Boolean(capabilities.edit_followup_task)"
+          :can-confirm="Boolean(capabilities.confirm_followup_task)"
+          @edit="saveSharedArtifact('followup_task', $event)"
+          @confirm="confirmSharedArtifact('followup_task', $event)"
         />
-        <SurveyPhase
+        <InstrumentPhase
           v-else-if="phase === 'POST_SURVEY'"
           title="Final questionnaire"
-          instrument="post_survey"
+          :instrument="currentInstrument"
           :busy="busy"
-          @submit="submit('post_survey', $event)"
+          :locked="hasCompleted('post_survey')"
+          :available="Boolean(capabilities.submit_post_survey)"
+          @submit="submitInstrument"
         />
         <section v-else-if="phase === 'COMPLETED'">
           <CompletionPhase />
+          <MarkerPhase :session-id="identity.session_id" />
           <WithdrawalPhase
             :session-id="identity.session_id"
             :role="role"
@@ -376,6 +520,7 @@ onUnmounted(() => {
 .card { background:#f9fbfc; border:1px solid #dce3e9; border-radius:8px; margin-top:1.25rem; padding:1.5rem; box-shadow:0 10px 28px rgba(39,58,74,.06); }
 .role-label { color:#667482; font-size:.85rem; text-transform:capitalize; }
 .meeting-guidance { margin:0; color:#5f6f79; line-height:1.55; }
+.final-decision-grid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:1.25rem; }
 .message { padding:.75rem 1rem; border-radius:8px; animation:message-in .18s ease-out; }
 .error { background:#fff0f0; color:#9b2828; }
 .success { background:#e9f7ef; color:#17633c; }
@@ -383,4 +528,5 @@ onUnmounted(() => {
 button { border:0; border-radius:8px; background:#245f8e; color:white; padding:.7rem 1rem; font:inherit; font-weight:700; cursor:pointer; }
 button:disabled { opacity:.5; cursor:not-allowed; }
 @keyframes message-in { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:translateY(0); } }
+@media (max-width:760px) { .final-decision-grid { grid-template-columns:1fr; } }
 </style>
