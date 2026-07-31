@@ -11,10 +11,12 @@ from .models import HUMAN_ROLES, Study1Role
 from .permissions import (
     AuthenticationError,
     Study1TokenManager,
+    require_researcher_scope,
     require_study1_auth,
     require_study1_internal,
     verify_researcher_key,
 )
+from .privacy_routes import register_privacy_routes
 from .services import (
     ActionNotAllowedInPhase,
     SqlAlchemyStudy1Repository,
@@ -24,6 +26,7 @@ from .services import (
 
 study1_bp = Blueprint("study1", __name__)
 _service_override: Study1Service | None = None
+register_privacy_routes(study1_bp)
 
 
 def set_service_for_testing(service: Study1Service | None) -> None:
@@ -52,7 +55,9 @@ def researcher_login():
     try:
         data = request.get_json(silent=True) or {}
         verify_researcher_key(str(data.get("key") or ""))
-        return jsonify({"token": Study1TokenManager().issue_researcher()}), 200
+        return jsonify(
+            {"token": Study1TokenManager().issue_researcher(data.get("scopes"))}
+        ), 200
     except AuthenticationError as error:
         return jsonify({"error": error.code, "message": str(error)}), error.status
 
@@ -614,9 +619,11 @@ def get_study1_media_status(session_id: str):
 @study1_bp.get(
     "/api/study1/sessions/<session_id>/recordings/<recording_id>"
 )
-@require_study1_auth([Study1Role.PRINCIPAL])
+@require_study1_auth([Study1Role.PRINCIPAL, Study1Role.RESEARCHER])
 def replay_study1_recording(session_id: str, recording_id: str):
     try:
+        if g.study1_identity.role is Study1Role.RESEARCHER:
+            require_researcher_scope(g.study1_identity, "read_raw_media")
         upstream = get_service().get_recording(
             session_id,
             g.study1_identity.as_actor(),
@@ -637,6 +644,8 @@ def replay_study1_recording(session_id: str, recording_id: str):
         )
     except Study1ServiceError as error:
         return _service_error(error)
+    except AuthenticationError as error:
+        return jsonify({"error": error.code, "message": str(error)}), error.status
 
 
 @study1_bp.post("/api/study1/sessions/<session_id>/mock-media/complete")

@@ -12,6 +12,7 @@ from flask import g, jsonify, request
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from .models import Study1Role
+from .privacy_models import DEFAULT_RESEARCHER_SCOPES, RESEARCHER_SCOPES
 
 
 class AuthenticationError(ValueError):
@@ -27,12 +28,14 @@ class Study1Identity:
     role: Study1Role
     session_id: str | None
     kind: str
+    scopes: frozenset[str] = frozenset()
 
-    def as_actor(self) -> dict[str, str | None]:
+    def as_actor(self) -> dict[str, str | list[str] | None]:
         return {
             "participant_id": self.participant_id,
             "role": self.role.value,
             "session_id": self.session_id,
+            "scopes": sorted(self.scopes),
         }
 
 
@@ -76,13 +79,15 @@ class Study1TokenManager:
             }
         )
 
-    def issue_researcher(self) -> str:
+    def issue_researcher(self, scopes: Iterable[str] | None = None) -> str:
+        clean_scopes = _normalize_researcher_scopes(scopes)
         return self.serializer.dumps(
             {
                 "kind": "researcher",
                 "session_id": None,
                 "participant_id": "researcher",
                 "role": Study1Role.RESEARCHER.value,
+                "scopes": sorted(clean_scopes),
             }
         )
 
@@ -99,11 +104,17 @@ class Study1TokenManager:
                 raise ValueError("invalid participant role")
             if kind == "researcher" and role is not Study1Role.RESEARCHER:
                 raise ValueError("invalid researcher role")
+            scopes = frozenset(
+                _normalize_researcher_scopes(payload.get("scopes"))
+                if kind == "researcher"
+                else set()
+            )
             return Study1Identity(
                 participant_id=str(payload["participant_id"]),
                 role=role,
                 session_id=payload.get("session_id"),
                 kind=kind,
+                scopes=scopes,
             )
         except SignatureExpired as error:
             raise AuthenticationError("AUTH_TOKEN_EXPIRED", "Token expired") from error
@@ -133,6 +144,25 @@ def verify_internal_key(provided: str) -> None:
         )
     if not hmac.compare_digest(configured, provided or ""):
         raise AuthenticationError("INVALID_INTERNAL_API_KEY", "Invalid internal API key")
+
+
+def _normalize_researcher_scopes(scopes: Iterable[str] | None) -> frozenset[str]:
+    if scopes is None:
+        return DEFAULT_RESEARCHER_SCOPES
+    allowed = set(RESEARCHER_SCOPES)
+    clean = {str(scope) for scope in scopes if str(scope) in allowed}
+    return frozenset(clean)
+
+
+def require_researcher_scope(identity: Study1Identity, scope: str) -> None:
+    if identity.kind != "researcher" or identity.role is not Study1Role.RESEARCHER:
+        raise AuthenticationError("FORBIDDEN", "Researcher role required", 403)
+    if scope not in identity.scopes:
+        raise AuthenticationError(
+            "RESEARCHER_SCOPE_REQUIRED",
+            f"Researcher scope required: {scope}",
+            403,
+        )
 
 
 def require_study1_internal(function):

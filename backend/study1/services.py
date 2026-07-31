@@ -83,6 +83,10 @@ from .shared_artifacts import (
     validate_shared_artifact_context,
     validate_shared_content,
 )
+from .privacy_service import (
+    missing_required_consent_scopes,
+    normalize_consent_submission,
+)
 from .formal_projection import (
     formal_capabilities,
     formal_readiness,
@@ -157,7 +161,6 @@ STRUCTURED_SUBMISSION_FIELDS: dict[str, tuple[str, ...]] = {
         "consent_version",
         "identity_confirmed",
         "role_confirmed",
-        "audio_recording_confirmed",
         "voluntary_participation_confirmed",
     ),
     "pre_vote": ("decision", "rationale", "confidence"),
@@ -3728,6 +3731,8 @@ class Study1Service:
         if session is None:
             raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
         self._authorize(session, "submit", str(identity.get("role") or ""))
+        if submission_type == "consent":
+            payload = normalize_consent_submission(payload)
         if session.get("structured_instruments"):
             self._validate_structured_submission(
                 submission_type, instrument_version, payload
@@ -3995,20 +4000,27 @@ class Study1Service:
                     raise Study1ServiceError(
                         "INVALID_SCALE_VALUE", f"{field} must be between 1 and 7", 400
                     )
-        if submission_type == "consent" and not all(
-            payload.get(field) is True
-            for field in (
-                "identity_confirmed",
-                "role_confirmed",
-                "audio_recording_confirmed",
-                "voluntary_participation_confirmed",
-            )
-        ):
-            raise Study1ServiceError(
-                "CONSENT_REQUIRED",
-                "All identity, role, recording, and voluntary participation confirmations are required",
-                400,
-            )
+        if submission_type == "consent":
+            if not all(
+                payload.get(field) is True
+                for field in (
+                    "identity_confirmed",
+                    "role_confirmed",
+                    "voluntary_participation_confirmed",
+                )
+            ):
+                raise Study1ServiceError(
+                    "CONSENT_REQUIRED",
+                    "Identity, role, and voluntary participation confirmations are required",
+                    400,
+                )
+            missing_scopes = missing_required_consent_scopes(payload)
+            if missing_scopes:
+                raise Study1ServiceError(
+                    "CONSENT_SCOPE_REQUIRED",
+                    "Required consent scopes are missing: " + ", ".join(missing_scopes),
+                    400,
+                )
 
     def _validate_proxy_config_authorization(
         self,
@@ -4385,13 +4397,13 @@ class Study1Service:
             Study1Phase.REVIEW.value,
             Study1Phase.COMPREHENSION_MEASUREMENT.value,
         )
-        if (
-            identity.get("role") != Study1Role.PRINCIPAL.value
-            or session["phase"] not in allowed_phases
-            or not session.get("completion", {}).get(
-                "delegation_expectation:principal"
-            )
-        ):
+        is_researcher = identity.get("role") == Study1Role.RESEARCHER.value
+        is_principal_review = (
+            identity.get("role") == Study1Role.PRINCIPAL.value
+            and session["phase"] in allowed_phases
+            and session.get("completion", {}).get("delegation_expectation:principal")
+        )
+        if not (is_researcher or is_principal_review):
             raise Study1ServiceError(
                 "MEDIA_REPLAY_FORBIDDEN",
                 "Recording replay is available only to P during Review",

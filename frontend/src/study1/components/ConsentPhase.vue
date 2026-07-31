@@ -10,12 +10,35 @@ const props = defineProps({
 const emit = defineEmits(['submit'])
 const identityConfirmed = ref(false)
 const roleConfirmed = ref(false)
-const recordingConfirmed = ref(false)
 const voluntaryConfirmed = ref(false)
+const consentScopes = ref({
+  audio_recording: false,
+  transcription: false,
+  ui_telemetry: false,
+  external_agent_processing: false,
+})
+const scopeLabels = [
+  {
+    key: 'audio_recording',
+    label: 'I consent to audio recording during the Study 1 meetings.',
+  },
+  {
+    key: 'transcription',
+    label: 'I consent to speech transcription for research analysis.',
+  },
+  {
+    key: 'ui_telemetry',
+    label: 'I consent to interface telemetry such as review reading and scrolling events.',
+  },
+  {
+    key: 'external_agent_processing',
+    label: 'I consent to external Agent or provider processing required by the Proxy and Summary pipeline.',
+  },
+]
 const complete = computed(() => (
   identityConfirmed.value
   && roleConfirmed.value
-  && recordingConfirmed.value
+  && Object.values(consentScopes.value).every(Boolean)
   && voluntaryConfirmed.value
 ))
 
@@ -25,7 +48,7 @@ function submit() {
     consent_version: props.consentVersion,
     identity_confirmed: identityConfirmed.value,
     role_confirmed: roleConfirmed.value,
-    audio_recording_confirmed: recordingConfirmed.value,
+    consent_scopes: { ...consentScopes.value },
     voluntary_participation_confirmed: voluntaryConfirmed.value,
   })
 }
@@ -42,11 +65,18 @@ function submit() {
       Consent saved and locked for role <strong>{{ role }}</strong>.
     </div>
     <template v-else>
-      <label><input v-model="identityConfirmed" type="checkbox">I confirm that this invitation was issued to me.</label>
-      <label><input v-model="roleConfirmed" type="checkbox">I confirm my assigned role is <strong>{{ role }}</strong>.</label>
-      <label><input v-model="recordingConfirmed" type="checkbox">I consent to audio recording, transcription, and research data export.</label>
-      <label><input v-model="voluntaryConfirmed" type="checkbox">I understand participation is voluntary and I may withdraw.</label>
-      <button :disabled="busy || !complete" @click="submit">Save consent and lock</button>
+      <label><input v-model="identityConfirmed" data-test="identity-confirmed" type="checkbox">I confirm that this invitation was issued to me.</label>
+      <label><input v-model="roleConfirmed" data-test="role-confirmed" type="checkbox">I confirm my assigned role is <strong>{{ role }}</strong>.</label>
+      <label v-for="scope in scopeLabels" :key="scope.key">
+        <input
+          v-model="consentScopes[scope.key]"
+          :data-test="`scope-${scope.key}`"
+          type="checkbox"
+        >
+        {{ scope.label }}
+      </label>
+      <label><input v-model="voluntaryConfirmed" data-test="voluntary-confirmed" type="checkbox">I understand participation is voluntary and I may withdraw.</label>
+      <button data-test="submit-consent" :disabled="busy || !complete" @click="submit">Save consent and lock</button>
     </template>
   </section>
 </template>

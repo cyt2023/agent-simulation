@@ -81,10 +81,12 @@ export function createSubmission(sessionId, type, payload, instrumentVersion = '
   )
 }
 
-export async function researcherLogin(key) {
+export async function researcherLogin(key, scopes = null) {
+  const body = { key }
+  if (Array.isArray(scopes) && scopes.length) body.scopes = scopes
   const result = await request('/api/study1/auth/researcher', {
     method: 'POST',
-    body: JSON.stringify({ key }),
+    body: JSON.stringify(body),
   })
   sessionStorage.setItem(TOKEN_KEY, result.token)
   sessionStorage.setItem(
@@ -92,6 +94,10 @@ export async function researcherLogin(key) {
     JSON.stringify({ participant_id: 'researcher', role: 'researcher', session_id: null }),
   )
   return result
+}
+
+export function fetchStudy1PrivacyScopes() {
+  return request('/api/study1/privacy/scopes')
 }
 
 export function createStudy1Session(payload) {
