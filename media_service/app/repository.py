@@ -15,6 +15,7 @@ from .models import (
     MediaIncidentRow,
     MediaRetentionTombstoneRow,
     MediaRuntimeRow,
+    MediaSummaryAttemptRow,
     OutboxMessageRow,
     TranscriptSegmentRow,
 )
@@ -653,6 +654,78 @@ class MediaRepository:
                     select(MediaIncidentRow)
                     .where(MediaIncidentRow.session_id == session_id)
                     .order_by(MediaIncidentRow.created_at)
+                ).all()
+            )
+
+    def begin_summary_attempt(
+        self,
+        *,
+        attempt_id: str,
+        session_id: str,
+        parent_attempt_id: str | None,
+        prompt_version: str,
+        prompt_sha256: str,
+        transcript_checksum: str,
+        config_checksum: str,
+        provider_version: str,
+        sampling: dict,
+        input_text: str,
+        reason: str | None = None,
+    ) -> MediaSummaryAttemptRow:
+        row = MediaSummaryAttemptRow(
+            attempt_id=attempt_id,
+            session_id=session_id,
+            parent_attempt_id=parent_attempt_id,
+            status="started",
+            prompt_version=prompt_version,
+            prompt_sha256=prompt_sha256,
+            transcript_checksum=transcript_checksum,
+            config_checksum=config_checksum,
+            provider_version=provider_version,
+            sampling=sampling,
+            input_text=input_text,
+            reason=reason,
+        )
+        with self.database.session_factory.begin() as session:
+            session.add(row)
+        return row
+
+    def finish_summary_attempt(
+        self,
+        attempt_id: str,
+        *,
+        status: str,
+        output_text: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> MediaSummaryAttemptRow:
+        with self.database.session_factory.begin() as session:
+            row = session.get(MediaSummaryAttemptRow, attempt_id)
+            if not row:
+                raise KeyError(attempt_id)
+            row.status = status
+            row.output_text = output_text
+            row.error_code = error_code
+            row.error_message = error_message
+            row.ended_at = datetime.now(timezone.utc)
+            return row
+
+    def get_summary_attempt(self, attempt_id: str) -> MediaSummaryAttemptRow:
+        with self.database.session_factory() as session:
+            row = session.get(MediaSummaryAttemptRow, attempt_id)
+            if not row:
+                raise KeyError(attempt_id)
+            return row
+
+    def list_session_summary_attempts(
+        self, session_id: str
+    ) -> list[MediaSummaryAttemptRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaSummaryAttemptRow)
+                    .where(MediaSummaryAttemptRow.session_id == session_id)
+                    .order_by(MediaSummaryAttemptRow.started_at)
                 ).all()
             )
 

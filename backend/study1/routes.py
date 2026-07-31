@@ -646,6 +646,36 @@ def replay_study1_recording(session_id: str, recording_id: str):
         return _service_error(error)
 
 
+@study1_bp.post("/api/study1/sessions/<session_id>/summary-actions")
+@require_study1_auth([Study1Role.RESEARCHER])
+def create_study1_summary_action(session_id: str):
+    try:
+        result = get_service().handle_summary_failure_action(
+            session_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+        )
+        return jsonify(result), 202
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/summary-qa")
+@require_study1_auth([Study1Role.RESEARCHER])
+def create_study1_summary_qa(session_id: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().record_summary_qa(
+            session_id,
+            g.study1_identity.as_actor(),
+            str(data.get("summary_artifact_id") or ""),
+            data.get("ratings") or {},
+        )
+        return jsonify(result), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
 @study1_bp.post("/api/study1/sessions/<session_id>/review-events/batch")
 @require_study1_auth([Study1Role.PRINCIPAL])
 def create_study1_review_event_batch(session_id: str):

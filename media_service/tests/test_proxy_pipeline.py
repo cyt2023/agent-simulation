@@ -117,6 +117,9 @@ async def test_proxy_pipeline_transcribes_replies_and_persists_artifacts(reposit
     artifacts = repository.list_session_artifacts("session-1")
     assert [item.kind for item in artifacts] == ["transcript", "summary"]
     assert all(item.generator_version for item in artifacts)
+    attempts = repository.list_session_summary_attempts("session-1")
+    assert [item.status for item in attempts] == ["succeeded"]
+    assert artifacts[1].metadata_json["summary_attempt_id"] == attempts[0].attempt_id
     artifact_messages = [
         row for row in repository.pending_outbox() if row.message_kind == "artifact"
     ]
@@ -137,6 +140,7 @@ async def test_proxy_pipeline_transcribes_replies_and_persists_artifacts(reposit
     assert summaries[-1].metadata_json["regeneration_reason"] == (
         "ASR correction approved by researcher"
     )
+    assert len(repository.list_session_summary_attempts("session-1")) == 2
 
 
 @pytest.mark.asyncio

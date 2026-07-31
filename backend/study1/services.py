@@ -83,6 +83,11 @@ from .shared_artifacts import (
     validate_shared_artifact_context,
     validate_shared_content,
 )
+from .summary_service import (
+    SummaryPolicyError,
+    SummaryQaService,
+    build_summary_failure_action,
+)
 from .privacy_service import (
     missing_required_consent_scopes,
     normalize_consent_submission,
@@ -4360,6 +4365,81 @@ class Study1Service:
             ) from error
         return {"command": envelope, "duplicate": not created, "gateway": result}
 
+    def handle_summary_failure_action(
+        self, session_id: str, actor: dict[str, Any], payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        try:
+            action = build_summary_failure_action(
+                action=str(payload.get("action") or ""),
+                reason=str(payload.get("reason") or ""),
+                frozen_config_checksum=payload.get("frozen_config_checksum"),
+                approved_config_checksum=payload.get("approved_config_checksum"),
+                source_transcript_checksum=payload.get("source_transcript_checksum"),
+                source_summary_version=payload.get("source_summary_version"),
+            )
+        except SummaryPolicyError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+        if action.get("media_command"):
+            issued = self.issue_media_command(
+                session_id,
+                actor,
+                str(action["media_command"]),
+                action["payload"],
+            )
+            return {"action": action, "media": issued}
+        return {"action": action}
+
+    def record_summary_qa(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        summary_artifact_id: str,
+        ratings: dict[str, Any],
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        data = self.repository.export_data(session_id)
+        summaries = [
+            item
+            for item in data.get("artifacts") or []
+            if item.get("type") == "summary"
+            and item.get("artifact_id") == summary_artifact_id
+        ]
+        if not summaries:
+            raise Study1ServiceError(
+                "SUMMARY_ARTIFACT_NOT_FOUND", "Summary artifact was not found", 404
+            )
+        try:
+            entry = SummaryQaService().record(
+                session_id=session_id,
+                summary_artifact_id=summary_artifact_id,
+                researcher_id=str(actor.get("participant_id") or "researcher"),
+                ratings=ratings or {},
+            )
+        except SummaryPolicyError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+        existing = [
+            item
+            for item in data.get("artifacts") or []
+            if item.get("type") == "summary_qa"
+        ]
+        artifact_result = self.create_artifact(
+            session_id,
+            {
+                "type": "summary_qa",
+                "version": str(len(existing) + 1),
+                "content": json.dumps(entry.public_dict(), ensure_ascii=False),
+                "generator_version": "human-researcher-summary-qa-v1",
+                "metadata": {
+                    "source_summary_artifact_id": summary_artifact_id,
+                    "private_researcher_qa": True,
+                },
+            },
+        )
+        return {"qa": entry.public_dict(), "artifact": artifact_result["artifact"]}
+
     def _proxy_authorized_context(self, session_id: str) -> dict[str, Any]:
         data = self.repository.export_data(session_id)
         configs = [
@@ -5016,6 +5096,7 @@ def _validate_artifact(session_id: str, data: dict[str, Any]) -> dict[str, Any]:
         "recording_manifest",
         "agent_log_manifest",
         "transcript_correction",
+        "summary_qa",
     }
     artifact_type = str(data.get("type") or "")
     if artifact_type not in allowed:

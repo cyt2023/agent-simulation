@@ -48,6 +48,7 @@ def build_media_export(
     connections = repository.list_session_connections(session_id)
     segments = repository.list_session_segments(session_id)
     artifacts = repository.list_session_artifacts(session_id)
+    summary_attempts = repository.list_session_summary_attempts(session_id)
     incidents = repository.list_session_incidents(session_id)
     status = {
         "session_id": session_id,
@@ -89,6 +90,7 @@ def build_media_export(
         archive.writestr("connections.jsonl", _jsonl_bytes(connections))
         archive.writestr("transcript.json", _json_bytes(transcript))
         archive.writestr("summary.json", _json_bytes(summaries))
+        archive.writestr("summary_attempts.jsonl", _jsonl_bytes(summary_attempts))
         archive.writestr("recording_manifest.json", _json_bytes(recordings))
         archive.writestr("agent_log.jsonl", _jsonl_bytes(agent_segments))
         archive.writestr("incidents.jsonl", _jsonl_bytes(incidents))

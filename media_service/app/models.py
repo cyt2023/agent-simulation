@@ -101,6 +101,29 @@ class MediaArtifactRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class MediaSummaryAttemptRow(Base):
+    __tablename__ = "summary_attempts"
+    __table_args__ = ({"schema": "media"},)
+
+    attempt_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    parent_attempt_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32))
+    prompt_version: Mapped[str] = mapped_column(String(128))
+    prompt_sha256: Mapped[str] = mapped_column(String(64))
+    transcript_checksum: Mapped[str] = mapped_column(String(64))
+    config_checksum: Mapped[str] = mapped_column(String(64))
+    provider_version: Mapped[str] = mapped_column(String(128))
+    sampling: Mapped[dict] = mapped_column(JSON, default=dict)
+    input_text: Mapped[str] = mapped_column(Text)
+    output_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class MediaIncidentRow(Base):
     __tablename__ = "incidents"
     __table_args__ = ({"schema": "media"},)
