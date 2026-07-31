@@ -7,6 +7,7 @@ from livekit import api, rtc
 
 from .access import MediaAccessService
 from .config import Settings
+from .playback import PlaybackGeneration, ProxyPlaybackController
 from .room_policy import (
     HANDOFF_HUMAN_ROLES,
     RoomPolicySnapshot,
@@ -36,6 +37,7 @@ class LiveKitRoomRuntime:
         self._recorder_rooms: dict[str, rtc.Room] = {}
         self._proxy_rooms: dict[str, rtc.Room] = {}
         self._sources: dict[str, rtc.AudioSource] = {}
+        self._playbacks: dict[str, ProxyPlaybackController] = {}
         self._tasks: set[asyncio.Task] = set()
         self._connect_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
@@ -171,6 +173,7 @@ class LiveKitRoomRuntime:
                 rooms.pop(session_id, None)
             if connection_kind == "proxy":
                 self._sources.pop(session_id, None)
+                self._playbacks.pop(session_id, None)
 
         source = None
         try:
@@ -194,10 +197,12 @@ class LiveKitRoomRuntime:
             rooms[session_id] = room
             if source is not None:
                 self._sources[session_id] = source
+                self._playbacks[session_id] = ProxyPlaybackController(source)
         except BaseException:
             if rooms.get(session_id) is room:
                 rooms.pop(session_id, None)
             self._sources.pop(session_id, None)
+            self._playbacks.pop(session_id, None)
             try:
                 await room.disconnect()
             except BaseException:
@@ -235,7 +240,37 @@ class LiveKitRoomRuntime:
         async for event in rtc.AudioStream(track, sample_rate=48000, num_channels=1):
             await self.audio_consumer(session_id, identity, event.frame)
 
-    async def publish_audio(self, session_id: str, pcm_s16le: bytes) -> None:
+    def _playback(self, session_id: str) -> ProxyPlaybackController:
+        playback = self._playbacks.get(session_id)
+        if playback:
+            return playback
+        source = self._sources[session_id]
+        playback = ProxyPlaybackController(source)
+        self._playbacks[session_id] = playback
+        return playback
+
+    def begin_proxy_audio(
+        self, session_id: str, turn_id: str
+    ) -> PlaybackGeneration:
+        return self._playback(session_id).begin(turn_id, session_id=session_id)
+
+    async def interrupt_proxy_audio(
+        self,
+        session_id: str,
+        generation: PlaybackGeneration | None = None,
+    ) -> bool:
+        playback = self._playbacks.get(session_id)
+        if not playback:
+            return False
+        return await playback.interrupt(generation, session_id=session_id)
+
+    async def publish_audio(
+        self,
+        session_id: str,
+        pcm_s16le: bytes,
+        *,
+        generation: PlaybackGeneration | None = None,
+    ) -> bool:
         source = self._sources[session_id]
         frame = rtc.AudioFrame(
             data=pcm_s16le,
@@ -243,7 +278,10 @@ class LiveKitRoomRuntime:
             num_channels=1,
             samples_per_channel=len(pcm_s16le) // 2,
         )
+        if generation is not None:
+            return await self._playback(session_id).publish(generation, frame)
         await source.capture_frame(frame)
+        return True
 
     async def apply_speaking_policy(
         self,
@@ -315,6 +353,7 @@ class LiveKitRoomRuntime:
 
     async def disconnect_proxy(self, session_id: str) -> None:
         self._sources.pop(session_id, None)
+        self._playbacks.pop(session_id, None)
         room = self._proxy_rooms.pop(session_id, None)
         if room:
             await room.disconnect()

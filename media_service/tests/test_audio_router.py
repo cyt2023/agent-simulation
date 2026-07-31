@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from media_service.app.audio_router import AudioPipelineRouter
+from media_service.app.playback import ProxyPlaybackController
 
 
 class StubPipeline:
@@ -38,6 +40,57 @@ class StubPipeline:
 
     async def regenerate_summary(self, *args, **kwargs):
         pass
+
+
+@pytest.mark.asyncio
+async def test_barge_in_clears_queue_and_rejects_late_frames():
+    audio_source = SimpleNamespace(
+        clear_queue=AsyncMock(),
+        capture_frame=AsyncMock(),
+    )
+    playback = ProxyPlaybackController(audio_source)
+
+    generation = playback.begin("turn-1")
+    await playback.interrupt(generation)
+    published = await playback.publish(generation, b"late")
+
+    assert published is False
+    assert audio_source.clear_queue.await_count == 1
+    assert audio_source.capture_frame.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_router_clears_proxy_audio_when_human_barge_in_starts(repository, tmp_path):
+    interrupts = []
+    cleared = []
+
+    class InterruptiblePipeline(StubPipeline):
+        def interrupt(self, session_id, speaker):
+            interrupts.append((session_id, speaker))
+            return True
+
+    async def interrupt_proxy_audio(session_id):
+        cleared.append(session_id)
+
+    router = AudioPipelineRouter(
+        InterruptiblePipeline(repository),
+        tmp_path,
+        interrupt_proxy_audio=interrupt_proxy_audio,
+    )
+    await router.start_session(
+        "session-1",
+        "runtime-1",
+        {},
+        proxy_enabled=True,
+        artifact_version="1",
+    )
+
+    loud_300ms = b"\xff\x7f" * 14400
+    frame = SimpleNamespace(data=loud_300ms, sample_rate=48000)
+    await router.handle_frame("session-1", "teammate_1", frame)
+
+    assert interrupts == [("session-1", "teammate_1")]
+    assert cleared == ["session-1"]
 
 
 @pytest.mark.asyncio

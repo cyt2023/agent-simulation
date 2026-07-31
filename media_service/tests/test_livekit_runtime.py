@@ -5,6 +5,7 @@ from livekit import rtc
 
 from media_service.app.config import Settings
 from media_service.app.livekit_runtime import LiveKitRoomRuntime
+from media_service.app.playback import ProxyPlaybackController
 from media_service.app.room_policy import SpeakingPolicy
 
 
@@ -69,6 +70,35 @@ async def test_disconnecting_proxy_preserves_stable_recorder_connection():
     await runtime.disconnect("session-1")
 
     assert recorder.disconnect_count == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_barge_in_clears_source_queue_and_rejects_late_frames():
+    class FakeAudioSource:
+        def __init__(self):
+            self.clear_queue_count = 0
+            self.captured = []
+
+        async def clear_queue(self):
+            self.clear_queue_count += 1
+
+        async def capture_frame(self, frame):
+            self.captured.append(frame)
+
+    runtime = LiveKitRoomRuntime(_settings())
+    source = FakeAudioSource()
+    runtime._sources["session-1"] = source
+    runtime._playbacks["session-1"] = ProxyPlaybackController(source)
+
+    generation = runtime.begin_proxy_audio("session-1", "turn-1")
+    await runtime.interrupt_proxy_audio("session-1")
+    published = await runtime.publish_audio(
+        "session-1", b"\x01\x00" * 240, generation=generation
+    )
+
+    assert published is False
+    assert source.clear_queue_count == 1
+    assert source.captured == []
 
 
 @pytest.mark.asyncio

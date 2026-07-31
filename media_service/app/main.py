@@ -63,8 +63,11 @@ def create_app(
             pipeline,
             resolved_settings.media_root,
             publish_audio=livekit_runtime.publish_audio,
+            begin_proxy_audio=livekit_runtime.begin_proxy_audio,
+            interrupt_proxy_audio=livekit_runtime.interrupt_proxy_audio,
         )
         pipeline.publish_audio = audio_router.publish_proxy_audio
+        pipeline.begin_proxy_playback = audio_router.begin_proxy_playback
         livekit_runtime.audio_consumer = audio_router.handle_frame
         resolved_runtime = RuntimeCoordinator(
             repository, livekit_runtime, lifecycle=audio_router

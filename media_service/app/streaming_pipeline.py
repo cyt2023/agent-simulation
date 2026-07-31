@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from .agent_turns import AgentTurnLedger
 from .announcements import (
@@ -36,6 +38,7 @@ class AuditedStreamingProxyPipeline:
         self.ledger = AgentTurnLedger(repository)
         self._sessions: dict[str, dict] = {}
         self._states: dict[str, ProxyState] = {}
+        self.begin_proxy_playback: Callable[[str, str], Any] | None = None
 
     async def start_session(
         self, session_id: str, runtime_id: str, authorized_context: dict
@@ -62,9 +65,19 @@ class AuditedStreamingProxyPipeline:
                 "announcement_version": FIXED_PROXY_INTRODUCTION_VERSION,
             },
         )
+        generation = (
+            self.begin_proxy_playback(session_id, turn.turn_id)
+            if self.begin_proxy_playback
+            else None
+        )
         async for chunk in self.tts.synthesize(FIXED_PROXY_INTRODUCTION):
             if chunk:
-                await self.publish_audio(session_id, chunk)
+                await _publish_audio_chunk(
+                    self.publish_audio,
+                    session_id,
+                    chunk,
+                    generation=generation,
+                )
         self.repository.finish_agent_turn(turn.turn_id, status="published")
         self._states[session_id] = ProxyState.LISTENING
 
@@ -121,11 +134,46 @@ class AuditedStreamingProxyPipeline:
             self._states[session_id] = ProxyState.TECHNICAL_ISSUE
             return
         self._states[session_id] = ProxyState.SPEAKING
+        generation = (
+            self.begin_proxy_playback(session_id, turn.turn_id)
+            if self.begin_proxy_playback
+            else None
+        )
         async for chunk in self.tts.synthesize(response_text):
             if chunk:
-                await self.publish_audio(session_id, chunk)
+                await _publish_audio_chunk(
+                    self.publish_audio,
+                    session_id,
+                    chunk,
+                    generation=generation,
+                )
         self.repository.finish_agent_turn(turn.turn_id, status="published")
         self._states[session_id] = ProxyState.LISTENING
 
     def proxy_state(self, session_id: str) -> ProxyState:
         return self._states.get(session_id, ProxyState.LISTENING)
+
+
+async def _publish_audio_chunk(
+    callback,
+    session_id: str,
+    chunk: bytes,
+    *,
+    generation,
+) -> None:
+    if generation is not None and _accepts_keyword(callback, "generation"):
+        await callback(session_id, chunk, generation=generation)
+        return
+    await callback(session_id, chunk)
+
+
+def _accepts_keyword(callback, keyword: str) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == keyword
+        for parameter in signature.parameters.values()
+    )

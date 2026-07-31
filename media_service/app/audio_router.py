@@ -4,8 +4,10 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import hashlib
+import inspect
 import json
 from pathlib import Path
+from typing import Any
 import uuid
 import wave
 
@@ -28,10 +30,17 @@ class AudioPipelineRouter:
         media_root: str | Path,
         *,
         publish_audio: Callable[[str, bytes], Awaitable[None]] | None = None,
+        begin_proxy_audio: Callable[[str, str], Any] | None = None,
+        interrupt_proxy_audio: Callable[[str], Awaitable[Any]] | None = None,
     ):
         self.pipeline = pipeline
         self.media_root = Path(media_root)
         self.publish_audio = publish_audio
+        self.begin_proxy_audio_callback = begin_proxy_audio
+        self.interrupt_proxy_audio_callback = interrupt_proxy_audio
+        self._publish_accepts_generation = _accepts_keyword(
+            publish_audio, "generation"
+        )
         self.sessions: dict[str, RouterSession] = {}
         self.detectors: dict[tuple[str, str, str], VoiceActivityBuffer] = {}
         self.recorders: dict[tuple[str, str, str], PcmWaveRecorder] = {}
@@ -98,7 +107,9 @@ class AudioPipelineRouter:
         if not was_speaking and detector.start_ms is not None:
             interrupt = getattr(self.pipeline, "interrupt", None)
             if interrupt:
-                interrupt(session_id, speaker)
+                interrupted = interrupt(session_id, speaker)
+                if interrupted:
+                    await self.interrupt_proxy_audio(session_id)
         for utterance in utterances:
             task = asyncio.create_task(
                 self.pipeline.process_utterance(
@@ -112,12 +123,32 @@ class AudioPipelineRouter:
             self.tasks[session_id].add(task)
             task.add_done_callback(self.tasks[session_id].discard)
 
-    async def publish_proxy_audio(self, session_id: str, pcm_s16le: bytes) -> None:
+    def begin_proxy_playback(self, session_id: str, turn_id: str):
+        if not self.begin_proxy_audio_callback:
+            return None
+        return self.begin_proxy_audio_callback(session_id, turn_id)
+
+    async def interrupt_proxy_audio(self, session_id: str):
+        if not self.interrupt_proxy_audio_callback:
+            return False
+        return await _maybe_await(self.interrupt_proxy_audio_callback(session_id))
+
+    async def publish_proxy_audio(
+        self, session_id: str, pcm_s16le: bytes, *, generation=None
+    ) -> bool:
         if session_id not in self.sessions:
-            return
-        self._recorder(session_id, "proxy", sample_rate=24000).write(pcm_s16le)
+            return False
         if self.publish_audio:
-            await self.publish_audio(session_id, pcm_s16le)
+            if generation is not None and self._publish_accepts_generation:
+                published = await self.publish_audio(
+                    session_id, pcm_s16le, generation=generation
+                )
+            else:
+                published = await self.publish_audio(session_id, pcm_s16le)
+            if published is False:
+                return False
+        self._recorder(session_id, "proxy", sample_rate=24000).write(pcm_s16le)
+        return True
 
     async def finalize(self, session_id: str, phase_version: int) -> None:
         state = self.sessions.get(session_id)
@@ -302,3 +333,23 @@ def _wave_duration_ms(path: Path) -> int:
     with wave.open(str(path), "rb") as stream:
         frame_rate = stream.getframerate()
         return round(stream.getnframes() * 1000 / frame_rate) if frame_rate else 0
+
+
+def _accepts_keyword(callback, keyword: str) -> bool:
+    if not callback:
+        return False
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == keyword
+        for parameter in signature.parameters.values()
+    )
+
+
+async def _maybe_await(result):
+    if inspect.isawaitable(result):
+        return await result
+    return result
