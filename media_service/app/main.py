@@ -25,6 +25,7 @@ from .providers.factory import create_providers
 from .repository import MediaRepository
 from .release_handshake import ReleaseHandshakeError, validate_release_handshake
 from .runtime import RuntimeCoordinator
+from .schema_migrations import MEDIA_SCHEMA_VERSION
 from .schemas import (
     CommandAcceptance,
     CommandEnvelope,
@@ -135,6 +136,7 @@ def create_app(
             "service": "study1-media",
             "status": "ok",
             "schema": resolved_settings.media_database_schema,
+            "schema_version": MEDIA_SCHEMA_VERSION,
         }
 
     @app.post(

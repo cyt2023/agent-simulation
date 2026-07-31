@@ -12,6 +12,8 @@ from .models import (
     MediaArtifactRow,
     MediaCommandRow,
     MediaConnectionRow,
+    MediaAgentTurnRow,
+    MediaConfigRow,
     MediaIncidentRow,
     MediaRetentionTombstoneRow,
     MediaRuntimeRow,
@@ -656,6 +658,72 @@ class MediaRepository:
                     .order_by(MediaIncidentRow.created_at)
                 ).all()
             )
+
+    def store_media_config(
+        self, *, session_id: str, phase_version: int, checksum: str, payload: dict
+    ) -> MediaConfigRow:
+        row = MediaConfigRow(
+            config_id=str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"study1-media-config:{session_id}:{phase_version}:{checksum}",
+                )
+            ),
+            session_id=session_id,
+            phase_version=phase_version,
+            checksum=checksum,
+            config_version=str(payload.get("config_version") or "study1-media-config-v2"),
+            payload=payload,
+        )
+        with self.database.session_factory.begin() as session:
+            existing = session.get(MediaConfigRow, row.config_id)
+            if existing:
+                return existing
+            session.add(row)
+            return row
+
+    def begin_agent_turn(self, payload: dict) -> MediaAgentTurnRow:
+        context_event_ids = list(payload.get("context_event_ids") or [])
+        if not context_event_ids:
+            raise ValueError("Agent turns require context_event_ids before provider attempts")
+        row = MediaAgentTurnRow(
+            turn_id=str(payload.get("turn_id") or uuid.uuid4()),
+            session_id=str(payload["session_id"]),
+            runtime_id=str(payload["runtime_id"]),
+            phase_version=int(payload["phase_version"]),
+            turn_kind=str(payload.get("turn_kind") or "llm_response"),
+            status="started",
+            context_event_ids=context_event_ids,
+            authorized_snapshot=dict(payload.get("authorized_snapshot") or {}),
+            provider_attempt_ids=list(payload.get("provider_attempt_ids") or []),
+        )
+        with self.database.session_factory.begin() as session:
+            existing = session.get(MediaAgentTurnRow, row.turn_id)
+            if existing:
+                return existing
+            session.add(row)
+            return row
+
+    def finish_agent_turn(
+        self,
+        turn_id: str,
+        *,
+        status: str,
+        provider_attempt_id: str | None = None,
+        error_code: str | None = None,
+    ) -> MediaAgentTurnRow:
+        with self.database.session_factory.begin() as session:
+            row = session.get(MediaAgentTurnRow, turn_id)
+            if not row:
+                raise KeyError(turn_id)
+            attempts = list(row.provider_attempt_ids or [])
+            if provider_attempt_id:
+                attempts.append(provider_attempt_id)
+            row.provider_attempt_ids = attempts
+            row.status = status
+            row.error_code = error_code
+            row.ended_at = datetime.now(timezone.utc)
+            return row
 
     def begin_summary_attempt(
         self,

@@ -125,10 +125,19 @@ Allowed `event_type` values:
 - `HANDOFF_COMPLETE`
 - `MEDIA_ERROR`
 - `MEETING_ENDED`
+- `MEDIA_CONFIG_FROZEN`
+- `AGENT_TURN_STARTED`
+- `AGENT_TURN_COMPLETED`
+- `AGENT_TURN_FAILED`
+- `RTC_METRIC_BATCH`
+- `COMPONENT_HEALTH`
+- `RECORDING_TRACK_FINALIZED`
 
 `event_id` is the idempotency key. A returns HTTP 200 with
 `"duplicate": true` for an already processed event. A rejects stale
 `phase_version` values with HTTP 409 and never advances a phase automatically.
+The v2 media configuration, Agent turn, RTC, health, and recording-track events
+are audit events only; they do not advance Study 1 phases.
 
 Event effects in A:
 

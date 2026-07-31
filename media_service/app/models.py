@@ -52,6 +52,98 @@ class MediaRuntimeRow(Base):
     recording_root_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class MediaConfigRow(Base):
+    __tablename__ = "media_configs"
+    __table_args__ = (
+        UniqueConstraint("session_id", "phase_version", name="uq_media_config_phase"),
+        {"schema": "media"},
+    )
+
+    config_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    phase_version: Mapped[int] = mapped_column(Integer)
+    checksum: Mapped[str] = mapped_column(String(64), index=True)
+    config_version: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MediaPhaseSpanRow(Base):
+    __tablename__ = "phase_spans"
+    __table_args__ = ({"schema": "media"},)
+
+    span_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    phase: Mapped[str] = mapped_column(String(64))
+    phase_version: Mapped[int] = mapped_column(Integer)
+    room_name: Mapped[str] = mapped_column(String(255))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MediaAgentTurnRow(Base):
+    __tablename__ = "agent_turns"
+    __table_args__ = ({"schema": "media"},)
+
+    turn_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    runtime_id: Mapped[str] = mapped_column(String(128), index=True)
+    phase_version: Mapped[int] = mapped_column(Integer)
+    turn_kind: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), default="started")
+    context_event_ids: Mapped[list] = mapped_column(JSON, default=list)
+    authorized_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    provider_attempt_ids: Mapped[list] = mapped_column(JSON, default=list)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MediaRtcMetricRow(Base):
+    __tablename__ = "rtc_metrics"
+    __table_args__ = ({"schema": "media"},)
+
+    metric_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    participant_id: Mapped[str] = mapped_column(String(128), index=True)
+    role: Mapped[str] = mapped_column(String(32))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class MediaComponentHealthRow(Base):
+    __tablename__ = "component_health"
+    __table_args__ = ({"schema": "media"},)
+
+    health_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    component: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32))
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class MediaRecordingTrackRow(Base):
+    __tablename__ = "recording_tracks"
+    __table_args__ = ({"schema": "media"},)
+
+    track_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    runtime_id: Mapped[str] = mapped_column(String(128), index=True)
+    participant_id: Mapped[str] = mapped_column(String(128), index=True)
+    role: Mapped[str] = mapped_column(String(32))
+    room_name: Mapped[str] = mapped_column(String(255))
+    room_start_ms: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    codec: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sample_rate_hz: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    storage_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="recording")
+
+
 class MediaConnectionRow(Base):
     __tablename__ = "connections"
     __table_args__ = ({"schema": "media"},)
