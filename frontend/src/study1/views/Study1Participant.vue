@@ -4,21 +4,34 @@ import { useRoute, useRouter } from 'vue-router'
 import PhaseHeader from '../components/PhaseHeader.vue'
 import MaterialPhase from '../components/MaterialPhase.vue'
 import VotePhase from '../components/VotePhase.vue'
+import InstrumentPhase from '../components/InstrumentPhase.vue'
+import SharedArtifactPhase from '../components/SharedArtifactPhase.vue'
 import ProxyConfigPhase from '../components/ProxyConfigPhase.vue'
 import WaitingRoom from '../components/WaitingRoom.vue'
 import ReviewPhase from '../components/ReviewPhase.vue'
 import SurveyPhase from '../components/SurveyPhase.vue'
 import CompletionPhase from '../components/CompletionPhase.vue'
-import Study1VoiceRoom from '../components/Study1VoiceRoom.vue'
+import MarkerPhase from '../components/MarkerPhase.vue'
+import Study1MeetingWorkspace from '../components/Study1MeetingWorkspace.vue'
 import Study1DeviceCheck from '../components/Study1DeviceCheck.vue'
 import ConsentPhase from '../components/ConsentPhase.vue'
+import WithdrawalPhase from '../components/WithdrawalPhase.vue'
+import { useStableAudioSession } from '../composables/useStableAudioSession.js'
 import {
   clearStudy1Auth,
+  confirmSharedArtifactRevision,
   createSubmission,
+  createSharedArtifactRevision,
   exchangeInvite,
+  fetchCurrentInstrument,
   fetchMe,
   fetchMyMaterials,
+  fetchSharedArtifact,
   getStudy1Identity,
+  logReviewUiEvent,
+  requestStudy1Withdrawal,
+  submitIndividualDecision,
+  submitInstrumentResponse,
 } from '../services/study1Api.js'
 import {
   joinStudy1Session,
@@ -36,14 +49,85 @@ const notice = ref('')
 const session = ref(null)
 const identity = ref(getStudy1Identity())
 const materials = ref([])
+const currentInstrument = ref(null)
+const sharedArtifacts = ref({
+  team_final: null,
+  followup_task: null,
+})
 let errorTimer = null
 let noticeTimer = null
+
+const formalInstrumentRoles = {
+  PRE_VOTE: new Set(['principal', 'teammate_1', 'teammate_2']),
+  TENTATIVE_DECISION: new Set(['teammate_1', 'teammate_2']),
+  DELEGATION_EXPECTATION: new Set(['principal']),
+  COMPREHENSION_MEASUREMENT: new Set(['principal']),
+  FINAL_DECISION: new Set(['principal', 'teammate_1', 'teammate_2']),
+  POST_SURVEY: new Set(['principal', 'teammate_1', 'teammate_2']),
+}
 
 const phase = computed(() => session.value?.phase || 'SETUP')
 const role = computed(() => identity.value?.role || '')
 const isParticipant = computed(() => ['principal', 'teammate_1', 'teammate_2'].includes(role.value))
+const capabilities = computed(() => session.value?.capabilities || {})
 const completedActions = computed(() => new Set(session.value?.my_completed_actions || []))
 const hasCompleted = type => completedActions.value.has(`${type}:${role.value}`)
+const hasAnyCompleted = types => types.some(type => hasCompleted(type))
+const currentCandidates = computed(() => (
+  currentInstrument.value?.candidate_ids
+  || currentInstrument.value?.candidates
+  || []
+))
+const showMaterialReference = computed(() => (
+  Boolean(capabilities.value.material_read)
+  && materials.value.length > 0
+  && !['MATERIAL_READING', 'PROXY_CONFIGURATION'].includes(phase.value)
+))
+const usesCurrentServerInstrument = computed(() => (
+  session.value?.protocol_mode === 'formal_v2'
+  && Boolean(formalInstrumentRoles[phase.value]?.has(role.value))
+))
+
+async function reportRtcTelemetry(sample) {
+  const sessionId = identity.value?.session_id
+  if (!sessionId) return
+  try {
+    await logReviewUiEvent(sessionId, 'rtc_metric_sample', sample)
+  } catch {
+    // Telemetry must never interrupt the participant's audio controls.
+  }
+}
+
+const audioSession = useStableAudioSession({ onTelemetrySample: reportRtcTelemetry })
+const teammateBridgePhases = new Set([
+  'PROXY_MEETING',
+  'TENTATIVE_DECISION',
+  'DELEGATION_EXPECTATION',
+  'REVIEW',
+  'COMPREHENSION_MEASUREMENT',
+  'HANDOFF',
+  'SYNC_MEETING',
+])
+const meetingWorkspaceVisible = computed(() => {
+  if (['HANDOFF', 'SYNC_MEETING'].includes(phase.value)) return true
+  return ['teammate_1', 'teammate_2'].includes(role.value)
+    && teammateBridgePhases.has(phase.value)
+})
+const workspaceTaskTitle = computed(() => ({
+  PROXY_MEETING: 'Discuss the assigned task',
+  TENTATIVE_DECISION: 'Record the tentative decision',
+  DELEGATION_EXPECTATION: 'Wait for P to record expectations',
+  REVIEW: 'Wait while P reviews the meeting record',
+  COMPREHENSION_MEASUREMENT: 'Wait while P completes the measurement',
+  HANDOFF: 'Prepare for P to rejoin',
+  SYNC_MEETING: 'Synchronize as a three-person team',
+}[phase.value] || 'Current study step'))
+const workspaceTaskDescription = computed(() => ({
+  PROXY_MEETING: 'Use the audio controls below the participant seats.',
+  TENTATIVE_DECISION: 'Your audio connection remains available while you submit this form.',
+  HANDOFF: 'Stay connected while the AI Proxy leaves and P joins.',
+  SYNC_MEETING: 'Continue the task with P, T1, and T2.',
+}[phase.value] || 'Remain on this page until the researcher advances the stage.'))
 
 function clearError() {
   window.clearTimeout(errorTimer)
@@ -74,11 +158,32 @@ async function refresh() {
   const result = await fetchMe(identity.value.session_id)
   identity.value = result.identity
   session.value = result.session
-  if (
-    phase.value === 'MATERIAL_READING'
-    || (phase.value === 'PROXY_CONFIGURATION' && role.value === 'principal')
-  ) {
+  if (capabilities.value.material_read) {
     materials.value = (await fetchMyMaterials(identity.value.session_id)).materials
+  } else {
+    materials.value = []
+  }
+  await loadPhaseAssets()
+}
+
+async function loadPhaseAssets() {
+  if (!identity.value?.session_id) return
+  const sessionId = identity.value.session_id
+  const shouldLoadInstrument = usesCurrentServerInstrument.value
+  const sharedArtifactKind = {
+    FINAL_DECISION: 'team_final',
+    FOLLOWUP_TASK: 'followup_task',
+  }[phase.value]
+
+  currentInstrument.value = shouldLoadInstrument
+    ? await fetchCurrentInstrument(sessionId)
+    : null
+
+  if (sharedArtifactKind) {
+    sharedArtifacts.value = {
+      ...sharedArtifacts.value,
+      [sharedArtifactKind]: await fetchSharedArtifact(sessionId, sharedArtifactKind),
+    }
   }
 }
 
@@ -130,6 +235,85 @@ async function submit(type, payload) {
   }
 }
 
+async function submitWithdrawal(payload) {
+  busy.value = true
+  clearError()
+  clearNotice()
+  try {
+    await requestStudy1Withdrawal(identity.value.session_id, payload)
+    showTransientNotice('Withdrawal request submitted for privacy review.')
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function submitDecision(decisionKind, payload) {
+  busy.value = true
+  clearError()
+  clearNotice()
+  try {
+    await submitIndividualDecision(identity.value.session_id, decisionKind, payload)
+    showTransientNotice('Saved and locked. Please wait for the researcher.')
+    await refresh()
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function submitInstrument(payload) {
+  busy.value = true
+  clearError()
+  clearNotice()
+  try {
+    await submitInstrumentResponse(
+      identity.value.session_id,
+      payload.instrument_definition_id,
+      payload.instrument_version,
+      payload.ordered_responses,
+    )
+    showTransientNotice('Saved and locked. Please wait for the researcher.')
+    await refresh()
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function saveSharedArtifact(kind, payload) {
+  busy.value = true
+  clearError()
+  clearNotice()
+  try {
+    await createSharedArtifactRevision(identity.value.session_id, kind, payload)
+    showTransientNotice('Shared revision saved.')
+    await refresh()
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function confirmSharedArtifact(kind, revisionId) {
+  busy.value = true
+  clearError()
+  clearNotice()
+  try {
+    await confirmSharedArtifactRevision(identity.value.session_id, kind, revisionId)
+    showTransientNotice('Shared revision confirmed.')
+    await refresh()
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    busy.value = false
+  }
+}
+
 function onPhaseEvent(event) {
   if (event?.session_id === identity.value?.session_id) refresh().catch(showError)
 }
@@ -140,6 +324,14 @@ watch(phase, (currentPhase, previousPhase) => {
     clearNotice()
   }
 })
+watch(
+  [phase, () => session.value?.phase_version, role],
+  ([currentPhase, phaseVersion, currentRole]) => {
+    audioSession
+      .syncAuthoritativePhase(currentPhase, Number(phaseVersion) || 0, currentRole)
+      .catch(showError)
+  },
+)
 
 onMounted(() => {
   onStudy1Event('study1_phase_updated', onPhaseEvent)
@@ -155,12 +347,13 @@ onUnmounted(() => {
   offStudy1Event('study1_readiness_updated', onPhaseEvent)
   offStudy1Event('study1_session_terminated', onPhaseEvent)
   leaveStudy1Session()
+  audioSession.dispose()
 })
 </script>
 
 <template>
   <main class="study-shell">
-    <div v-if="loading" class="card">Loading the authoritative study state…</div>
+    <div v-if="loading" class="card">Loading the authoritative study state...</div>
     <div v-else-if="!session" class="card error-card">
       <h1>Study 1 access unavailable</h1>
       <p>{{ error }}</p>
@@ -172,11 +365,66 @@ onUnmounted(() => {
         :status="session.status"
         :ready="session.ready_to_advance"
         :remaining-seconds="session.remaining_seconds"
+        :session-id="identity.session_id"
       />
       <p class="role-label">Signed in as {{ role.replaceAll('_', ' ') }}</p>
       <p v-if="error" class="message error">{{ error }}</p>
       <p v-if="notice" class="message success">{{ notice }}</p>
-      <div class="card">
+      <Study1MeetingWorkspace
+        v-if="meetingWorkspaceVisible"
+        :session-id="identity.session_id"
+        :phase="phase"
+        :phase-version="session.phase_version"
+        :role="role"
+        :audio-session="audioSession"
+        :task-title="workspaceTaskTitle"
+        :task-description="workspaceTaskDescription"
+        :remaining-seconds="session.remaining_seconds"
+        @error="showTransientError($event)"
+      >
+        <section v-if="showMaterialReference" class="material-reference">
+          <h2>Your private material reference</h2>
+          <p>Only the material assigned to your role is shown here.</p>
+          <article v-for="material in materials" :key="material.material_id">
+            <h3>{{ material.title }}</h3>
+            <p v-if="material.content">{{ material.content }}</p>
+            <a v-else-if="material.storage_uri" :href="material.storage_uri" target="_blank" rel="noopener">
+              Open assigned document
+            </a>
+          </article>
+        </section>
+        <VotePhase
+          v-if="phase === 'TENTATIVE_DECISION'"
+          title="Tentative decision"
+          variant="tentative"
+          :candidates="currentCandidates"
+          :busy="busy"
+          :locked="hasAnyCompleted(['tentative_individual', 'tentative_decision'])"
+          :available="Boolean(capabilities.submit_tentative_individual)"
+          @submit="submitDecision('tentative_individual', $event)"
+        />
+        <WaitingRoom
+          v-else-if="['DELEGATION_EXPECTATION', 'REVIEW', 'COMPREHENSION_MEASUREMENT'].includes(phase)"
+          message="Your audio connection is being kept ready. Wait for the researcher to continue."
+        />
+        <p v-else class="meeting-guidance">
+          {{ phase === 'PROXY_MEETING'
+            ? 'Discuss the task with the participants shown in the meeting.'
+            : 'Use the shared audio room for this stage.' }}
+        </p>
+      </Study1MeetingWorkspace>
+      <div v-else class="card">
+        <section v-if="showMaterialReference" class="material-reference">
+          <h2>Your private material reference</h2>
+          <p>Only the material assigned to your role is shown here.</p>
+          <article v-for="material in materials" :key="material.material_id">
+            <h3>{{ material.title }}</h3>
+            <p v-if="material.content">{{ material.content }}</p>
+            <a v-else-if="material.storage_uri" :href="material.storage_uri" target="_blank" rel="noopener">
+              Open assigned document
+            </a>
+          </article>
+        </section>
         <section v-if="phase === 'SETUP'">
           <ConsentPhase
             :role="role"
@@ -198,9 +446,11 @@ onUnmounted(() => {
           v-else-if="phase === 'PRE_VOTE'"
           title="Initial judgment"
           variant="pre"
+          :candidates="currentCandidates"
           :busy="busy"
-          :locked="hasCompleted(role === 'principal' ? 'proxy_config' : 'proxy_ready')"
-          @submit="submit('pre_vote', $event)"
+          :locked="hasAnyCompleted(['pre_individual', 'pre_vote'])"
+          :available="Boolean(capabilities.submit_pre_individual)"
+          @submit="submitDecision('pre_individual', $event)"
         />
         <ProxyConfigPhase
           v-else-if="phase === 'PROXY_CONFIGURATION'"
@@ -209,34 +459,28 @@ onUnmounted(() => {
           :busy="busy"
           @submit="submit(role === 'principal' ? 'proxy_config' : 'proxy_ready', $event)"
         />
-        <Study1VoiceRoom
-          v-else-if="phase === 'PROXY_MEETING' && role !== 'principal'"
-          :session-id="identity.session_id"
-          :phase="phase"
-          :phase-version="session.phase_version"
-          :role="role"
-          @error="showTransientError($event)"
-        />
         <WaitingRoom
           v-else-if="phase === 'PROXY_MEETING'"
           :message="session.waiting_room?.message || 'The delegated discussion is in progress.'"
           :remaining-seconds="session.waiting_room?.remaining_seconds"
           :connection-status="session.waiting_room?.connection_status || 'connected'"
         />
-        <VotePhase
-          v-else-if="phase === 'TENTATIVE_DECISION' && role !== 'principal'"
-          title="Tentative decision"
-          variant="tentative"
-          :busy="busy"
-          @submit="submit('tentative_decision', $event)"
-        />
         <WaitingRoom v-else-if="phase === 'TENTATIVE_DECISION'" />
         <SurveyPhase
-          v-else-if="phase === 'DELEGATION_EXPECTATION' && role === 'principal'"
+          v-else-if="phase === 'DELEGATION_EXPECTATION' && role === 'principal' && !usesCurrentServerInstrument"
           title="Delegation expectation"
           instrument="delegation_expectation"
           :busy="busy"
           @submit="submit('delegation_expectation', $event)"
+        />
+        <InstrumentPhase
+          v-else-if="phase === 'DELEGATION_EXPECTATION' && role === 'principal'"
+          title="Delegation expectation"
+          :instrument="currentInstrument"
+          :busy="busy"
+          :locked="hasCompleted('delegation_expectation')"
+          :available="Boolean(capabilities.submit_delegation_expectation)"
+          @submit="submitInstrument"
         />
         <WaitingRoom v-else-if="phase === 'DELEGATION_EXPECTATION'" />
         <ReviewPhase
@@ -245,52 +489,92 @@ onUnmounted(() => {
         />
         <WaitingRoom v-else-if="phase === 'REVIEW'" />
         <SurveyPhase
-          v-else-if="phase === 'COMPREHENSION_MEASUREMENT' && role === 'principal'"
+          v-else-if="phase === 'COMPREHENSION_MEASUREMENT' && role === 'principal' && !usesCurrentServerInstrument"
           title="Comprehension measurement"
           instrument="comprehension_measurement"
           :busy="busy"
           @submit="submit('comprehension_measurement', $event)"
         />
-        <WaitingRoom v-else-if="phase === 'COMPREHENSION_MEASUREMENT'" />
-        <Study1VoiceRoom
-          v-else-if="['HANDOFF', 'SYNC_MEETING'].includes(phase)"
-          :session-id="identity.session_id"
-          :phase="phase"
-          :phase-version="session.phase_version"
-          :role="role"
-          @error="showTransientError($event)"
-        />
-        <VotePhase
-          v-else-if="phase === 'FINAL_DECISION'"
-          title="Final decision"
-          variant="final"
+        <InstrumentPhase
+          v-else-if="phase === 'COMPREHENSION_MEASUREMENT' && role === 'principal'"
+          title="Comprehension measurement"
+          :instrument="currentInstrument"
           :busy="busy"
-          @submit="submit('final_decision', $event)"
+          :locked="hasCompleted('comprehension_measurement')"
+          :available="Boolean(capabilities.submit_comprehension_measurement)"
+          @submit="submitInstrument"
         />
-        <SurveyPhase
+        <WaitingRoom v-else-if="phase === 'COMPREHENSION_MEASUREMENT'" />
+        <section v-else-if="phase === 'FINAL_DECISION'" class="final-decision-grid">
+          <SharedArtifactPhase
+            title="Shared team final decision"
+            kind="team_final"
+            :role="role"
+            :candidates="currentCandidates"
+            :artifact="sharedArtifacts.team_final"
+            :busy="busy"
+            :can-edit="Boolean(capabilities.edit_team_final)"
+            :can-confirm="Boolean(capabilities.confirm_team_final)"
+            @edit="saveSharedArtifact('team_final', $event)"
+            @confirm="confirmSharedArtifact('team_final', $event)"
+          />
+          <VotePhase
+            title="Private final decision"
+            variant="final"
+            :candidates="currentCandidates"
+            :busy="busy"
+            :locked="hasAnyCompleted(['final_individual', 'final_decision'])"
+            :available="Boolean(capabilities.submit_final_individual)"
+            @submit="submitDecision('final_individual', $event)"
+          />
+        </section>
+        <SharedArtifactPhase
           v-else-if="phase === 'FOLLOWUP_TASK'"
           title="Follow-up collaboration task"
-          instrument="followup_task"
+          kind="followup_task"
+          :role="role"
+          :artifact="sharedArtifacts.followup_task"
           :busy="busy"
-          @submit="submit('followup_task', $event)"
+          :can-edit="Boolean(capabilities.edit_followup_task)"
+          :can-confirm="Boolean(capabilities.confirm_followup_task)"
+          @edit="saveSharedArtifact('followup_task', $event)"
+          @confirm="confirmSharedArtifact('followup_task', $event)"
         />
-        <SurveyPhase
+        <InstrumentPhase
           v-else-if="phase === 'POST_SURVEY'"
           title="Final questionnaire"
-          instrument="post_survey"
+          :instrument="currentInstrument"
           :busy="busy"
-          @submit="submit('post_survey', $event)"
+          :locked="hasCompleted('post_survey')"
+          :available="Boolean(capabilities.submit_post_survey)"
+          @submit="submitInstrument"
         />
-        <CompletionPhase v-else-if="phase === 'COMPLETED'" />
+        <section v-else-if="phase === 'COMPLETED'">
+          <CompletionPhase />
+          <MarkerPhase :session-id="identity.session_id" />
+          <WithdrawalPhase
+            :session-id="identity.session_id"
+            :role="role"
+            :busy="busy"
+            @submit="submitWithdrawal"
+          />
+        </section>
       </div>
     </template>
   </main>
 </template>
 
 <style scoped>
-.study-shell { width:min(840px, calc(100% - 2rem)); margin:2rem auto; color:#263746; font-family:Inter, ui-sans-serif, system-ui, sans-serif; }
-.card { background:#f9fbfc; border:1px solid #dce3e9; border-radius:14px; margin-top:1.25rem; padding:1.5rem; box-shadow:0 10px 28px rgba(39,58,74,.06); }
+:global(body) { background:#eef1f2; }
+.study-shell { width:min(1180px, calc(100% - 2rem)); min-height:100vh; margin:1.25rem auto 2rem; color:#263746; font-family:Inter, ui-sans-serif, system-ui, sans-serif; }
+.card { background:#f9fbfc; border:1px solid #dce3e9; border-radius:8px; margin-top:1.25rem; padding:1.5rem; box-shadow:0 10px 28px rgba(39,58,74,.06); }
 .role-label { color:#667482; font-size:.85rem; text-transform:capitalize; }
+.meeting-guidance { margin:0; color:#5f6f79; line-height:1.55; }
+.final-decision-grid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:1.25rem; }
+.material-reference { margin:0 0 1rem; padding:1rem; border:1px solid #d7e0e7; border-radius:10px; background:#fff; }
+.material-reference h2 { margin-top:0; }
+.material-reference article { margin-top:.8rem; padding-top:.8rem; border-top:1px solid #e5ebf0; }
+.material-reference p { white-space:pre-wrap; line-height:1.55; }
 .message { padding:.75rem 1rem; border-radius:8px; animation:message-in .18s ease-out; }
 .error { background:#fff0f0; color:#9b2828; }
 .success { background:#e9f7ef; color:#17633c; }
@@ -298,4 +582,5 @@ onUnmounted(() => {
 button { border:0; border-radius:8px; background:#245f8e; color:white; padding:.7rem 1rem; font:inherit; font-weight:700; cursor:pointer; }
 button:disabled { opacity:.5; cursor:not-allowed; }
 @keyframes message-in { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:translateY(0); } }
+@media (max-width:760px) { .final-decision-grid { grid-template-columns:1fr; } }
 </style>

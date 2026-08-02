@@ -1,5 +1,5 @@
 import { flushPromises, mount } from '@vue/test-utils'
-import { expect, it, vi } from 'vitest'
+import { beforeEach, expect, it, vi } from 'vitest'
 
 import ReviewPhase from './ReviewPhase.vue'
 
@@ -20,7 +20,16 @@ vi.mock('../services/study1Api.js', () => ({
     },
   })),
   logReviewUiEvent: vi.fn(async () => ({ accepted: true })),
+  sendReviewEventBatch: vi.fn(async () => ({ accepted: true })),
 }))
+
+import { sendReviewEventBatch } from '../services/study1Api.js'
+
+
+beforeEach(() => {
+  vi.useRealTimers()
+  vi.clearAllMocks()
+})
 
 
 it('renders B transcript JSON as timestamped attributed segments', async () => {
@@ -31,4 +40,32 @@ it('renders B transcript JSON as timestamped attributed segments', async () => {
   expect(wrapper.get('#segment-seg-9').text()).toContain('00:00.100')
   expect(wrapper.get('#segment-seg-9').text()).toContain('T1')
   expect(wrapper.get('#segment-seg-9').text()).toContain('The north route is shorter.')
+})
+
+
+it('sends server review telemetry batches for enter and heartbeat events', async () => {
+  vi.useFakeTimers()
+  const wrapper = mount(ReviewPhase, { props: { sessionId: 'session-1' } })
+  await flushPromises()
+
+  expect(sendReviewEventBatch).toHaveBeenCalledWith(
+    'session-1',
+    expect.objectContaining({
+      visit_id: expect.any(String),
+      events: [
+        expect.objectContaining({ sequence_no: 1, event_type: 'enter' }),
+      ],
+    }),
+  )
+
+  await vi.advanceTimersByTimeAsync(5_000)
+  expect(sendReviewEventBatch).toHaveBeenCalledWith(
+    'session-1',
+    expect.objectContaining({
+      events: [
+        expect.objectContaining({ event_type: 'heartbeat' }),
+      ],
+    }),
+  )
+  wrapper.unmount()
 })

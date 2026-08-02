@@ -1,3 +1,9 @@
+import {
+  normalizeMediaAccess,
+  normalizeParticipantState,
+  normalizeResearcherMediaStatus,
+} from './study1Contracts.js'
+
 const TOKEN_KEY = 'study1_auth_token'
 const IDENTITY_KEY = 'study1_identity'
 
@@ -48,6 +54,10 @@ export async function exchangeInvite(token) {
 
 export function fetchMe(sessionId) {
   return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/me`)
+    .then(result => ({
+      ...result,
+      session: normalizeParticipantState(result.session || {}),
+    }))
 }
 
 export function fetchMyMaterials(sessionId) {
@@ -81,10 +91,12 @@ export function createSubmission(sessionId, type, payload, instrumentVersion = '
   )
 }
 
-export async function researcherLogin(key) {
+export async function researcherLogin(key, scopes = null) {
+  const body = { key }
+  if (Array.isArray(scopes) && scopes.length) body.scopes = scopes
   const result = await request('/api/study1/auth/researcher', {
     method: 'POST',
-    body: JSON.stringify({ key }),
+    body: JSON.stringify(body),
   })
   sessionStorage.setItem(TOKEN_KEY, result.token)
   sessionStorage.setItem(
@@ -92,6 +104,192 @@ export async function researcherLogin(key) {
     JSON.stringify({ participant_id: 'researcher', role: 'researcher', session_id: null }),
   )
   return result
+}
+
+function formalSegment(value) {
+  return encodeURIComponent(String(value || '').replaceAll('_', '-'))
+}
+
+export function createTaskDefinition(payload) {
+  return request('/api/study1/task-definitions', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function listTaskDefinitions(status = null) {
+  const query = status ? `?status=${encodeURIComponent(status)}` : ''
+  return request(`/api/study1/task-definitions${query}`)
+}
+
+export function fetchTaskDefinition(taskDefinitionId, version = null) {
+  const query = version ? `?version=${encodeURIComponent(version)}` : ''
+  return request(`/api/study1/task-definitions/${encodeURIComponent(taskDefinitionId)}${query}`)
+}
+
+export function replaceTaskDefinition(taskDefinitionId, payload, version = null) {
+  const query = version ? `?version=${encodeURIComponent(version)}` : ''
+  return request(`/api/study1/task-definitions/${encodeURIComponent(taskDefinitionId)}${query}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function validateTaskDefinition(taskDefinitionId, version = null) {
+  const query = version ? `?version=${encodeURIComponent(version)}` : ''
+  return request(`/api/study1/task-definitions/${encodeURIComponent(taskDefinitionId)}/validate${query}`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+}
+
+export function fetchCurrentInstrument(sessionId) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/me/instrument`)
+}
+
+export function submitInstrumentResponse(
+  sessionId,
+  instrumentDefinitionId,
+  instrumentVersion,
+  orderedResponses,
+) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/me/instrument`, {
+    method: 'POST',
+    body: JSON.stringify({
+      instrument_definition_id: instrumentDefinitionId,
+      instrument_version: instrumentVersion,
+      ordered_responses: orderedResponses,
+    }),
+  })
+}
+
+export function submitIndividualDecision(
+  sessionId,
+  decisionKind,
+  payload,
+  instrumentVersion = '2.0',
+) {
+  return request(
+    `/api/study1/sessions/${encodeURIComponent(sessionId)}/decisions/${formalSegment(decisionKind)}`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        instrument_version: instrumentVersion,
+        payload,
+      }),
+    },
+  )
+}
+
+export function fetchSharedArtifact(sessionId, kind) {
+  return request(
+    `/api/study1/sessions/${encodeURIComponent(sessionId)}/shared-artifacts/${formalSegment(kind)}`,
+  )
+}
+
+export function createSharedArtifactRevision(sessionId, kind, payload) {
+  return request(
+    `/api/study1/sessions/${encodeURIComponent(sessionId)}/shared-artifacts/${formalSegment(kind)}/revisions`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  )
+}
+
+export function confirmSharedArtifactRevision(sessionId, kind, revisionId) {
+  return request(
+    `/api/study1/sessions/${encodeURIComponent(sessionId)}/shared-artifacts/${formalSegment(kind)}/revisions/${encodeURIComponent(revisionId)}/confirm`,
+    {
+      method: 'POST',
+      body: JSON.stringify({}),
+    },
+  )
+}
+
+export function fetchMarkers(sessionId) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/markers`)
+}
+
+export function createMarker(sessionId, payload) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/markers`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function fetchReplayPlans(sessionId) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/replay-plans`)
+}
+
+export function createReplayPlan(sessionId, payload) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/replay-plans`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function createSummaryAction(sessionId, payload) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/summary-actions`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function submitSummaryQa(sessionId, summaryArtifactId, ratings) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/summary-qa`, {
+    method: 'POST',
+    body: JSON.stringify({
+      summary_artifact_id: summaryArtifactId,
+      ratings,
+    }),
+  })
+}
+
+export function reportQualityMetrics(sessionId, payload) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/quality-metrics`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function fetchQualitySnapshot(sessionId) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/quality`)
+}
+
+export function createRetentionJob(payload) {
+  return request('/api/study1/privacy/retention-jobs', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function executeRetentionJob(jobId, payload = {}) {
+  return request(`/api/study1/privacy/retention-jobs/${encodeURIComponent(jobId)}/execute`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function fetchStudy2Resource(sessionId, resource, { cursor = null, limit = null } = {}) {
+  const query = new URLSearchParams()
+  if (cursor != null) query.set('cursor', cursor)
+  if (limit != null) query.set('limit', String(limit))
+  const suffix = query.toString() ? `?${query.toString()}` : ''
+  return request(
+    `/api/study2/v1/sessions/${encodeURIComponent(sessionId)}/${formalSegment(resource)}${suffix}`,
+  )
+}
+
+export function fetchStudy1PrivacyScopes() {
+  return request('/api/study1/privacy/scopes')
+}
+
+export function requestStudy1Withdrawal(sessionId, payload) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/privacy/withdrawal-requests`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
 }
 
 export function createStudy1Session(payload) {
@@ -160,11 +358,12 @@ export function fetchMediaAccess(sessionId) {
   return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/media-access`, {
     method: 'POST',
     body: JSON.stringify({}),
-  })
+  }).then(normalizeMediaAccess)
 }
 
 export function fetchMediaStatus(sessionId) {
   return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/media-status`)
+    .then(normalizeResearcherMediaStatus)
 }
 
 export function reportMediaDevice(sessionId, payload) {
@@ -215,6 +414,13 @@ export function logReviewUiEvent(sessionId, eventType, payload = {}) {
       event_type: eventType,
       payload,
     }),
+  })
+}
+
+export function sendReviewEventBatch(sessionId, payload) {
+  return request(`/api/study1/sessions/${encodeURIComponent(sessionId)}/review-events/batch`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
   })
 }
 

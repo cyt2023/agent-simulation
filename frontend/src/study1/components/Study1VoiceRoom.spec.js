@@ -1,4 +1,5 @@
 import { flushPromises, mount } from '@vue/test-utils'
+import { ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import Study1VoiceRoom from './Study1VoiceRoom.vue'
@@ -60,6 +61,41 @@ describe('Study1VoiceRoom', () => {
         ]),
       },
     })
+  })
+
+  it('uses a participant-shell audio session instead of creating a component Room', async () => {
+    const external = {
+      connectionState: ref('disconnected'),
+      reconnectSecondsRemaining: ref(0),
+      muted: ref(false),
+      error: ref(''),
+      connect: vi.fn(async () => {
+        external.connectionState.value = 'connected'
+        return true
+      }),
+      toggleMute: vi.fn(),
+      disconnect: vi.fn(),
+      setAudioHost: vi.fn(),
+      dispose: vi.fn(),
+    }
+    const wrapper = mount(Study1VoiceRoom, {
+      props: {
+        sessionId: 'session-1', phase: 'PROXY_MEETING', phaseVersion: 5,
+        role: 'teammate_1', audioSession: external,
+      },
+    })
+    await flushPromises()
+    await wrapper.get('[data-test="join-audio"]').trigger('click')
+    await flushPromises()
+
+    expect(external.connect).toHaveBeenCalledWith({
+      sessionId: 'session-1', phase: 'PROXY_MEETING', phaseVersion: 5,
+      role: 'teammate_1', deviceId: 'mic-1',
+    })
+    expect(connect).not.toHaveBeenCalled()
+
+    wrapper.unmount()
+    expect(external.dispose).not.toHaveBeenCalled()
   })
 
   it('shows the proxy as a named meeting participant', async () => {

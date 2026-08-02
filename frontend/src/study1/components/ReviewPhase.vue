@@ -1,6 +1,12 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
-import { fetchReview, fetchStudy1Recording, logReviewUiEvent } from '../services/study1Api.js'
+import { createReviewTelemetry } from '../composables/useReviewTelemetry.js'
+import {
+  fetchReview,
+  fetchStudy1Recording,
+  logReviewUiEvent,
+  sendReviewEventBatch,
+} from '../services/study1Api.js'
 
 const props = defineProps({ sessionId: { type: String, required: true } })
 const loading = ref(true)
@@ -12,7 +18,13 @@ const replayUrl = ref('')
 const replayingId = ref('')
 const transcriptExpanded = ref(false)
 const maxDepth = ref(0)
-const enteredAt = ref(0)
+const visitId = `review-${Date.now()}-${Math.random().toString(36).slice(2)}`
+const telemetry = createReviewTelemetry({
+  sessionId: props.sessionId,
+  visitId,
+  sendBatch: sendReviewEventBatch,
+})
+let heartbeatTimer = null
 let scrollTimer = null
 
 const transcriptSegments = computed(() => {
@@ -70,6 +82,7 @@ async function replay(recordingId) {
   const blob = await fetchStudy1Recording(props.sessionId, recordingId)
   replayUrl.value = URL.createObjectURL(blob)
   replayingId.value = recordingId
+  await telemetry.replayRange({ recording_id: recordingId, start_ms: 0, end_ms: 0 })
   await log('recording_replay', { recording_id: recordingId, action: 'play' })
   await nextTick()
   document.querySelector('[data-study1-replay]')?.play()
@@ -77,6 +90,7 @@ async function replay(recordingId) {
 
 function toggleTranscript() {
   transcriptExpanded.value = !transcriptExpanded.value
+  telemetry.transcriptToggle(transcriptExpanded.value)
   log(transcriptExpanded.value ? 'transcript_expand' : 'transcript_collapse')
 }
 
@@ -95,15 +109,32 @@ function handleScroll() {
             const rect = node.getBoundingClientRect()
             return rect.bottom >= 0 && rect.top <= window.innerHeight
           })
-          .map(segment => segment.id)
+          .map(segment => segment.sourceId)
       : []
+    telemetry.scroll({ max_depth: maxDepth.value, visible_segments: visible })
     log('scroll_depth', { max_depth: maxDepth.value, visible_segments: visible })
   }, 750)
 }
 
+function handleVisibilityChange() {
+  telemetry.visibility(document.visibilityState === 'hidden' ? 'hidden' : 'visible')
+}
+
+function handleFocus() {
+  telemetry.focus(true)
+}
+
+function handleBlur() {
+  telemetry.focus(false)
+}
+
 onMounted(async () => {
-  enteredAt.value = Date.now()
+  telemetry.enter()
+  heartbeatTimer = window.setInterval(() => telemetry.heartbeat(), 5000)
   window.addEventListener('scroll', handleScroll, { passive: true })
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+  window.addEventListener('focus', handleFocus)
+  window.addEventListener('blur', handleBlur)
   try {
     const result = await fetchReview(props.sessionId)
     summary.value = result.summary
@@ -123,9 +154,14 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('scroll', handleScroll)
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  window.removeEventListener('focus', handleFocus)
+  window.removeEventListener('blur', handleBlur)
+  if (heartbeatTimer) window.clearInterval(heartbeatTimer)
   if (scrollTimer) window.clearTimeout(scrollTimer)
+  telemetry.leave()
   log('active_reading_time', {
-    client_active_seconds: Math.max(0, Math.round((Date.now() - enteredAt.value) / 1000)),
+    client_active_seconds: telemetry.activeSeconds(),
     max_depth: maxDepth.value,
   })
   log('review_page_leave')
@@ -136,7 +172,7 @@ onUnmounted(() => {
 <template>
   <section>
     <h2>Review the delegated discussion</h2>
-    <p v-if="loading">Loading the authorized artifact…</p>
+    <p v-if="loading">Loading the authorized artifact...</p>
     <p v-else-if="error" class="error">{{ error }}</p>
     <template v-else>
       <article class="summary">
@@ -155,7 +191,7 @@ onUnmounted(() => {
           v-for="segment in transcriptSegments"
           :id="segment.id"
           :key="segment.id"
-          @mouseenter="log('transcript_segment_view', { segment_id: segment.sourceId })"
+          @mouseenter="telemetry.segmentVisible(segment.sourceId); log('transcript_segment_view', { segment_id: segment.sourceId })"
         >
           {{ segment.text }}
           <button class="marker" @click="markCritical('transcript_segment', segment.sourceId)">Mark</button>

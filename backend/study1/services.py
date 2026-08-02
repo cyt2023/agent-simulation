@@ -15,9 +15,10 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Mapping, MutableMapping
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from services.db import ResearchSessionRow, get_session_factory, is_db_configured
 
@@ -27,10 +28,22 @@ from .models import (
     Study1ArtifactRow,
     Study1InviteRow,
     Study1IncidentRow,
+    Study1FactAssignmentRow,
+    Study1MarkerRow,
     Study1MaterialRow,
     Study1Phase,
     Study1Role,
+    Study1RoleAssignmentRow,
+    Study1ProtocolSnapshotRow,
+    Study1ReplayPlanRow,
+    Study1DecisionRow,
+    Study1InstrumentResponseRow,
+    Study1SharedArtifactRow,
+    Study1SharedConfirmationRow,
+    Study1SharedRevisionRow,
     Study1SubmissionRow,
+    Study1TaskDefinitionRow,
+    Study1TaskFactRow,
 )
 from .media_gateway import (
     COMMANDS,
@@ -47,6 +60,54 @@ from .state_machine import (
     readiness,
     transition_phase,
 )
+from .task_registry import TaskDefinitionValidationError, validate_registered_task
+from .protocol_config import (
+    ProtocolConfigError,
+    assert_protocol_runtime_match,
+    clone_protocol_values,
+    compute_protocol_checksum,
+    formal_protocol_defaults,
+    freeze_protocol_snapshot,
+    normalize_protocol_config_v2,
+)
+from .action_policy import ActionPolicyViolation, authorize_action
+from .decisions import DecisionKind, DecisionValidationError, validate_individual_decision
+from .instruments import (
+    InstrumentValidationError,
+    instrument_for,
+    load_instrument_catalog,
+    validate_ordered_responses,
+)
+from .shared_artifacts import (
+    SharedArtifactKind,
+    SharedArtifactValidationError,
+    content_checksum,
+    validate_shared_artifact_context,
+    validate_shared_content,
+)
+from .summary_service import (
+    SummaryPolicyError,
+    SummaryQaService,
+    build_summary_failure_action,
+)
+from .incident_codes import IncidentCodeError, incident_definition
+from .quality_service import build_quality_snapshot, normalize_rtc_metric
+from .marker_service import (
+    MarkerValidationError,
+    marker_visible_to_actor,
+    normalize_marker,
+)
+from .replay_service import ReplayValidationError, build_replay_plan
+from .privacy_service import (
+    missing_required_consent_scopes,
+    normalize_consent_submission,
+)
+from .review_telemetry import ReviewTelemetryAccumulator
+from .formal_projection import (
+    formal_capabilities,
+    formal_readiness,
+    project_formal_session,
+)
 
 
 def utc_now() -> datetime:
@@ -55,6 +116,14 @@ def utc_now() -> datetime:
 
 def utc_iso(value: datetime | None = None) -> str:
     return (value or utc_now()).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def study1_release_identity_from_env() -> dict[str, str] | None:
+    release_id = os.environ.get("STUDY1_RELEASE_ID")
+    checksum = os.environ.get("STUDY1_RELEASE_CHECKSUM")
+    if not release_id and not checksum:
+        return None
+    return {"release_id": str(release_id or ""), "checksum": str(checksum or "")}
 
 
 def hash_invite_token(token: str) -> str:
@@ -116,7 +185,6 @@ STRUCTURED_SUBMISSION_FIELDS: dict[str, tuple[str, ...]] = {
         "consent_version",
         "identity_confirmed",
         "role_confirmed",
-        "audio_recording_confirmed",
         "voluntary_participation_confirmed",
     ),
     "pre_vote": ("decision", "rationale", "confidence"),
@@ -181,6 +249,7 @@ REVIEW_UI_EVENTS = {
     "active_reading_time",
     "critical_marker",
     "recording_replay",
+    "rtc_metric_sample",
 }
 
 
@@ -216,6 +285,17 @@ class InMemoryStudy1Repository:
         self.submissions: list[dict[str, Any]] = []
         self.artifacts: list[dict[str, Any]] = []
         self.incidents: list[dict[str, Any]] = []
+        self.task_definitions: dict[tuple[str, str], dict[str, Any]] = {}
+        self.role_assignments: list[dict[str, Any]] = []
+        self.fact_assignments: list[dict[str, Any]] = []
+        self.protocol_snapshots: dict[str, dict[str, Any]] = {}
+        self.decisions: list[dict[str, Any]] = []
+        self.instrument_responses: list[dict[str, Any]] = []
+        self.shared_artifacts: dict[tuple[str, str], dict[str, Any]] = {}
+        self.shared_revisions: list[dict[str, Any]] = []
+        self.shared_confirmations: list[dict[str, Any]] = []
+        self.markers: list[dict[str, Any]] = []
+        self.replay_plans: list[dict[str, Any]] = []
         self.idempotency_keys: set[str] = set()
         self._lock = threading.RLock()
 
@@ -224,12 +304,141 @@ class InMemoryStudy1Repository:
         snapshot: dict[str, Any],
         invites: list[dict[str, Any]],
         materials: list[dict[str, Any]] | None = None,
+        role_assignments: list[dict[str, Any]] | None = None,
+        fact_assignments: list[dict[str, Any]] | None = None,
+        initial_events: list[dict[str, Any]] | None = None,
+        protocol_snapshot: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
-            self.sessions[snapshot["session_id"]] = snapshot
+            self.sessions[snapshot["session_id"]] = copy.deepcopy(snapshot)
             for invite in invites:
-                self.invites[invite["token_hash"]] = invite
+                self.invites[invite["token_hash"]] = copy.deepcopy(invite)
             self.materials.extend(copy.deepcopy(materials or []))
+            self.role_assignments.extend(copy.deepcopy(role_assignments or []))
+            self.fact_assignments.extend(copy.deepcopy(fact_assignments or []))
+            self.events.extend(copy.deepcopy(initial_events or []))
+            if protocol_snapshot is not None:
+                self.protocol_snapshots[snapshot["session_id"]] = copy.deepcopy(
+                    protocol_snapshot
+                )
+
+    def get_protocol_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            value = self.protocol_snapshots.get(session_id)
+            return copy.deepcopy(value) if value else None
+
+    def update_protocol_snapshot(
+        self, session_id: str, protocol_snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            self.protocol_snapshots[session_id] = copy.deepcopy(protocol_snapshot)
+            config = copy.deepcopy(protocol_snapshot.get("canonical_config") or {})
+            session["experiment_config"] = config
+            session["configuration_checksum"] = protocol_snapshot.get("checksum")
+            session["protocol_snapshot_id"] = protocol_snapshot.get(
+                "protocol_snapshot_id"
+            )
+            session["protocol_config_frozen"] = bool(protocol_snapshot.get("frozen"))
+            return copy.deepcopy(protocol_snapshot)
+
+    def create_task_definition(self, task: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            key = (task["task_definition_id"], task["task_version"])
+            if key in self.task_definitions:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_EXISTS", "Task definition already exists", 409
+                )
+            self.task_definitions[key] = copy.deepcopy(task)
+            return copy.deepcopy(task)
+
+    def get_task_definition(
+        self, task_definition_id: str, task_version: str | None = None
+    ) -> dict[str, Any] | None:
+        """Resolve an exact version, or the newest definition for legacy callers."""
+        with self._lock:
+            if task_version is not None:
+                value = self.task_definitions.get(
+                    (task_definition_id, task_version)
+                )
+            else:
+                matches = [
+                    item
+                    for (logical_id, _version), item in self.task_definitions.items()
+                    if logical_id == task_definition_id
+                ]
+                value = max(
+                    matches,
+                    key=lambda item: (item["created_at"], item["task_version"]),
+                    default=None,
+                )
+            return copy.deepcopy(value) if value else None
+
+    def replace_task_definition(
+        self, task_definition_id: str, task: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self._lock:
+            key = (task_definition_id, task["task_version"])
+            current = self.task_definitions.get(key)
+            if current is None:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+                )
+            if current["status"] != "draft":
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_IMMUTABLE",
+                    "Validated task definitions cannot be modified",
+                    409,
+                )
+            self.task_definitions[key] = copy.deepcopy(task)
+            return copy.deepcopy(task)
+
+    def set_task_definition_status(
+        self,
+        task_definition_id: str,
+        task_version: str,
+        status: str,
+        content_checksum: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            task = self.task_definitions.get((task_definition_id, task_version))
+            if task is None:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+                )
+            if task["content_checksum"] != content_checksum:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_CHANGED",
+                    "Task definition changed before validation completed",
+                    409,
+                )
+            if task["status"] == status:
+                return copy.deepcopy(task)
+            if task["status"] != "draft":
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_IMMUTABLE",
+                    "Validated task definitions cannot be modified",
+                    409,
+                )
+            task["status"] = status
+            return copy.deepcopy(task)
+
+    def list_task_definitions(self, status: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            values = self.task_definitions.values()
+            return [
+                copy.deepcopy(item)
+                for item in sorted(
+                    values,
+                    key=lambda value: (
+                        value["task_definition_id"],
+                        value["task_version"],
+                    ),
+                )
+                if status is None or item["status"] == status
+            ]
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -255,16 +464,23 @@ class InMemoryStudy1Repository:
         actor: dict[str, Any],
         reason: str | None,
         override: bool,
+        completion_override: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         with self._lock:
-            session = self.sessions.get(session_id)
-            if not session:
+            stored = self.sessions.get(session_id)
+            if not stored:
                 raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            session = copy.deepcopy(stored)
+            if completion_override is not None:
+                session["completion"] = copy.deepcopy(dict(completion_override))
             transition = transition_phase(
                 session, target_phase, actor, reason=reason, override=override
             )
             if session["phase"] == Study1Phase.COMPLETED.value:
                 session["status"] = "completed"
+            if completion_override is not None:
+                session["completion"] = copy.deepcopy(stored.get("completion") or {})
+            self.sessions[session_id] = session
             events = _transition_events(session_id, actor, transition)
             self.events.extend(copy.deepcopy(events))
             return copy.deepcopy(session), events
@@ -328,6 +544,221 @@ class InMemoryStudy1Repository:
             self.submissions.append(revision)
             return copy.deepcopy(revision)
 
+    def create_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if any(
+                row["session_id"] == decision["session_id"]
+                and row["decision_kind"] == decision["decision_kind"]
+                and row.get("participant_id") == decision.get("participant_id")
+                for row in self.decisions
+            ):
+                raise Study1ServiceError("DECISION_ALREADY_SUBMITTED", "Decision already submitted", 409)
+            self.decisions.append(copy.deepcopy(decision))
+            return copy.deepcopy(decision)
+
+    def mark_completion(self, session_id: str, key: str) -> None:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            session.setdefault("completion", {})[key] = True
+
+    def list_decisions(self, session_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            return [copy.deepcopy(row) for row in self.decisions if row["session_id"] == session_id]
+
+    def create_instrument_response(self, response: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if any(
+                row["session_id"] == response["session_id"]
+                and row["participant_id"] == response["participant_id"]
+                and row["instrument_definition_id"] == response["instrument_definition_id"]
+                and row["instrument_version"] == response["instrument_version"]
+                for row in self.instrument_responses
+            ):
+                raise Study1ServiceError("INSTRUMENT_ALREADY_SUBMITTED", "Instrument already submitted", 409)
+            self.instrument_responses.append(copy.deepcopy(response))
+            return copy.deepcopy(response)
+
+    def get_shared_artifact(
+        self, session_id: str, kind: str
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            artifact = self.shared_artifacts.get((session_id, kind))
+            if artifact is None:
+                return None
+            return _shared_artifact_projection(
+                artifact,
+                [
+                    row
+                    for row in self.shared_revisions
+                    if row["shared_artifact_id"] == artifact["shared_artifact_id"]
+                ],
+                self.shared_confirmations,
+            )
+
+    def create_shared_revision(
+        self,
+        session_id: str,
+        kind: str,
+        parent_revision_id: str | None,
+        content: dict[str, Any],
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            key = (session_id, kind)
+            artifact = self.shared_artifacts.get(key)
+            now = utc_now()
+            if artifact is None:
+                if parent_revision_id is not None:
+                    raise Study1ServiceError(
+                        "SHARED_REVISION_CONFLICT",
+                        "parent_revision_id does not match the current revision",
+                        409,
+                    )
+                artifact = {
+                    "shared_artifact_id": str(uuid.uuid4()),
+                    "session_id": session_id,
+                    "kind": kind,
+                    "current_revision_id": None,
+                    "locked_revision_id": None,
+                    "locked_at": None,
+                    "created_at": now,
+                }
+                self.shared_artifacts[key] = artifact
+            if artifact.get("locked_revision_id"):
+                raise Study1ServiceError(
+                    "SHARED_ARTIFACT_LOCKED", "Shared artifact is already locked", 409
+                )
+            if parent_revision_id != artifact.get("current_revision_id"):
+                raise Study1ServiceError(
+                    "SHARED_REVISION_CONFLICT",
+                    "parent_revision_id does not match the current revision",
+                    409,
+                )
+            revision_number = 1 + sum(
+                1
+                for row in self.shared_revisions
+                if row["shared_artifact_id"] == artifact["shared_artifact_id"]
+            )
+            revision = {
+                "revision_id": str(uuid.uuid4()),
+                "shared_artifact_id": artifact["shared_artifact_id"],
+                "revision_number": revision_number,
+                "parent_revision_id": parent_revision_id,
+                "content": copy.deepcopy(content),
+                "content_checksum": content_checksum(content),
+                "editor_participant_id": identity["participant_id"],
+                "editor_role": identity["role"],
+                "created_at": now,
+            }
+            self.shared_revisions.append(revision)
+            artifact["current_revision_id"] = revision["revision_id"]
+            self.events.append(
+                _shared_artifact_event(
+                    session,
+                    identity,
+                    "shared_revision_created",
+                    {
+                        "kind": kind,
+                        "revision_id": revision["revision_id"],
+                        "revision_number": revision_number,
+                        "parent_revision_id": parent_revision_id,
+                        "content_checksum": revision["content_checksum"],
+                    },
+                    now,
+                )
+            )
+            return _shared_revision_projection(revision, [], artifact)
+
+    def confirm_shared_revision(
+        self,
+        session_id: str,
+        kind: str,
+        revision_id: str,
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            artifact = self.shared_artifacts.get((session_id, kind))
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            if artifact is None or artifact.get("current_revision_id") != revision_id:
+                raise Study1ServiceError(
+                    "SHARED_REVISION_NOT_CURRENT",
+                    "Only the current revision can be confirmed",
+                    409,
+                )
+            revision = next(
+                (
+                    row
+                    for row in self.shared_revisions
+                    if row["revision_id"] == revision_id
+                ),
+                None,
+            )
+            if revision is None:
+                raise Study1ServiceError(
+                    "SHARED_REVISION_NOT_FOUND", "Shared revision not found", 404
+                )
+            existing = next(
+                (
+                    row
+                    for row in self.shared_confirmations
+                    if row["revision_id"] == revision_id
+                    and row["participant_id"] == identity["participant_id"]
+                ),
+                None,
+            )
+            now = utc_now()
+            if existing is None:
+                confirmation = {
+                    "confirmation_id": str(uuid.uuid4()),
+                    "revision_id": revision_id,
+                    "participant_id": identity["participant_id"],
+                    "role": identity["role"],
+                    "confirmed_at": now,
+                }
+                self.shared_confirmations.append(confirmation)
+                self.events.append(
+                    _shared_artifact_event(
+                        session,
+                        identity,
+                        "shared_revision_confirmed",
+                        {"kind": kind, "revision_id": revision_id},
+                        now,
+                    )
+                )
+            confirmations = [
+                row
+                for row in self.shared_confirmations
+                if row["revision_id"] == revision_id
+            ]
+            roles = {row["role"] for row in confirmations}
+            if roles == {role.value for role in HUMAN_ROLES} and not artifact.get(
+                "locked_revision_id"
+            ):
+                artifact["locked_revision_id"] = revision_id
+                artifact["locked_at"] = now
+                _apply_shared_lock_to_snapshot(session, kind)
+                if kind == SharedArtifactKind.TEAM_FINAL.value:
+                    self.decisions.append(
+                        _team_final_decision(session_id, revision, now)
+                    )
+                self.events.append(
+                    _shared_artifact_event(
+                        session,
+                        identity,
+                        "shared_artifact_locked",
+                        {"kind": kind, "revision_id": revision_id},
+                        now,
+                    )
+                )
+            return _shared_revision_projection(revision, confirmations, artifact)
+
     def add_artifact_for_testing(self, artifact: dict[str, Any]) -> None:
         with self._lock:
             self.artifacts.append(copy.deepcopy(artifact))
@@ -361,12 +792,120 @@ class InMemoryStudy1Repository:
     ) -> dict[str, Any]:
         with self._lock:
             session = self.sessions.get(session_id)
-            _validate_review_access(session, identity)
+            if event_type == "rtc_metric_sample":
+                _validate_rtc_telemetry_access(session, identity)
+            else:
+                _validate_review_access(session, identity)
             event = _record_review_ui_event(
                 session, identity, event_type, payload, utc_now()
             )
             self.events.append(event)
             return copy.deepcopy(event)
+
+    def record_review_event_batch(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        visit_id: str,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            _validate_review_access(session, identity)
+            result = _record_review_event_batch(
+                session, identity, visit_id, events, utc_now()
+            )
+            self.events.append(result["event"])
+            return copy.deepcopy(result["response"])
+
+    def create_marker(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            marker = normalize_marker(
+                session_id=session_id,
+                actor=actor,
+                payload=payload,
+                created_at=utc_now(),
+            )
+            self.markers.append(copy.deepcopy(marker))
+            self.events.append(_marker_event(session, actor, marker))
+            return copy.deepcopy(marker)
+
+    def list_markers(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            if session_id not in self.sessions:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            markers = [
+                item
+                for item in self.markers
+                if item["session_id"] == session_id and marker_visible_to_actor(item, actor)
+            ]
+            return copy.deepcopy(
+                sorted(markers, key=lambda item: (item["start_ms"], item["created_at"]))
+            )
+
+    def create_replay_plan(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            marker_ids = _normalize_optional_string_set(payload.get("marker_ids"))
+            markers = [
+                marker
+                for marker in self.markers
+                if marker["session_id"] == session_id
+                and (not marker_ids or marker["marker_id"] in marker_ids)
+            ]
+            plan = build_replay_plan(
+                session_id=session_id,
+                markers=copy.deepcopy(markers),
+                existing_count=len(
+                    [
+                        item
+                        for item in self.replay_plans
+                        if item["session_id"] == session_id
+                    ]
+                ),
+                created_by=str(actor.get("participant_id") or actor.get("role") or ""),
+                context_seconds=int(payload.get("context_seconds", 10)),
+                created_at=utc_now(),
+            )
+            self.replay_plans.append(copy.deepcopy(plan))
+            self.events.append(_replay_plan_event(session, actor, plan))
+            return copy.deepcopy(plan)
+
+    def list_replay_plans(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            if actor.get("role") != Study1Role.RESEARCHER.value:
+                raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+            if session_id not in self.sessions:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            return copy.deepcopy(
+                [
+                    item
+                    for item in sorted(
+                        self.replay_plans,
+                        key=lambda row: (row["session_id"], row["created_at"]),
+                    )
+                    if item["session_id"] == session_id
+                ]
+            )
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -455,6 +994,74 @@ class InMemoryStudy1Repository:
                 "materials": copy.deepcopy(
                     [item for item in self.materials if item["session_id"] == session_id]
                 ),
+                "role_assignments": copy.deepcopy(
+                    [
+                        item
+                        for item in self.role_assignments
+                        if item["session_id"] == session_id
+                    ]
+                ),
+                "fact_assignments": copy.deepcopy(
+                    [
+                        item
+                        for item in self.fact_assignments
+                        if item["session_id"] == session_id
+                    ]
+                ),
+                "protocol_snapshot": copy.deepcopy(
+                    self.protocol_snapshots.get(session_id)
+                ),
+                "decisions": copy.deepcopy(
+                    [item for item in self.decisions if item["session_id"] == session_id]
+                ),
+                "instrument_responses": copy.deepcopy(
+                    [item for item in self.instrument_responses if item["session_id"] == session_id]
+                ),
+                "shared_artifacts": copy.deepcopy(
+                    [
+                        item
+                        for item in self.shared_artifacts.values()
+                        if item["session_id"] == session_id
+                    ]
+                ),
+                "shared_revisions": copy.deepcopy(
+                    [
+                        item
+                        for item in self.shared_revisions
+                        if any(
+                            artifact["shared_artifact_id"]
+                            == item["shared_artifact_id"]
+                            and artifact["session_id"] == session_id
+                            for artifact in self.shared_artifacts.values()
+                        )
+                    ]
+                ),
+                "shared_confirmations": copy.deepcopy(
+                    [
+                        item
+                        for item in self.shared_confirmations
+                        if any(
+                            revision["revision_id"] == item["revision_id"]
+                            and any(
+                                artifact["shared_artifact_id"]
+                                == revision["shared_artifact_id"]
+                                and artifact["session_id"] == session_id
+                                for artifact in self.shared_artifacts.values()
+                            )
+                            for revision in self.shared_revisions
+                        )
+                    ]
+                ),
+                "markers": copy.deepcopy(
+                    [item for item in self.markers if item["session_id"] == session_id]
+                ),
+                "replay_plans": copy.deepcopy(
+                    [
+                        item
+                        for item in self.replay_plans
+                        if item["session_id"] == session_id
+                    ]
+                ),
             }
 
     def record_media_command(
@@ -534,11 +1141,181 @@ class SqlAlchemyStudy1Repository:
             )
         self.SessionLocal = get_session_factory()
 
+    def create_task_definition(self, task: dict[str, Any]) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            existing = db.scalar(
+                select(Study1TaskDefinitionRow).where(
+                    Study1TaskDefinitionRow.task_definition_id
+                    == task["task_definition_id"],
+                    Study1TaskDefinitionRow.task_version == task["task_version"],
+                )
+            )
+            if existing:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_EXISTS", "Task definition already exists", 409
+                )
+            db.add(_task_definition_orm(task))
+            for fact in task["facts"]:
+                db.add(
+                    _task_fact_orm(
+                        task["task_definition_id"], task["task_version"], fact
+                    )
+                )
+            db.commit()
+            return copy.deepcopy(task)
+
+    def get_task_definition(
+        self, task_definition_id: str, task_version: str | None = None
+    ) -> dict[str, Any] | None:
+        """Resolve an exact version, or the newest definition for legacy callers."""
+        with self.SessionLocal() as db:
+            query = select(Study1TaskDefinitionRow).where(
+                Study1TaskDefinitionRow.task_definition_id == task_definition_id
+            )
+            if task_version is not None:
+                query = query.where(
+                    Study1TaskDefinitionRow.task_version == task_version
+                )
+            row = db.scalar(
+                query.order_by(
+                    Study1TaskDefinitionRow.created_at.desc(),
+                    Study1TaskDefinitionRow.id.desc(),
+                )
+            )
+            if row is None:
+                return None
+            facts = db.scalars(
+                select(Study1TaskFactRow)
+                .where(
+                    Study1TaskFactRow.task_definition_id == task_definition_id,
+                    Study1TaskFactRow.task_version == row.task_version,
+                )
+                .order_by(Study1TaskFactRow.id.asc())
+            ).all()
+            return _task_definition_row_dict(row, facts)
+
+    def replace_task_definition(
+        self, task_definition_id: str, task: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            row = db.scalar(
+                select(Study1TaskDefinitionRow)
+                .where(
+                    Study1TaskDefinitionRow.task_definition_id == task_definition_id,
+                    Study1TaskDefinitionRow.task_version == task["task_version"],
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+                )
+            if row.status != "draft":
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_IMMUTABLE",
+                    "Validated task definitions cannot be modified",
+                    409,
+                )
+            row.task_version = task["task_version"]
+            row.title = task["title"]
+            row.candidate_ids = task["candidate_ids"]
+            row.status = task["status"]
+            row.content_checksum = task["content_checksum"]
+            old_facts = db.scalars(
+                select(Study1TaskFactRow).where(
+                    Study1TaskFactRow.task_definition_id == task_definition_id,
+                    Study1TaskFactRow.task_version == task["task_version"],
+                )
+            ).all()
+            for fact in old_facts:
+                db.delete(fact)
+            db.flush()
+            for fact in task["facts"]:
+                db.add(
+                    _task_fact_orm(task_definition_id, task["task_version"], fact)
+                )
+            db.commit()
+            return copy.deepcopy(task)
+
+    def set_task_definition_status(
+        self,
+        task_definition_id: str,
+        task_version: str,
+        status: str,
+        content_checksum: str,
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            row = db.scalar(
+                select(Study1TaskDefinitionRow)
+                .where(
+                    Study1TaskDefinitionRow.task_definition_id == task_definition_id,
+                    Study1TaskDefinitionRow.task_version == task_version,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+                )
+            if row.content_checksum != content_checksum:
+                raise Study1ServiceError(
+                    "TASK_DEFINITION_CHANGED",
+                    "Task definition changed before validation completed",
+                    409,
+                )
+            if row.status != status:
+                if row.status != "draft":
+                    raise Study1ServiceError(
+                        "TASK_DEFINITION_IMMUTABLE",
+                        "Validated task definitions cannot be modified",
+                        409,
+                    )
+                row.status = status
+            facts = db.scalars(
+                select(Study1TaskFactRow)
+                .where(
+                    Study1TaskFactRow.task_definition_id == task_definition_id,
+                    Study1TaskFactRow.task_version == task_version,
+                )
+                .order_by(Study1TaskFactRow.id.asc())
+            ).all()
+            db.commit()
+            return _task_definition_row_dict(row, facts)
+
+    def list_task_definitions(self, status: str | None = None) -> list[dict[str, Any]]:
+        with self.SessionLocal() as db:
+            query = select(Study1TaskDefinitionRow)
+            if status is not None:
+                query = query.where(Study1TaskDefinitionRow.status == status)
+            rows = db.scalars(
+                query.order_by(
+                    Study1TaskDefinitionRow.task_definition_id.asc(),
+                    Study1TaskDefinitionRow.task_version.asc(),
+                )
+            ).all()
+            values: list[dict[str, Any]] = []
+            for row in rows:
+                facts = db.scalars(
+                    select(Study1TaskFactRow)
+                    .where(
+                        Study1TaskFactRow.task_definition_id
+                        == row.task_definition_id,
+                        Study1TaskFactRow.task_version == row.task_version,
+                    )
+                    .order_by(Study1TaskFactRow.id.asc())
+                ).all()
+                values.append(_task_definition_row_dict(row, facts))
+            return values
+
     def create_session(
         self,
         snapshot: dict[str, Any],
         invites: list[dict[str, Any]],
         materials: list[dict[str, Any]] | None = None,
+        role_assignments: list[dict[str, Any]] | None = None,
+        fact_assignments: list[dict[str, Any]] | None = None,
+        initial_events: list[dict[str, Any]] | None = None,
+        protocol_snapshot: dict[str, Any] | None = None,
     ) -> None:
         with self.SessionLocal() as db:
             db.add(
@@ -553,7 +1330,94 @@ class SqlAlchemyStudy1Repository:
                 db.add(Study1InviteRow(**item))
             for item in materials or []:
                 db.add(Study1MaterialRow(**item))
+            for item in role_assignments or []:
+                db.add(Study1RoleAssignmentRow(**item))
+            for item in fact_assignments or []:
+                db.add(Study1FactAssignmentRow(**item))
+            for item in initial_events or []:
+                db.add(_event_orm(item))
+            if protocol_snapshot is not None:
+                db.add(
+                    Study1ProtocolSnapshotRow(
+                        protocol_snapshot_id=protocol_snapshot["protocol_snapshot_id"],
+                        session_id=snapshot["session_id"],
+                        schema_version=protocol_snapshot.get("schema_version", "2.0"),
+                        protocol_mode=protocol_snapshot.get("protocol_mode", "formal_v2"),
+                        canonical_config=protocol_snapshot["canonical_config"],
+                        checksum=protocol_snapshot["checksum"],
+                        frozen=bool(protocol_snapshot.get("frozen", False)),
+                        frozen_at=protocol_snapshot.get("frozen_at"),
+                        frozen_by=protocol_snapshot.get("frozen_by"),
+                        created_at=protocol_snapshot.get("created_at") or utc_now(),
+                    )
+                )
             db.commit()
+
+    def get_protocol_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        with self.SessionLocal() as db:
+            row = db.scalar(
+                select(Study1ProtocolSnapshotRow).where(
+                    Study1ProtocolSnapshotRow.session_id == session_id
+                )
+            )
+            if row is None:
+                return None
+            return _protocol_snapshot_row_dict(row)
+
+    def update_protocol_snapshot(
+        self, session_id: str, protocol_snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
+        frozen_at = protocol_snapshot.get("frozen_at")
+        if isinstance(frozen_at, str):
+            frozen_at = datetime.fromisoformat(frozen_at.replace("Z", "+00:00"))
+        created_at = protocol_snapshot.get("created_at") or utc_now()
+        if isinstance(created_at, str):
+            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if session_row is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            row = db.scalar(
+                select(Study1ProtocolSnapshotRow)
+                .where(Study1ProtocolSnapshotRow.session_id == session_id)
+                .with_for_update()
+            )
+            if row is None:
+                db.add(
+                    Study1ProtocolSnapshotRow(
+                        protocol_snapshot_id=protocol_snapshot["protocol_snapshot_id"],
+                        session_id=session_id,
+                        schema_version=protocol_snapshot.get("schema_version", "2.0"),
+                        protocol_mode=protocol_snapshot.get("protocol_mode", "formal_v2"),
+                        canonical_config=protocol_snapshot["canonical_config"],
+                        checksum=protocol_snapshot["checksum"],
+                        frozen=bool(protocol_snapshot.get("frozen", False)),
+                        frozen_at=frozen_at,
+                        frozen_by=protocol_snapshot.get("frozen_by"),
+                        created_at=created_at,
+                    )
+                )
+            else:
+                row.canonical_config = protocol_snapshot["canonical_config"]
+                row.checksum = protocol_snapshot["checksum"]
+                row.frozen = bool(protocol_snapshot.get("frozen", False))
+                row.frozen_at = frozen_at
+                row.frozen_by = protocol_snapshot.get("frozen_by")
+            snapshot = copy.deepcopy(session_row.payload)
+            snapshot["experiment_config"] = copy.deepcopy(
+                protocol_snapshot["canonical_config"]
+            )
+            snapshot["configuration_checksum"] = protocol_snapshot["checksum"]
+            snapshot["protocol_snapshot_id"] = protocol_snapshot["protocol_snapshot_id"]
+            snapshot["protocol_config_frozen"] = bool(protocol_snapshot.get("frozen"))
+            session_row.payload = snapshot
+            session_row.updated_at = utc_now()
+            db.commit()
+            return copy.deepcopy(protocol_snapshot)
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self.SessionLocal() as db:
@@ -591,6 +1455,7 @@ class SqlAlchemyStudy1Repository:
         actor: dict[str, Any],
         reason: str | None,
         override: bool,
+        completion_override: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         with self.SessionLocal() as db:
             row = db.scalar(
@@ -600,12 +1465,17 @@ class SqlAlchemyStudy1Repository:
             )
             if not row or row.payload.get("experiment_type") != "study1":
                 raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            original_completion = copy.deepcopy((row.payload or {}).get("completion") or {})
             snapshot = copy.deepcopy(row.payload)
+            if completion_override is not None:
+                snapshot["completion"] = copy.deepcopy(dict(completion_override))
             transition = transition_phase(
                 snapshot, target_phase, actor, reason=reason, override=override
             )
             if snapshot["phase"] == Study1Phase.COMPLETED.value:
                 snapshot["status"] = "completed"
+            if completion_override is not None:
+                snapshot["completion"] = original_completion
             events = _transition_events(session_id, actor, transition)
             for event in events:
                 db.add(_event_orm(event))
@@ -689,6 +1559,289 @@ class SqlAlchemyStudy1Repository:
             db.commit()
             return revision
 
+    def create_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
+        try:
+            with self.SessionLocal() as db:
+                db.add(Study1DecisionRow(**decision))
+                db.commit()
+                return copy.deepcopy(decision)
+        except IntegrityError as error:
+            raise Study1ServiceError(
+                "DECISION_ALREADY_SUBMITTED", "Decision already submitted", 409
+            ) from error
+
+    def mark_completion(self, session_id: str, key: str) -> None:
+        with self.SessionLocal() as db:
+            row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            snapshot = copy.deepcopy(row.payload)
+            snapshot.setdefault("completion", {})[key] = True
+            row.payload = snapshot
+            row.updated_at = utc_now()
+            db.commit()
+
+    def list_decisions(self, session_id: str) -> list[dict[str, Any]]:
+        with self.SessionLocal() as db:
+            rows = db.scalars(
+                select(Study1DecisionRow)
+                .where(Study1DecisionRow.session_id == session_id)
+                .order_by(Study1DecisionRow.created_at.asc())
+            ).all()
+            return [_decision_row_dict(row) for row in rows]
+
+    def create_instrument_response(self, response: dict[str, Any]) -> dict[str, Any]:
+        try:
+            with self.SessionLocal() as db:
+                db.add(Study1InstrumentResponseRow(**response))
+                db.commit()
+                return copy.deepcopy(response)
+        except IntegrityError as error:
+            raise Study1ServiceError(
+                "INSTRUMENT_ALREADY_SUBMITTED", "Instrument already submitted", 409
+            ) from error
+
+    def get_shared_artifact(
+        self, session_id: str, kind: str
+    ) -> dict[str, Any] | None:
+        with self.SessionLocal() as db:
+            artifact = db.scalar(
+                select(Study1SharedArtifactRow).where(
+                    Study1SharedArtifactRow.session_id == session_id,
+                    Study1SharedArtifactRow.kind == kind,
+                )
+            )
+            if artifact is None:
+                return None
+            revisions = db.scalars(
+                select(Study1SharedRevisionRow)
+                .where(
+                    Study1SharedRevisionRow.shared_artifact_id
+                    == artifact.shared_artifact_id
+                )
+                .order_by(Study1SharedRevisionRow.revision_number.asc())
+            ).all()
+            confirmations = db.scalars(
+                select(Study1SharedConfirmationRow).where(
+                    Study1SharedConfirmationRow.revision_id.in_(
+                        [row.revision_id for row in revisions]
+                    )
+                )
+            ).all() if revisions else []
+            return _shared_artifact_projection(
+                _shared_artifact_row_dict(artifact),
+                [_shared_revision_row_dict(row) for row in revisions],
+                [_shared_confirmation_row_dict(row) for row in confirmations],
+            )
+
+    def create_shared_revision(
+        self,
+        session_id: str,
+        kind: str,
+        parent_revision_id: str | None,
+        content: dict[str, Any],
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if session_row is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            artifact = db.scalar(
+                select(Study1SharedArtifactRow)
+                .where(
+                    Study1SharedArtifactRow.session_id == session_id,
+                    Study1SharedArtifactRow.kind == kind,
+                )
+                .with_for_update()
+            )
+            now = utc_now()
+            if artifact is None:
+                if parent_revision_id is not None:
+                    raise Study1ServiceError(
+                        "SHARED_REVISION_CONFLICT",
+                        "parent_revision_id does not match the current revision",
+                        409,
+                    )
+                artifact = Study1SharedArtifactRow(
+                    shared_artifact_id=str(uuid.uuid4()),
+                    session_id=session_id,
+                    kind=kind,
+                    current_revision_id=None,
+                    locked_revision_id=None,
+                    locked_at=None,
+                    created_at=now,
+                )
+                db.add(artifact)
+                db.flush()
+            if artifact.locked_revision_id:
+                raise Study1ServiceError(
+                    "SHARED_ARTIFACT_LOCKED", "Shared artifact is already locked", 409
+                )
+            if parent_revision_id != artifact.current_revision_id:
+                raise Study1ServiceError(
+                    "SHARED_REVISION_CONFLICT",
+                    "parent_revision_id does not match the current revision",
+                    409,
+                )
+            revision_number = (
+                db.scalar(
+                    select(Study1SharedRevisionRow.revision_number)
+                    .where(
+                        Study1SharedRevisionRow.shared_artifact_id
+                        == artifact.shared_artifact_id
+                    )
+                    .order_by(Study1SharedRevisionRow.revision_number.desc())
+                    .limit(1)
+                )
+                or 0
+            ) + 1
+            revision = Study1SharedRevisionRow(
+                revision_id=str(uuid.uuid4()),
+                shared_artifact_id=artifact.shared_artifact_id,
+                revision_number=revision_number,
+                parent_revision_id=parent_revision_id,
+                content=copy.deepcopy(content),
+                content_checksum=content_checksum(content),
+                editor_participant_id=identity["participant_id"],
+                editor_role=identity["role"],
+                created_at=now,
+            )
+            db.add(revision)
+            artifact.current_revision_id = revision.revision_id
+            event = _shared_artifact_event(
+                session_row.payload,
+                identity,
+                "shared_revision_created",
+                {
+                    "kind": kind,
+                    "revision_id": revision.revision_id,
+                    "revision_number": revision_number,
+                    "parent_revision_id": parent_revision_id,
+                    "content_checksum": revision.content_checksum,
+                },
+                now,
+            )
+            db.add(_event_orm(event))
+            db.commit()
+            return _shared_revision_projection(
+                _shared_revision_row_dict(revision), [], _shared_artifact_row_dict(artifact)
+            )
+
+    def confirm_shared_revision(
+        self,
+        session_id: str,
+        kind: str,
+        revision_id: str,
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if session_row is None:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            artifact = db.scalar(
+                select(Study1SharedArtifactRow)
+                .where(
+                    Study1SharedArtifactRow.session_id == session_id,
+                    Study1SharedArtifactRow.kind == kind,
+                )
+                .with_for_update()
+            )
+            if artifact is None or artifact.current_revision_id != revision_id:
+                raise Study1ServiceError(
+                    "SHARED_REVISION_NOT_CURRENT",
+                    "Only the current revision can be confirmed",
+                    409,
+                )
+            revision = db.scalar(
+                select(Study1SharedRevisionRow).where(
+                    Study1SharedRevisionRow.revision_id == revision_id
+                )
+            )
+            if revision is None:
+                raise Study1ServiceError(
+                    "SHARED_REVISION_NOT_FOUND", "Shared revision not found", 404
+                )
+            existing = db.scalar(
+                select(Study1SharedConfirmationRow).where(
+                    Study1SharedConfirmationRow.revision_id == revision_id,
+                    Study1SharedConfirmationRow.participant_id
+                    == identity["participant_id"],
+                )
+            )
+            now = utc_now()
+            if existing is None:
+                db.add(
+                    Study1SharedConfirmationRow(
+                        confirmation_id=str(uuid.uuid4()),
+                        revision_id=revision_id,
+                        participant_id=identity["participant_id"],
+                        role=identity["role"],
+                        confirmed_at=now,
+                    )
+                )
+                db.add(
+                    _event_orm(
+                        _shared_artifact_event(
+                            session_row.payload,
+                            identity,
+                            "shared_revision_confirmed",
+                            {"kind": kind, "revision_id": revision_id},
+                            now,
+                        )
+                    )
+                )
+                db.flush()
+            confirmations = db.scalars(
+                select(Study1SharedConfirmationRow).where(
+                    Study1SharedConfirmationRow.revision_id == revision_id
+                )
+            ).all()
+            roles = {row.role for row in confirmations}
+            if roles == {role.value for role in HUMAN_ROLES} and not artifact.locked_revision_id:
+                artifact.locked_revision_id = revision_id
+                artifact.locked_at = now
+                snapshot = copy.deepcopy(session_row.payload)
+                _apply_shared_lock_to_snapshot(snapshot, kind)
+                session_row.payload = snapshot
+                if kind == SharedArtifactKind.TEAM_FINAL.value:
+                    existing_team_decision = db.scalar(
+                        select(Study1DecisionRow).where(
+                            Study1DecisionRow.session_id == session_id,
+                            Study1DecisionRow.decision_kind == SharedArtifactKind.TEAM_FINAL.value,
+                        )
+                    )
+                    if existing_team_decision is None:
+                        db.add(_team_final_decision_orm(session_id, revision, now))
+                db.add(
+                    _event_orm(
+                        _shared_artifact_event(
+                            snapshot,
+                            identity,
+                            "shared_artifact_locked",
+                            {"kind": kind, "revision_id": revision_id},
+                            now,
+                        )
+                    )
+                )
+            db.commit()
+            return _shared_revision_projection(
+                _shared_revision_row_dict(revision),
+                [_shared_confirmation_row_dict(row) for row in confirmations],
+                _shared_artifact_row_dict(artifact),
+            )
+
     def open_review(
         self, session_id: str, identity: dict[str, Any]
     ) -> dict[str, Any]:
@@ -738,7 +1891,10 @@ class SqlAlchemyStudy1Repository:
             if not session_row:
                 raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
             snapshot = copy.deepcopy(session_row.payload)
-            _validate_review_access(snapshot, identity)
+            if event_type == "rtc_metric_sample":
+                _validate_rtc_telemetry_access(snapshot, identity)
+            else:
+                _validate_review_access(snapshot, identity)
             event = _record_review_ui_event(
                 snapshot, identity, event_type, payload, utc_now()
             )
@@ -747,6 +1903,176 @@ class SqlAlchemyStudy1Repository:
             session_row.updated_at = utc_now()
             db.commit()
             return event
+
+    def record_review_event_batch(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        visit_id: str,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow)
+                .where(ResearchSessionRow.session_id == session_id)
+                .with_for_update()
+            )
+            if not session_row:
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            snapshot = copy.deepcopy(session_row.payload)
+            _validate_review_access(snapshot, identity)
+            result = _record_review_event_batch(
+                snapshot, identity, visit_id, events, utc_now()
+            )
+            db.add(_event_orm(result["event"]))
+            session_row.payload = snapshot
+            session_row.updated_at = utc_now()
+            db.commit()
+            return result["response"]
+
+    def create_marker(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row or session_row.payload.get("experiment_type") != "study1":
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            marker = normalize_marker(
+                session_id=session_id,
+                actor=actor,
+                payload=payload,
+                created_at=utc_now(),
+            )
+            db.add(
+                Study1MarkerRow(
+                    marker_id=marker["marker_id"],
+                    session_id=marker["session_id"],
+                    marker_type=marker["marker_type"],
+                    source=marker["source"],
+                    participant_id=marker["participant_id"],
+                    role=marker["role"],
+                    participant_visible=marker["participant_visible"],
+                    start_ms=marker["start_ms"],
+                    end_ms=marker["end_ms"],
+                    segment_ids=marker["segment_ids"],
+                    recording_ids=marker["recording_ids"],
+                    reason=marker["reason"],
+                    created_at=marker["created_at"],
+                    marker_metadata=marker["metadata"],
+                )
+            )
+            db.add(_event_orm(_marker_event(session_row.payload, actor, marker)))
+            db.commit()
+            return marker
+
+    def list_markers(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row or session_row.payload.get("experiment_type") != "study1":
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            rows = db.scalars(
+                select(Study1MarkerRow)
+                .where(Study1MarkerRow.session_id == session_id)
+                .order_by(Study1MarkerRow.start_ms.asc(), Study1MarkerRow.created_at.asc())
+            ).all()
+            return [
+                marker
+                for marker in (_marker_row_dict(row) for row in rows)
+                if marker_visible_to_actor(marker, actor)
+            ]
+
+    def create_replay_plan(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row or session_row.payload.get("experiment_type") != "study1":
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            marker_ids = _normalize_optional_string_set(payload.get("marker_ids"))
+            marker_query = select(Study1MarkerRow).where(
+                Study1MarkerRow.session_id == session_id
+            )
+            if marker_ids:
+                marker_query = marker_query.where(
+                    Study1MarkerRow.marker_id.in_(marker_ids)
+                )
+            marker_rows = db.scalars(
+                marker_query.order_by(
+                    Study1MarkerRow.start_ms.asc(), Study1MarkerRow.created_at.asc()
+                )
+            ).all()
+            existing_count = len(
+                db.scalars(
+                    select(Study1ReplayPlanRow.replay_plan_id).where(
+                        Study1ReplayPlanRow.session_id == session_id
+                    )
+                ).all()
+            )
+            plan = build_replay_plan(
+                session_id=session_id,
+                markers=[_marker_row_dict(row) for row in marker_rows],
+                existing_count=existing_count,
+                created_by=str(actor.get("participant_id") or actor.get("role") or ""),
+                context_seconds=int(payload.get("context_seconds", 10)),
+                created_at=utc_now(),
+            )
+            db.add(
+                Study1ReplayPlanRow(
+                    replay_plan_id=plan["replay_plan_id"],
+                    session_id=session_id,
+                    version=plan["version"],
+                    context_seconds=plan["context_seconds"],
+                    source_marker_ids=plan["source_marker_ids"],
+                    items=plan["items"],
+                    created_by=plan["created_by"],
+                    created_at=plan["created_at"],
+                    generator_version=plan["generator_version"],
+                    replay_metadata=plan["metadata"],
+                )
+            )
+            db.add(_event_orm(_replay_plan_event(session_row.payload, actor, plan)))
+            db.commit()
+            return plan
+
+    def list_replay_plans(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        with self.SessionLocal() as db:
+            session_row = db.scalar(
+                select(ResearchSessionRow).where(
+                    ResearchSessionRow.session_id == session_id
+                )
+            )
+            if not session_row or session_row.payload.get("experiment_type") != "study1":
+                raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+            rows = db.scalars(
+                select(Study1ReplayPlanRow)
+                .where(Study1ReplayPlanRow.session_id == session_id)
+                .order_by(Study1ReplayPlanRow.created_at.asc())
+            ).all()
+            return [_replay_plan_row_dict(row) for row in rows]
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self.SessionLocal() as db:
@@ -907,6 +2233,71 @@ class SqlAlchemyStudy1Repository:
                 .where(Study1MaterialRow.session_id == session_id)
                 .order_by(Study1MaterialRow.id.asc())
             ).all()
+            role_assignment_rows = db.scalars(
+                select(Study1RoleAssignmentRow)
+                .where(Study1RoleAssignmentRow.session_id == session_id)
+                .order_by(Study1RoleAssignmentRow.assignment_order.asc())
+            ).all()
+            fact_assignment_rows = db.scalars(
+                select(Study1FactAssignmentRow)
+                .where(Study1FactAssignmentRow.session_id == session_id)
+                .order_by(Study1FactAssignmentRow.id.asc())
+            ).all()
+            decision_rows = db.scalars(
+                select(Study1DecisionRow)
+                .where(Study1DecisionRow.session_id == session_id)
+                .order_by(Study1DecisionRow.created_at.asc())
+            ).all()
+            instrument_response_rows = db.scalars(
+                select(Study1InstrumentResponseRow)
+                .where(Study1InstrumentResponseRow.session_id == session_id)
+                .order_by(Study1InstrumentResponseRow.submitted_at.asc())
+            ).all()
+            shared_artifact_rows = db.scalars(
+                select(Study1SharedArtifactRow)
+                .where(Study1SharedArtifactRow.session_id == session_id)
+                .order_by(Study1SharedArtifactRow.created_at.asc())
+            ).all()
+            shared_artifact_ids = [
+                row.shared_artifact_id for row in shared_artifact_rows
+            ]
+            shared_revision_rows = db.scalars(
+                select(Study1SharedRevisionRow)
+                .where(
+                    Study1SharedRevisionRow.shared_artifact_id.in_(
+                        shared_artifact_ids
+                    )
+                )
+                .order_by(
+                    Study1SharedRevisionRow.shared_artifact_id.asc(),
+                    Study1SharedRevisionRow.revision_number.asc(),
+                )
+            ).all() if shared_artifact_ids else []
+            shared_revision_ids = [row.revision_id for row in shared_revision_rows]
+            shared_confirmation_rows = db.scalars(
+                select(Study1SharedConfirmationRow)
+                .where(
+                    Study1SharedConfirmationRow.revision_id.in_(
+                        shared_revision_ids
+                    )
+                )
+                .order_by(Study1SharedConfirmationRow.confirmed_at.asc())
+            ).all() if shared_revision_ids else []
+            marker_rows = db.scalars(
+                select(Study1MarkerRow)
+                .where(Study1MarkerRow.session_id == session_id)
+                .order_by(Study1MarkerRow.start_ms.asc(), Study1MarkerRow.created_at.asc())
+            ).all()
+            replay_plan_rows = db.scalars(
+                select(Study1ReplayPlanRow)
+                .where(Study1ReplayPlanRow.session_id == session_id)
+                .order_by(Study1ReplayPlanRow.created_at.asc())
+            ).all()
+            protocol_row = db.scalar(
+                select(Study1ProtocolSnapshotRow).where(
+                    Study1ProtocolSnapshotRow.session_id == session_id
+                )
+            )
             return {
                 "session": dict(session_row.payload),
                 "events": [
@@ -940,6 +2331,36 @@ class SqlAlchemyStudy1Repository:
                     for row in incident_rows
                 ],
                 "materials": [_material_row_dict(row) for row in material_rows],
+                "role_assignments": [
+                    _role_assignment_row_dict(row) for row in role_assignment_rows
+                ],
+                "fact_assignments": [
+                    _fact_assignment_row_dict(row) for row in fact_assignment_rows
+                ],
+                "protocol_snapshot": (
+                    _protocol_snapshot_row_dict(protocol_row)
+                    if protocol_row is not None
+                    else None
+                ),
+                "decisions": [_decision_row_dict(row) for row in decision_rows],
+                "instrument_responses": [
+                    _instrument_response_row_dict(row)
+                    for row in instrument_response_rows
+                ],
+                "shared_artifacts": [
+                    _shared_artifact_row_dict(row) for row in shared_artifact_rows
+                ],
+                "shared_revisions": [
+                    _shared_revision_row_dict(row) for row in shared_revision_rows
+                ],
+                "shared_confirmations": [
+                    _shared_confirmation_row_dict(row)
+                    for row in shared_confirmation_rows
+                ],
+                "markers": [_marker_row_dict(row) for row in marker_rows],
+                "replay_plans": [
+                    _replay_plan_row_dict(row) for row in replay_plan_rows
+                ],
             }
 
     def record_media_command(
@@ -1048,7 +2469,10 @@ class SqlAlchemyStudy1Repository:
                 raise Study1ServiceError(
                     "INVITE_ALREADY_USED", "Invite has already been redeemed", 409
                 )
-            if row.expires_at <= used_at:
+            expires_at = row.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= used_at:
                 raise Study1ServiceError("INVITE_EXPIRED", "Invite has expired", 410)
             row.used_at = used_at
             snapshot_row = db.scalar(
@@ -1073,6 +2497,305 @@ class SqlAlchemyStudy1Repository:
             )
             db.commit()
             return invite
+
+
+def _task_definition_orm(task: dict[str, Any]) -> Study1TaskDefinitionRow:
+    return Study1TaskDefinitionRow(
+        task_definition_id=task["task_definition_id"],
+        task_version=task["task_version"],
+        title=task["title"],
+        candidate_ids=copy.deepcopy(task["candidate_ids"]),
+        status=task["status"],
+        content_checksum=task["content_checksum"],
+        created_at=task["created_at"],
+        created_by=task["created_by"],
+    )
+
+
+def _task_fact_orm(
+    task_definition_id: str,
+    task_version: str,
+    fact: dict[str, Any],
+) -> Study1TaskFactRow:
+    return Study1TaskFactRow(
+        task_definition_id=task_definition_id,
+        task_version=task_version,
+        fact_id=fact["fact_id"],
+        candidate_id=fact["candidate_id"],
+        text=fact["text"],
+        valence=fact["valence"],
+        information_type=fact["information_type"],
+        visible_to_roles=copy.deepcopy(fact["visible_to_roles"]),
+    )
+
+
+def _task_definition_row_dict(
+    row: Study1TaskDefinitionRow, facts: list[Study1TaskFactRow]
+) -> dict[str, Any]:
+    return {
+        "task_definition_id": row.task_definition_id,
+        "task_version": row.task_version,
+        "title": row.title,
+        "candidate_ids": list(row.candidate_ids or []),
+        "facts": [
+            {
+                "fact_id": fact.fact_id,
+                "candidate_id": fact.candidate_id,
+                "text": fact.text,
+                "valence": fact.valence,
+                "information_type": fact.information_type,
+                "visible_to_roles": list(fact.visible_to_roles or []),
+            }
+            for fact in facts
+        ],
+        "status": row.status,
+        "content_checksum": row.content_checksum,
+        "created_at": row.created_at,
+        "created_by": row.created_by,
+    }
+
+
+def _role_assignment_row_dict(row: Study1RoleAssignmentRow) -> dict[str, Any]:
+    return {
+        "assignment_id": row.assignment_id,
+        "session_id": row.session_id,
+        "participant_slot_id": row.participant_slot_id,
+        "participant_id": row.participant_id,
+        "role": row.role,
+        "assignment_order": row.assignment_order,
+        "randomization_seed": row.randomization_seed,
+        "assigned_at": row.assigned_at,
+    }
+
+
+def _fact_assignment_row_dict(row: Study1FactAssignmentRow) -> dict[str, Any]:
+    return {
+        "assignment_id": row.assignment_id,
+        "session_id": row.session_id,
+        "task_definition_id": row.task_definition_id,
+        "task_version": row.task_version,
+        "fact_id": row.fact_id,
+        "role": row.role,
+        "assigned_at": row.assigned_at,
+    }
+
+
+def _protocol_snapshot_row_dict(row: Study1ProtocolSnapshotRow) -> dict[str, Any]:
+    return {
+        "protocol_snapshot_id": row.protocol_snapshot_id,
+        "session_id": row.session_id,
+        "schema_version": row.schema_version,
+        "protocol_mode": row.protocol_mode,
+        "canonical_config": copy.deepcopy(row.canonical_config),
+        "checksum": row.checksum,
+        "frozen": bool(row.frozen),
+        "frozen_at": utc_iso(row.frozen_at) if row.frozen_at else None,
+        "frozen_by": row.frozen_by,
+        "created_at": utc_iso(row.created_at) if row.created_at else None,
+    }
+
+
+def _decision_row_dict(row: Study1DecisionRow) -> dict[str, Any]:
+    return {
+        "decision_id": row.decision_id,
+        "session_id": row.session_id,
+        "decision_kind": row.decision_kind,
+        "participant_id": row.participant_id,
+        "role": row.role,
+        "candidate_id": row.candidate_id,
+        "rationale": row.rationale,
+        "confidence": row.confidence,
+        "ratings": dict(row.ratings or {}),
+        "decision_status": row.decision_status,
+        "phase": row.phase,
+        "instrument_version": row.instrument_version,
+        "source_revision_id": row.source_revision_id,
+        "locked": bool(row.locked),
+        "created_at": utc_iso(row.created_at) if row.created_at else None,
+    }
+
+
+def _shared_artifact_event(
+    session: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    event_type: str,
+    payload: dict[str, Any],
+    occurred_at: datetime,
+) -> dict[str, Any]:
+    return {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session["session_id"],
+        "participant_id": identity.get("participant_id"),
+        "role": identity.get("role"),
+        "phase": session.get("phase"),
+        "phase_version": int(session.get("phase_version") or 1),
+        "event_type": event_type,
+        "occurred_at": occurred_at,
+        "payload": copy.deepcopy(payload),
+        "idempotency_key": None,
+    }
+
+
+def _apply_shared_lock_to_snapshot(session: MutableMapping[str, Any], kind: str) -> None:
+    completion = session.setdefault("completion", {})
+    if kind == SharedArtifactKind.TEAM_FINAL.value:
+        completion["team_final_locked"] = True
+    elif kind == SharedArtifactKind.FOLLOWUP_TASK.value:
+        completion["followup_task_locked"] = True
+        for role in HUMAN_ROLES:
+            completion[f"followup_task:{role.value}"] = True
+
+
+def _team_final_decision(
+    session_id: str, revision: Mapping[str, Any], created_at: datetime
+) -> dict[str, Any]:
+    content = revision["content"]
+    return {
+        "decision_id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "decision_kind": SharedArtifactKind.TEAM_FINAL.value,
+        "participant_id": None,
+        "role": "team",
+        "candidate_id": content["candidate_id"],
+        "rationale": content["rationale"],
+        "confidence": content.get("confidence"),
+        "ratings": copy.deepcopy(content.get("ratings") or {}),
+        "decision_status": content.get("decision_status"),
+        "phase": Study1Phase.FINAL_DECISION.value,
+        "instrument_version": "2.0",
+        "source_revision_id": revision["revision_id"],
+        "locked": True,
+        "created_at": created_at,
+    }
+
+
+def _team_final_decision_orm(
+    session_id: str, revision: Study1SharedRevisionRow, created_at: datetime
+) -> Study1DecisionRow:
+    content = revision.content
+    return Study1DecisionRow(
+        decision_id=str(uuid.uuid4()),
+        session_id=session_id,
+        decision_kind=SharedArtifactKind.TEAM_FINAL.value,
+        participant_id=None,
+        role="team",
+        candidate_id=content["candidate_id"],
+        rationale=content["rationale"],
+        confidence=content.get("confidence"),
+        ratings=copy.deepcopy(content.get("ratings") or {}),
+        decision_status=content.get("decision_status"),
+        phase=Study1Phase.FINAL_DECISION.value,
+        instrument_version="2.0",
+        source_revision_id=revision.revision_id,
+        locked=True,
+        created_at=created_at,
+    )
+
+
+def _shared_revision_projection(
+    revision: Mapping[str, Any],
+    confirmations: list[Mapping[str, Any]],
+    artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    roles = {str(item.get("role") or "") for item in confirmations}
+    ordered_roles = [role.value for role in HUMAN_ROLES]
+    return {
+        "revision_id": revision["revision_id"],
+        "shared_artifact_id": revision["shared_artifact_id"],
+        "kind": artifact["kind"],
+        "revision_number": revision["revision_number"],
+        "parent_revision_id": revision.get("parent_revision_id"),
+        "content": copy.deepcopy(revision["content"]),
+        "content_checksum": revision["content_checksum"],
+        "editor_participant_id": revision["editor_participant_id"],
+        "editor_role": revision["editor_role"],
+        "created_at": utc_iso(revision["created_at"]),
+        "confirmed_roles": [role for role in ordered_roles if role in roles],
+        "locked": artifact.get("locked_revision_id") == revision["revision_id"],
+    }
+
+
+def _shared_artifact_projection(
+    artifact: Mapping[str, Any],
+    revisions: list[Mapping[str, Any]],
+    confirmations: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    current_id = artifact.get("current_revision_id")
+    current = next(
+        (item for item in revisions if item["revision_id"] == current_id), None
+    )
+    current_confirmations = [
+        item for item in confirmations if item["revision_id"] == current_id
+    ]
+    return {
+        "shared_artifact_id": artifact["shared_artifact_id"],
+        "session_id": artifact["session_id"],
+        "kind": artifact["kind"],
+        "current_revision_id": current_id,
+        "locked_revision_id": artifact.get("locked_revision_id"),
+        "locked_at": (
+            utc_iso(artifact["locked_at"]) if artifact.get("locked_at") else None
+        ),
+        "current_revision": (
+            _shared_revision_projection(current, current_confirmations, artifact)
+            if current is not None
+            else None
+        ),
+        "locked": bool(artifact.get("locked_revision_id")),
+    }
+
+
+def _shared_artifact_row_dict(row: Study1SharedArtifactRow) -> dict[str, Any]:
+    return {
+        "shared_artifact_id": row.shared_artifact_id,
+        "session_id": row.session_id,
+        "kind": row.kind,
+        "current_revision_id": row.current_revision_id,
+        "locked_revision_id": row.locked_revision_id,
+        "locked_at": row.locked_at,
+        "created_at": row.created_at,
+    }
+
+
+def _shared_revision_row_dict(row: Study1SharedRevisionRow) -> dict[str, Any]:
+    return {
+        "revision_id": row.revision_id,
+        "shared_artifact_id": row.shared_artifact_id,
+        "revision_number": row.revision_number,
+        "parent_revision_id": row.parent_revision_id,
+        "content": copy.deepcopy(row.content),
+        "content_checksum": row.content_checksum,
+        "editor_participant_id": row.editor_participant_id,
+        "editor_role": row.editor_role,
+        "created_at": row.created_at,
+    }
+
+
+def _shared_confirmation_row_dict(
+    row: Study1SharedConfirmationRow,
+) -> dict[str, Any]:
+    return {
+        "confirmation_id": row.confirmation_id,
+        "revision_id": row.revision_id,
+        "participant_id": row.participant_id,
+        "role": row.role,
+        "confirmed_at": row.confirmed_at,
+    }
+
+
+def _instrument_response_row_dict(row: Study1InstrumentResponseRow) -> dict[str, Any]:
+    return {
+        "response_id": row.response_id,
+        "session_id": row.session_id,
+        "participant_id": row.participant_id,
+        "role": row.role,
+        "instrument_definition_id": row.instrument_definition_id,
+        "instrument_version": row.instrument_version,
+        "phase": row.phase,
+        "ordered_responses": copy.deepcopy(row.ordered_responses),
+        "response_checksum": row.response_checksum,
+        "submitted_at": utc_iso(row.submitted_at) if row.submitted_at else None,
+    }
 
 
 def _invite_row_dict(row: Study1InviteRow) -> dict[str, Any]:
@@ -1154,6 +2877,41 @@ def _artifact_row_dict(row: Study1ArtifactRow) -> dict[str, Any]:
         "created_at": utc_iso(row.created_at),
         "generator_version": row.generator_version,
         "metadata": dict(row.artifact_metadata or {}),
+    }
+
+
+def _marker_row_dict(row: Study1MarkerRow) -> dict[str, Any]:
+    return {
+        "marker_id": row.marker_id,
+        "session_id": row.session_id,
+        "marker_type": row.marker_type,
+        "type": row.marker_type,
+        "source": row.source,
+        "participant_id": row.participant_id,
+        "role": row.role,
+        "participant_visible": bool(row.participant_visible),
+        "start_ms": row.start_ms,
+        "end_ms": row.end_ms,
+        "segment_ids": list(row.segment_ids or []),
+        "recording_ids": list(row.recording_ids or []),
+        "reason": row.reason,
+        "created_at": utc_iso(row.created_at),
+        "metadata": dict(row.marker_metadata or {}),
+    }
+
+
+def _replay_plan_row_dict(row: Study1ReplayPlanRow) -> dict[str, Any]:
+    return {
+        "replay_plan_id": row.replay_plan_id,
+        "session_id": row.session_id,
+        "version": row.version,
+        "context_seconds": row.context_seconds,
+        "source_marker_ids": list(row.source_marker_ids or []),
+        "items": copy.deepcopy(row.items or []),
+        "created_by": row.created_by,
+        "created_at": utc_iso(row.created_at),
+        "generator_version": row.generator_version,
+        "metadata": dict(row.replay_metadata or {}),
     }
 
 
@@ -1362,6 +3120,23 @@ def _validate_review_access(
         )
 
 
+def _validate_rtc_telemetry_access(
+    session: dict[str, Any] | None, identity: dict[str, Any]
+) -> None:
+    if not session:
+        raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+    if identity.get("role") not in {
+        Study1Role.PRINCIPAL.value,
+        Study1Role.TEAMMATE_1.value,
+        Study1Role.TEAMMATE_2.value,
+    }:
+        raise Study1ServiceError(
+            "RTC_TELEMETRY_FORBIDDEN", "Participant role required", 403
+        )
+    if session.get("status") in {"terminated", "completed"}:
+        raise Study1ServiceError("SESSION_NOT_ACTIVE", "Session is not active", 409)
+
+
 def _ui_event(
     session: dict[str, Any],
     identity: dict[str, Any],
@@ -1420,6 +3195,100 @@ def _record_review_ui_event(
         if elapsed >= minimum:
             session["completion"]["minimum_review_time_met:principal"] = True
     return _ui_event(session, identity, event_type, safe_payload, now)
+
+
+def _record_review_event_batch(
+    session: dict[str, Any],
+    identity: dict[str, Any],
+    visit_id: str,
+    events: list[dict[str, Any]],
+    now: datetime,
+) -> dict[str, Any]:
+    state = session.setdefault("review_telemetry", {})
+    accumulator = ReviewTelemetryAccumulator(state)
+    summary = accumulator.record_batch(
+        {
+            "visit_id": visit_id,
+            "session_id": session["session_id"],
+            "participant_id": identity["participant_id"],
+            "role": identity["role"],
+        },
+        events if isinstance(events, list) else [],
+        received_at_ms=int(now.timestamp() * 1000),
+    )
+    session["completion"]["review_reading_recorded:principal"] = True
+    minimum = int(session.get("minimum_review_seconds") or 0)
+    if summary.active_seconds >= minimum:
+        session["completion"]["minimum_review_time_met:principal"] = True
+    response = {
+        "accepted": True,
+        "summary": summary.public_dict(),
+    }
+    event = _ui_event(
+        session,
+        identity,
+        "review_telemetry_batch",
+        {
+            "visit_id": visit_id,
+            "accepted_event_count": summary.event_count,
+            "duplicate_event_count": summary.duplicate_count,
+            "summary": summary.public_dict(),
+        },
+        now,
+    )
+    return {"response": response, "event": event}
+
+
+def _normalize_optional_string_set(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if not isinstance(value, list):
+        raise ReplayValidationError(
+            "INVALID_REPLAY_MARKERS", "marker_ids must be a list"
+        )
+    return {item for item in (str(item).strip() for item in value) if item}
+
+
+def _marker_event(
+    session: dict[str, Any],
+    actor: dict[str, Any],
+    marker: dict[str, Any],
+) -> dict[str, Any]:
+    return _status_event(
+        session,
+        actor,
+        "marker_created",
+        {
+            "marker_id": marker["marker_id"],
+            "marker_type": marker["marker_type"],
+            "source": marker["source"],
+            "participant_visible": marker["participant_visible"],
+            "start_ms": marker["start_ms"],
+            "end_ms": marker["end_ms"],
+            "segment_ids": list(marker.get("segment_ids") or []),
+            "recording_ids": list(marker.get("recording_ids") or []),
+        },
+    )
+
+
+def _replay_plan_event(
+    session: dict[str, Any],
+    actor: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    return _status_event(
+        session,
+        actor,
+        "replay_plan_created",
+        {
+            "replay_plan_id": plan["replay_plan_id"],
+            "version": plan["version"],
+            "context_seconds": plan["context_seconds"],
+            "source_marker_ids": list(plan.get("source_marker_ids") or []),
+            "item_count": len(plan.get("items") or []),
+            "generator_version": plan["generator_version"],
+        },
+    )
 
 
 def _review_payload(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1573,18 +3442,25 @@ def _new_incident(
         raise Study1ServiceError(
             "INCIDENT_DESCRIPTION_REQUIRED", "Incident description is required", 400
         )
+    try:
+        definition = incident_definition(category)
+    except IncidentCodeError as error:
+        raise Study1ServiceError(error.code, str(error), 400) from error
     allowed_severity = {"info", "warning", "critical"}
     if severity not in allowed_severity:
         raise Study1ServiceError("INVALID_INCIDENT_SEVERITY", "Invalid severity", 400)
+    enriched_metadata = copy.deepcopy(metadata or {})
+    enriched_metadata.setdefault("incident_label", definition.label)
+    enriched_metadata.setdefault("incident_component", definition.component)
     return {
         "incident_id": str(uuid.uuid4()),
         "session_id": session_id,
-        "category": (category or "other")[:64],
+        "category": definition.code,
         "severity": severity,
         "description": clean_description,
         "created_at": utc_now(),
         "created_by": actor.get("participant_id") or "researcher",
-        "metadata": copy.deepcopy(metadata or {}),
+        "metadata": enriched_metadata,
     }
 
 
@@ -1626,7 +3502,7 @@ def _dashboard_payload(
     artifacts: list[dict[str, Any]],
     incidents: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    state = readiness(session)
+    state = formal_readiness(session) if session.get("protocol_mode") == "formal_v2" else readiness(session)
     completion = session.get("completion") or {}
     participant_status = []
     for participant in session.get("participants") or []:
@@ -1754,6 +3630,127 @@ class Study1Service:
         self.tokens = token_manager or Study1TokenManager()
         self.media_gateway = media_gateway or create_media_gateway_from_env()
 
+    @staticmethod
+    def _authorize(session: dict[str, Any], action: str, role: str | None = None) -> None:
+        # Legacy Sessions retain their original behavior; formal Sessions use
+        # the canonical policy so every runtime entry point sees the same gate.
+        if session.get("protocol_mode") != "formal_v2":
+            return
+        try:
+            authorize_action(session, action, role)
+        except ActionPolicyViolation as error:
+            raise Study1ServiceError(error.code, str(error), error.status) from error
+
+    def create_task_definition(
+        self, actor: dict[str, Any], payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._require_researcher(actor)
+        canonical = self._validate_task_payload(payload)
+        task = {
+            **canonical,
+            "status": "draft",
+            "created_at": utc_now(),
+            "created_by": str(actor.get("participant_id") or "researcher"),
+        }
+        return self.repository.create_task_definition(task)
+
+    def replace_task_definition(
+        self,
+        task_definition_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+        task_version: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_researcher(actor)
+        replacement = copy.deepcopy(payload)
+        replacement["task_definition_id"] = task_definition_id
+        if task_version is not None:
+            clean_route_version = str(task_version).strip()
+            payload_version = str(replacement.get("task_version") or "").strip()
+            if payload_version and payload_version != clean_route_version:
+                raise Study1ServiceError(
+                    "TASK_VERSION_MISMATCH",
+                    "Payload task_version does not match the selected version",
+                    400,
+                )
+            replacement["task_version"] = clean_route_version
+        selected_version = str(replacement.get("task_version") or "").strip() or None
+        existing = self.repository.get_task_definition(
+            task_definition_id, selected_version
+        )
+        if existing is None:
+            raise Study1ServiceError(
+                "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+            )
+        if existing["status"] == "validated":
+            raise Study1ServiceError(
+                "TASK_DEFINITION_IMMUTABLE",
+                "Validated task definitions cannot be modified",
+                409,
+            )
+        canonical = self._validate_task_payload(replacement)
+        task = {
+            **canonical,
+            "status": "draft",
+            "created_at": existing["created_at"],
+            "created_by": existing["created_by"],
+        }
+        return self.repository.replace_task_definition(task_definition_id, task)
+
+    def validate_task_definition(
+        self,
+        task_definition_id: str,
+        actor: dict[str, Any],
+        task_version: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_researcher(actor)
+        task = self.repository.get_task_definition(task_definition_id, task_version)
+        if task is None:
+            raise Study1ServiceError(
+                "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+            )
+        if task["status"] == "validated":
+            return task
+        canonical = self._validate_task_payload(task)
+        return self.repository.set_task_definition_status(
+            task_definition_id,
+            task["task_version"],
+            "validated",
+            canonical["content_checksum"],
+        )
+
+    def list_task_definitions(
+        self, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        clean_status = str(status).strip() if status is not None else None
+        if clean_status not in (None, "draft", "validated"):
+            raise Study1ServiceError(
+                "INVALID_TASK_STATUS", "status must be draft or validated", 400
+            )
+        return self.repository.list_task_definitions(clean_status)
+
+    def get_task_definition(
+        self, task_definition_id: str, task_version: str | None = None
+    ) -> dict[str, Any]:
+        task = self.repository.get_task_definition(task_definition_id, task_version)
+        if task is None:
+            raise Study1ServiceError(
+                "TASK_DEFINITION_NOT_FOUND", "Task definition not found", 404
+            )
+        return task
+
+    @staticmethod
+    def _require_researcher(actor: dict[str, Any]) -> None:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+
+    @staticmethod
+    def _validate_task_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return validate_registered_task(payload)
+        except TaskDefinitionValidationError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+
     def create_session(
         self,
         session_name: str,
@@ -1761,21 +3758,67 @@ class Study1Service:
         materials_by_role: dict[str, list[dict[str, Any]]] | None = None,
         minimum_review_seconds: int = 0,
         experiment_config: dict[str, Any] | None = None,
+        task_definition_id: str | None = None,
     ) -> dict[str, Any]:
         clean_name = (session_name or "").strip()
         if not clean_name:
             raise Study1ServiceError(
                 "SESSION_NAME_REQUIRED", "session_name is required", 400
             )
-        config = _normalize_experiment_config(experiment_config or {})
+        registered_task: dict[str, Any] | None = None
+        raw_config = copy.deepcopy(experiment_config or {})
+        if task_definition_id is not None:
+            clean_task_id = str(task_definition_id).strip()
+            requested_version = (
+                str(raw_config.get("task_version") or "").strip() or None
+            )
+            registered_task = self.repository.get_task_definition(
+                clean_task_id, requested_version
+            )
+            if registered_task is None or registered_task.get("status") != "validated":
+                raise Study1ServiceError(
+                    "TASK_NOT_VALIDATED",
+                    "Formal sessions require a validated task definition",
+                    409,
+                )
+            raw_config.setdefault("role_assignment_mode", "randomized")
+            raw_config["task_version"] = registered_task["task_version"]
+            raw_config["task_instance_id"] = registered_task["task_definition_id"]
+        if registered_task:
+            # Formal Sessions always use the complete V2 vocabulary.  Request
+            # values override explicit defaults, while every phase/provider/build
+            # value remains present in the persisted snapshot.
+            defaults = formal_protocol_defaults(
+                str(raw_config.get("randomization_seed") or "") or None
+            )
+            defaults.update(raw_config)
+            default_durations = defaults["phase_durations_seconds"]
+            requested_durations = raw_config.get("phase_durations_seconds") or {}
+            defaults["phase_durations_seconds"] = {
+                **default_durations,
+                **requested_durations,
+            }
+            if minimum_review_seconds:
+                defaults["minimum_review_seconds"] = int(minimum_review_seconds)
+            # Keep the old public config field as a compatibility alias.
+            if "proxy_model_version" in raw_config and "proxy_model" not in raw_config:
+                defaults["proxy_model"] = raw_config["proxy_model_version"]
+            try:
+                config = dict(normalize_protocol_config_v2(defaults))
+            except ProtocolConfigError as error:
+                raise Study1ServiceError(error.code, str(error), 400) from error
+        else:
+            config = _normalize_experiment_config(raw_config)
         now = utc_now()
         session_id = str(uuid.uuid4())
+        participant_slot_ids = [str(uuid.uuid4()) for _ in HUMAN_ROLES]
         assigned_roles = list(HUMAN_ROLES)
         if config["role_assignment_mode"] == "randomized":
             random.Random(config["randomization_seed"]).shuffle(assigned_roles)
         participants = [
             {
                 "participant_id": str(uuid.uuid4()),
+                "participant_slot_id": participant_slot_ids[index - 1],
                 "role": role.value,
                 "online": False,
                 "assignment_order": index,
@@ -1815,17 +3858,28 @@ class Study1Service:
             ],
             "participants": participants,
             "created_at": utc_iso(now),
-            "protocol_version": "study1-a-1.0",
+            "protocol_version": config.get("protocol_version", "study1-a-1.0"),
+            "protocol_mode": "formal_v2" if registered_task else "legacy_protocol",
+            "formal_certifiable": bool(registered_task),
+            "task_definition_id": (
+                registered_task["task_definition_id"] if registered_task else None
+            ),
             "task_version": config["task_version"],
             "task_instance_id": config["task_instance_id"],
+            "candidate_ids": (
+                copy.deepcopy(registered_task["candidate_ids"])
+                if registered_task
+                else []
+            ),
             "minimum_review_seconds": max(0, int(minimum_review_seconds)),
             "require_consent": config["require_consent"],
             "structured_instruments": config["structured_instruments"],
             "experiment_config": config,
+            # ``configuration_locked_at`` is retained for legacy DTO clients;
+            # formal mutability is governed by protocol_config_frozen below.
             "configuration_locked_at": utc_iso(now),
-            "configuration_checksum": hashlib.sha256(
-                json.dumps(config, sort_keys=True, ensure_ascii=False).encode("utf-8")
-            ).hexdigest(),
+            "configuration_checksum": compute_protocol_checksum(config),
+            "protocol_config_frozen": False if registered_task else True,
             "remaining_seconds": int(
                 config["phase_durations_seconds"].get(Study1Phase.SETUP.value) or 0
             ),
@@ -1861,8 +3915,95 @@ class Study1Service:
                     "created_at": now,
                 }
             )
-        materials = _normalize_materials(session_id, materials_by_role or {}, now)
-        self.repository.create_session(snapshot, rows, materials)
+        material_source = (
+            _registered_task_materials(registered_task)
+            if registered_task
+            else (materials_by_role or {})
+        )
+        materials = _normalize_materials(session_id, material_source, now)
+        role_assignments: list[dict[str, Any]] = []
+        fact_assignments: list[dict[str, Any]] = []
+        initial_events: list[dict[str, Any]] = []
+        if registered_task:
+            participant_by_role = {
+                participant["role"]: participant for participant in participants
+            }
+            for participant in participants:
+                assignment = {
+                    "assignment_id": str(uuid.uuid4()),
+                    "session_id": session_id,
+                    "participant_slot_id": participant["participant_slot_id"],
+                    "participant_id": participant["participant_id"],
+                    "role": participant["role"],
+                    "assignment_order": participant["assignment_order"],
+                    "randomization_seed": config["randomization_seed"],
+                    "assigned_at": now,
+                }
+                role_assignments.append(assignment)
+                initial_events.append(
+                    _assignment_event(
+                        snapshot,
+                        "role_assignment_created",
+                        participant["participant_id"],
+                        participant["role"],
+                        assignment,
+                        now,
+                    )
+                )
+            for fact in registered_task["facts"]:
+                for role in fact["visible_to_roles"]:
+                    assignment = {
+                        "assignment_id": str(uuid.uuid4()),
+                        "session_id": session_id,
+                        "task_definition_id": registered_task[
+                            "task_definition_id"
+                        ],
+                        "task_version": registered_task["task_version"],
+                        "fact_id": fact["fact_id"],
+                        "role": role,
+                        "assigned_at": now,
+                    }
+                    fact_assignments.append(assignment)
+                    initial_events.append(
+                        _assignment_event(
+                            snapshot,
+                            "fact_assignment_created",
+                            participant_by_role[role]["participant_id"],
+                            role,
+                            assignment,
+                            now,
+                        )
+                    )
+        protocol_snapshot = None
+        if registered_task:
+            protocol_snapshot = {
+                "protocol_snapshot_id": str(uuid.uuid4()),
+                "session_id": session_id,
+                "schema_version": "2.0",
+                "protocol_mode": "formal_v2",
+                "canonical_config": copy.deepcopy(config),
+                "checksum": compute_protocol_checksum(
+                    config,
+                    registered_task,
+                    role_assignments + fact_assignments,
+                    materials,
+                ),
+                "frozen": False,
+                "frozen_at": None,
+                "frozen_by": None,
+                "created_at": now,
+            }
+            snapshot["protocol_snapshot_id"] = protocol_snapshot["protocol_snapshot_id"]
+            snapshot["configuration_checksum"] = protocol_snapshot["checksum"]
+        self.repository.create_session(
+            snapshot,
+            rows,
+            materials,
+            role_assignments,
+            fact_assignments,
+            initial_events,
+            protocol_snapshot,
+        )
         return {
             "session": self.session_dto(snapshot),
             "invites": [invite.public_dict() for invite in created],
@@ -1898,21 +4039,86 @@ class Study1Service:
             materials_by_role,
             int(snapshot.get("minimum_review_seconds") or 0),
             config,
+            snapshot.get("task_definition_id"),
         )
 
-    def get_materials(self, session_id: str, role: Study1Role | str) -> list[dict[str, Any]]:
+    def get_protocol_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        """Return the canonical protocol snapshot for a formal Session."""
+        return self.repository.get_protocol_snapshot(session_id)
+
+    def update_protocol_config(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        patch: dict[str, Any],
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        session = self.repository.get_session(session_id)
+        snapshot = self.repository.get_protocol_snapshot(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if snapshot is None:
+            raise Study1ServiceError(
+                "LEGACY_PROTOCOL", "Legacy Sessions do not have a formal protocol", 409
+            )
+        if snapshot.get("frozen") or session.get("status") != "waiting":
+            raise Study1ServiceError(
+                "CONFIGURATION_FROZEN", "Protocol configuration is frozen", 409
+            )
+        if not isinstance(patch, dict):
+            raise Study1ServiceError("INVALID_CONFIG", "Protocol patch must be an object", 400)
+        candidate = copy.deepcopy(snapshot.get("canonical_config") or {})
+        candidate.update(copy.deepcopy(patch))
+        try:
+            config = dict(normalize_protocol_config_v2(candidate))
+        except ProtocolConfigError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+        updated = copy.deepcopy(snapshot)
+        updated["canonical_config"] = config
+        task = self.repository.get_task_definition(
+            session.get("task_definition_id"), session.get("task_version")
+        ) if session.get("task_definition_id") else None
+        exported = self.repository.export_data(session_id)
+        updated["checksum"] = compute_protocol_checksum(
+            config,
+            task,
+            exported.get("role_assignments") or [],
+            exported.get("materials") or [],
+        )
+        return self.repository.update_protocol_snapshot(session_id, updated)
+
+    def get_materials(
+        self,
+        session_id: str,
+        role: Study1Role | str,
+        *,
+        enforce_phase: bool = False,
+    ) -> list[dict[str, Any]]:
         role_value = Study1Role(role)
         if role_value not in HUMAN_ROLES:
             raise Study1ServiceError(
                 "MATERIAL_ACCESS_FORBIDDEN", "Role cannot access participant materials", 403
             )
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if enforce_phase:
+            self._authorize(session, "material_read", role_value.value)
         return self.repository.list_materials(session_id, role_value.value)
 
     def add_materials(
         self, session_id: str, role: Study1Role | str, items: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        if self.repository.get_session(session_id) is None:
+        session = self.repository.get_session(session_id)
+        if session is None:
             raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        protocol = self.repository.get_protocol_snapshot(session_id)
+        if protocol and protocol.get("frozen"):
+            raise Study1ServiceError(
+                "CONFIGURATION_FROZEN", "Protocol configuration is frozen", 409
+            )
+        self._authorize(session, "material_write", Study1Role.RESEARCHER.value)
         rows = _normalize_materials(session_id, {Study1Role(role).value: items}, utc_now())
         self.repository.add_materials(rows)
         return rows
@@ -1985,6 +4191,9 @@ class Study1Service:
         session = self.repository.get_session(session_id)
         if session is None:
             raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        self._authorize(session, "submit", str(identity.get("role") or ""))
+        if submission_type == "consent":
+            payload = normalize_consent_submission(payload)
         if session.get("structured_instruments"):
             self._validate_structured_submission(
                 submission_type, instrument_version, payload
@@ -2012,6 +4221,204 @@ class Study1Service:
             instrument_version,
             payload,
             parsed_client_time,
+        )
+
+    def create_individual_decision(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        kind: DecisionKind | str,
+        payload: dict[str, Any],
+        instrument_version: str = "2.0",
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if session.get("protocol_mode") != "formal_v2":
+            raise Study1ServiceError("FORMAL_PROTOCOL_REQUIRED", "Formal protocol required", 409)
+        self._authorize(session, "submit", str(identity.get("role") or ""))
+        if not any(
+            item.get("participant_id") == identity.get("participant_id")
+            and item.get("role") == identity.get("role")
+            for item in session.get("participants") or []
+        ):
+            raise Study1ServiceError("FORBIDDEN", "Participant is not assigned to this Session", 403)
+        try:
+            normalized = validate_individual_decision(kind, session, identity, payload)
+        except DecisionValidationError as error:
+            status = 403 if error.code == "FORBIDDEN" else 409 if error.code == "ACTION_NOT_ALLOWED_IN_PHASE" else 400
+            raise Study1ServiceError(error.code, str(error), status) from error
+        now = utc_now()
+        row = {
+            "decision_id": str(uuid.uuid4()),
+            "session_id": session_id,
+            "participant_id": identity["participant_id"],
+            "role": identity["role"],
+            **normalized,
+            "instrument_version": str(instrument_version or "2.0"),
+            "source_revision_id": None,
+            "locked": True,
+            "created_at": now,
+        }
+        created = self.repository.create_decision(row)
+        completion_prefix = {
+            DecisionKind.PRE_INDIVIDUAL.value: "pre_vote",
+            DecisionKind.TENTATIVE_INDIVIDUAL.value: "tentative_decision",
+            DecisionKind.FINAL_INDIVIDUAL.value: "final_decision",
+        }[normalized["decision_kind"]]
+        self.repository.mark_completion(session_id, f"{completion_prefix}:{identity['role']}")
+        return created
+
+    def get_current_instrument(
+        self, session_id: str, identity: dict[str, Any]
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if session.get("protocol_mode") != "formal_v2":
+            raise Study1ServiceError("FORMAL_PROTOCOL_REQUIRED", "Formal protocol required", 409)
+        catalog = load_instrument_catalog()
+        instrument = instrument_for(catalog, session["phase"], identity["role"])
+        if instrument is None:
+            raise Study1ServiceError(
+                "INSTRUMENT_NOT_AVAILABLE", "No instrument is available in the current phase", 404
+            )
+        return {
+            **instrument,
+            "catalog_version": catalog["catalog_version"],
+            "catalog_checksum": catalog["checksum"],
+            "candidate_ids": copy.deepcopy(session.get("candidate_ids") or []),
+        }
+
+    def submit_instrument_response(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        instrument_definition_id: str,
+        instrument_version: str,
+        ordered_responses: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        instrument = self.get_current_instrument(session_id, identity)
+        if (
+            instrument_definition_id != instrument["instrument_definition_id"]
+            or instrument_version != instrument["instrument_version"]
+        ):
+            raise Study1ServiceError(
+                "INSTRUMENT_VERSION_MISMATCH", "Instrument identifier or version does not match", 409
+            )
+        try:
+            normalized = validate_ordered_responses(instrument, ordered_responses)
+        except InstrumentValidationError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+        content = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        response = {
+            "response_id": str(uuid.uuid4()),
+            "session_id": session_id,
+            "participant_id": identity["participant_id"],
+            "role": identity["role"],
+            "instrument_definition_id": instrument_definition_id,
+            "instrument_version": instrument_version,
+            "phase": instrument["phase"],
+            "ordered_responses": normalized,
+            "response_checksum": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "submitted_at": utc_now(),
+        }
+        created = self.repository.create_instrument_response(response)
+        completion_by_phase = {
+            Study1Phase.DELEGATION_EXPECTATION.value: "delegation_expectation",
+            Study1Phase.COMPREHENSION_MEASUREMENT.value: "comprehension_measurement",
+            Study1Phase.POST_SURVEY.value: "post_survey",
+        }
+        completion_prefix = completion_by_phase.get(instrument["phase"])
+        if completion_prefix:
+            self.repository.mark_completion(
+                session_id, f"{completion_prefix}:{identity['role']}"
+            )
+        return created
+
+    def get_shared_artifact(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        kind: SharedArtifactKind | str,
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if session.get("protocol_mode") != "formal_v2":
+            raise Study1ServiceError("FORMAL_PROTOCOL_REQUIRED", "Formal protocol required", 409)
+        try:
+            artifact_kind = validate_shared_artifact_context(kind, session, identity)
+        except SharedArtifactValidationError as error:
+            status = 403 if error.code == "FORBIDDEN" else 409
+            raise Study1ServiceError(error.code, str(error), status) from error
+        self._authorize(session, "submit", str(identity.get("role") or ""))
+        artifact = self.repository.get_shared_artifact(session_id, artifact_kind.value)
+        if artifact is not None:
+            return artifact
+        return {
+            "shared_artifact_id": None,
+            "session_id": session_id,
+            "kind": artifact_kind.value,
+            "current_revision_id": None,
+            "locked_revision_id": None,
+            "locked_at": None,
+            "current_revision": None,
+            "locked": False,
+        }
+
+    def create_shared_revision(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        kind: SharedArtifactKind | str,
+        parent_revision_id: str | None,
+        content: dict[str, Any],
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if session.get("protocol_mode") != "formal_v2":
+            raise Study1ServiceError("FORMAL_PROTOCOL_REQUIRED", "Formal protocol required", 409)
+        try:
+            artifact_kind = validate_shared_artifact_context(kind, session, identity)
+            normalized = validate_shared_content(artifact_kind, session, content)
+        except SharedArtifactValidationError as error:
+            status = 403 if error.code == "FORBIDDEN" else 409 if error.code == "ACTION_NOT_ALLOWED_IN_PHASE" else 400
+            raise Study1ServiceError(error.code, str(error), status) from error
+        self._authorize(session, "submit", str(identity.get("role") or ""))
+        return self.repository.create_shared_revision(
+            session_id,
+            artifact_kind.value,
+            parent_revision_id,
+            normalized,
+            identity,
+        )
+
+    def confirm_shared_revision(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        kind: SharedArtifactKind | str,
+        revision_id: str,
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if session.get("protocol_mode") != "formal_v2":
+            raise Study1ServiceError("FORMAL_PROTOCOL_REQUIRED", "Formal protocol required", 409)
+        try:
+            artifact_kind = validate_shared_artifact_context(kind, session, identity)
+        except SharedArtifactValidationError as error:
+            status = 403 if error.code == "FORBIDDEN" else 409
+            raise Study1ServiceError(error.code, str(error), status) from error
+        self._authorize(session, "submit", str(identity.get("role") or ""))
+        if not str(revision_id or "").strip():
+            raise Study1ServiceError(
+                "SHARED_REVISION_REQUIRED", "revision_id is required", 400
+            )
+        return self.repository.confirm_shared_revision(
+            session_id, artifact_kind.value, revision_id, identity
         )
 
     def _validate_structured_submission(
@@ -2062,20 +4469,27 @@ class Study1Service:
                     raise Study1ServiceError(
                         "INVALID_SCALE_VALUE", f"{field} must be between 1 and 7", 400
                     )
-        if submission_type == "consent" and not all(
-            payload.get(field) is True
-            for field in (
-                "identity_confirmed",
-                "role_confirmed",
-                "audio_recording_confirmed",
-                "voluntary_participation_confirmed",
-            )
-        ):
-            raise Study1ServiceError(
-                "CONSENT_REQUIRED",
-                "All identity, role, recording, and voluntary participation confirmations are required",
-                400,
-            )
+        if submission_type == "consent":
+            if not all(
+                payload.get(field) is True
+                for field in (
+                    "identity_confirmed",
+                    "role_confirmed",
+                    "voluntary_participation_confirmed",
+                )
+            ):
+                raise Study1ServiceError(
+                    "CONSENT_REQUIRED",
+                    "Identity, role, and voluntary participation confirmations are required",
+                    400,
+                )
+            missing_scopes = missing_required_consent_scopes(payload)
+            if missing_scopes:
+                raise Study1ServiceError(
+                    "CONSENT_SCOPE_REQUIRED",
+                    "Required consent scopes are missing: " + ", ".join(missing_scopes),
+                    400,
+                )
 
     def _validate_proxy_config_authorization(
         self,
@@ -2154,9 +4568,21 @@ class Study1Service:
         reason: str | None = None,
         override: bool = False,
     ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if session is None:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        self._authorize(session, "advance", str(actor.get("role") or ""))
+        completion_override = None
+        if session.get("protocol_mode") == "formal_v2":
+            completion_override = self._project_snapshot(session).get("completion") or {}
         try:
             snapshot, events = self.repository.transition(
-                session_id, target_phase, actor, reason, override
+                session_id,
+                target_phase,
+                actor,
+                reason,
+                override,
+                completion_override=completion_override,
             )
             return {"session": self.session_dto(snapshot), "events": events}
         except OverrideReasonRequired as error:
@@ -2190,16 +4616,44 @@ class Study1Service:
             current = self.repository.get_session(session_id)
             if current is None:
                 raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
-            missing = readiness(current)["missing_prerequisites"]
+            current_projected = self._project_snapshot(current)
+            missing = self._readiness_for_snapshot(current_projected)[
+                "missing_prerequisites"
+            ]
             if missing:
                 raise Study1ServiceError(
                     "PREREQUISITES_NOT_MET",
                     "Missing prerequisites: " + ", ".join(missing),
                     409,
                 )
+            protocol = self.repository.get_protocol_snapshot(session_id)
+            if protocol and not protocol.get("frozen"):
+                exported = self.repository.export_data(session_id)
+                task = self.repository.get_task_definition(
+                    current.get("task_definition_id"), current.get("task_version")
+                ) if current.get("task_definition_id") else None
+                frozen = freeze_protocol_snapshot(
+                    protocol,
+                    task=task,
+                    assignments=(exported.get("role_assignments") or [])
+                    + (exported.get("fact_assignments") or []),
+                    materials=exported.get("materials") or [],
+                    actor=actor,
+                )
+                self.repository.update_protocol_snapshot(session_id, frozen)
         snapshot, events = self.repository.control_session(
             session_id, action, actor, payload or {}
         )
+        if action == "terminate":
+            self.issue_media_command(
+                session_id,
+                actor,
+                "STOP_SESSION",
+                {"reason": str((payload or {}).get("reason") or "session_terminated")},
+                command_id=str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, f"study1:{session_id}:stop-session")
+                ),
+            )
         return {"session": self.session_dto(snapshot), "events": events}
 
     def add_incident(
@@ -2226,7 +4680,13 @@ class Study1Service:
         self.repository.participant_status(session_id, identity, online)
 
     def researcher_dashboard(self, session_id: str) -> dict[str, Any]:
-        return self.repository.dashboard(session_id)
+        data = self.repository.export_data(session_id)
+        session = self._project_snapshot(data["session"], data)
+        return _dashboard_payload(
+            session,
+            data.get("artifacts") or [],
+            data.get("incidents") or [],
+        )
 
     def issue_media_command(
         self,
@@ -2243,6 +4703,8 @@ class Study1Service:
         session = self.repository.get_session(session_id)
         if not session:
             raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        if command != "STOP_SESSION":
+            self._authorize(session, "issue_media_command", str(actor.get("role") or ""))
         required = {
             "START_PROXY_MEETING": Study1Phase.PROXY_MEETING.value,
             "BEGIN_HANDOFF": Study1Phase.HANDOFF.value,
@@ -2265,6 +4727,9 @@ class Study1Service:
                 "END_CURRENT_MEETING requires an active meeting phase",
                 409,
             )
+        release_identity = study1_release_identity_from_env()
+        if release_identity:
+            command_payload["release"] = release_identity
         envelope = {
             "command_id": command_id or str(uuid.uuid4()),
             "session_id": session_id,
@@ -2281,6 +4746,81 @@ class Study1Service:
                 "MEDIA_SERVICE_UNAVAILABLE", str(error), 502
             ) from error
         return {"command": envelope, "duplicate": not created, "gateway": result}
+
+    def handle_summary_failure_action(
+        self, session_id: str, actor: dict[str, Any], payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        try:
+            action = build_summary_failure_action(
+                action=str(payload.get("action") or ""),
+                reason=str(payload.get("reason") or ""),
+                frozen_config_checksum=payload.get("frozen_config_checksum"),
+                approved_config_checksum=payload.get("approved_config_checksum"),
+                source_transcript_checksum=payload.get("source_transcript_checksum"),
+                source_summary_version=payload.get("source_summary_version"),
+            )
+        except SummaryPolicyError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+        if action.get("media_command"):
+            issued = self.issue_media_command(
+                session_id,
+                actor,
+                str(action["media_command"]),
+                action["payload"],
+            )
+            return {"action": action, "media": issued}
+        return {"action": action}
+
+    def record_summary_qa(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        summary_artifact_id: str,
+        ratings: dict[str, Any],
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        data = self.repository.export_data(session_id)
+        summaries = [
+            item
+            for item in data.get("artifacts") or []
+            if item.get("type") == "summary"
+            and item.get("artifact_id") == summary_artifact_id
+        ]
+        if not summaries:
+            raise Study1ServiceError(
+                "SUMMARY_ARTIFACT_NOT_FOUND", "Summary artifact was not found", 404
+            )
+        try:
+            entry = SummaryQaService().record(
+                session_id=session_id,
+                summary_artifact_id=summary_artifact_id,
+                researcher_id=str(actor.get("participant_id") or "researcher"),
+                ratings=ratings or {},
+            )
+        except SummaryPolicyError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+        existing = [
+            item
+            for item in data.get("artifacts") or []
+            if item.get("type") == "summary_qa"
+        ]
+        artifact_result = self.create_artifact(
+            session_id,
+            {
+                "type": "summary_qa",
+                "version": str(len(existing) + 1),
+                "content": json.dumps(entry.public_dict(), ensure_ascii=False),
+                "generator_version": "human-researcher-summary-qa-v1",
+                "metadata": {
+                    "source_summary_artifact_id": summary_artifact_id,
+                    "private_researcher_qa": True,
+                },
+            },
+        )
+        return {"qa": entry.public_dict(), "artifact": artifact_result["artifact"]}
 
     def _proxy_authorized_context(self, session_id: str) -> dict[str, Any]:
         data = self.repository.export_data(session_id)
@@ -2343,6 +4883,7 @@ class Study1Service:
         if not session:
             raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
         role = str(identity.get("role") or "")
+        self._authorize(session, "issue_media_access", role)
         allowed = {
             Study1Phase.PROXY_MEETING.value: {
                 Study1Role.TEAMMATE_1.value,
@@ -2403,13 +4944,13 @@ class Study1Service:
             Study1Phase.REVIEW.value,
             Study1Phase.COMPREHENSION_MEASUREMENT.value,
         )
-        if (
-            identity.get("role") != Study1Role.PRINCIPAL.value
-            or session["phase"] not in allowed_phases
-            or not session.get("completion", {}).get(
-                "delegation_expectation:principal"
-            )
-        ):
+        is_researcher = identity.get("role") == Study1Role.RESEARCHER.value
+        is_principal_review = (
+            identity.get("role") == Study1Role.PRINCIPAL.value
+            and session["phase"] in allowed_phases
+            and session.get("completion", {}).get("delegation_expectation:principal")
+        )
+        if not (is_researcher or is_principal_review):
             raise Study1ServiceError(
                 "MEDIA_REPLAY_FORBIDDEN",
                 "Recording replay is available only to P during Review",
@@ -2577,7 +5118,13 @@ class Study1Service:
     def export_bundle(self, session_id: str):
         from .export_service import build_study1_export, merge_media_export
 
-        workflow = build_study1_export(self.repository.export_data(session_id))
+        data = self.repository.export_data(session_id)
+        session = data["session"]
+        if session.get("task_definition_id"):
+            data["task_definition"] = self.repository.get_task_definition(
+                session["task_definition_id"], session.get("task_version")
+            )
+        workflow = build_study1_export(data)
         try:
             media = self.media_gateway.export_bundle(session_id)
             return merge_media_export(workflow, media)
@@ -2599,6 +5146,102 @@ class Study1Service:
         return self.repository.record_ui_event(
             session_id, identity, event_type, payload
         )
+
+    def record_quality_metrics(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        session = self.repository.get_session(session_id)
+        if not session:
+            raise Study1ServiceError("SESSION_NOT_FOUND", "Session not found", 404)
+        metric = normalize_rtc_metric(
+            session_id, identity, payload or {}, received_at=utc_now()
+        )
+        event = self.repository.record_ui_event(
+            session_id, identity, "rtc_metric_sample", metric
+        )
+        try:
+            self.media_gateway.report_rtc_metrics(
+                {
+                    "session_id": session_id,
+                    "phase_version": session["phase_version"],
+                    "participant_id": identity["participant_id"],
+                    "role": identity["role"],
+                    "samples": [metric],
+                }
+            )
+        except MediaGatewayError:
+            pass
+        return event
+
+    def quality_snapshot(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        data = self.repository.export_data(session_id)
+        try:
+            media_status = self.media_gateway.get_status(session_id)
+        except MediaGatewayError as error:
+            media_status = {
+                "service_status": "unavailable",
+                "last_error": str(error),
+                "components": {},
+            }
+        return build_quality_snapshot(
+            session_id=session_id,
+            data=data,
+            media_status=media_status,
+            now=utc_now(),
+        )
+
+    def record_review_event_batch(
+        self,
+        session_id: str,
+        identity: dict[str, Any],
+        visit_id: str,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return self.repository.record_review_event_batch(
+            session_id, identity, visit_id, events
+        )
+
+    def create_marker(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return self.repository.create_marker(session_id, actor, payload or {})
+        except MarkerValidationError as error:
+            status = 403 if error.code == "FORBIDDEN" else 400
+            raise Study1ServiceError(error.code, str(error), status) from error
+
+    def list_markers(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        return self.repository.list_markers(session_id, actor)
+
+    def generate_replay_plan(
+        self,
+        session_id: str,
+        actor: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if actor.get("role") != Study1Role.RESEARCHER.value:
+            raise Study1ServiceError("FORBIDDEN", "Researcher role required", 403)
+        try:
+            return self.repository.create_replay_plan(session_id, actor, payload or {})
+        except ReplayValidationError as error:
+            raise Study1ServiceError(error.code, str(error), 400) from error
+
+    def list_replay_plans(
+        self, session_id: str, actor: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        return self.repository.list_replay_plans(session_id, actor)
 
     def exchange_invite(self, raw_token: str) -> dict[str, Any]:
         if not raw_token:
@@ -2623,35 +5266,111 @@ class Study1Service:
     def session_dto(
         self, snapshot: dict[str, Any], role: str | None = None
     ) -> dict[str, Any]:
+        projected = self._project_snapshot(snapshot)
+        state = self._readiness_for_snapshot(projected)
         base = {
-            "session_id": snapshot["session_id"],
-            "status": snapshot["status"],
-            "phase": snapshot["phase"],
-            "phase_version": snapshot["phase_version"],
-            "phase_started_at": snapshot["phase_started_at"],
-            "remaining_seconds": _remaining_seconds(snapshot),
-            **readiness(snapshot),
-            "consent_version": (snapshot.get("experiment_config") or {}).get(
+            "session_id": projected["session_id"],
+            "status": projected["status"],
+            "phase": projected["phase"],
+            "phase_version": projected["phase_version"],
+            "phase_started_at": projected["phase_started_at"],
+            "remaining_seconds": _remaining_seconds(projected),
+            "protocol_mode": projected.get("protocol_mode", "legacy_protocol"),
+            "formal_certifiable": bool(projected.get("formal_certifiable", False)),
+            "task_definition_id": projected.get("task_definition_id"),
+            "task_version": projected.get("task_version"),
+            **state,
+            "consent_version": (projected.get("experiment_config") or {}).get(
                 "consent_version", "study1-consent-v1"
             ),
-            "structured_instruments": bool(snapshot.get("structured_instruments")),
+            "structured_instruments": bool(projected.get("structured_instruments")),
         }
         if role in {item.value for item in HUMAN_ROLES}:
-            completion = snapshot.get("completion") or {}
+            completion = projected.get("completion") or {}
             base["my_completed_actions"] = sorted(
                 key for key, completed in completion.items()
                 if completed is True and key.endswith(f":{role}")
             )
-        if role == Study1Role.PRINCIPAL.value and snapshot["phase"] == "PROXY_MEETING":
+        if role:
+            base["capabilities"] = formal_capabilities(projected, role)
+        if role == Study1Role.PRINCIPAL.value and projected["phase"] == "PROXY_MEETING":
             return {
                 **base,
                 "waiting_room": {
                     "message": "The delegated discussion is in progress.",
-                    "remaining_seconds": snapshot.get("remaining_seconds"),
+                    "remaining_seconds": projected.get("remaining_seconds"),
                     "connection_status": "connected",
                 },
             }
         return base
+
+    def _project_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if snapshot.get("protocol_mode") != "formal_v2":
+            return snapshot
+        exported = data
+        if exported is None:
+            exported = self.repository.export_data(snapshot["session_id"])
+        return project_formal_session(snapshot, exported)
+
+    def _readiness_for_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        if snapshot.get("protocol_mode") == "formal_v2":
+            return formal_readiness(snapshot)
+        return readiness(snapshot)
+
+
+def _registered_task_materials(
+    task: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    materials: dict[str, list[dict[str, Any]]] = {}
+    for role in (item.value for item in HUMAN_ROLES):
+        visible_facts = [
+            copy.deepcopy(fact)
+            for fact in task["facts"]
+            if role in fact["visible_to_roles"]
+        ]
+        materials[role] = [
+            {
+                "title": task["title"],
+                "content": "\n".join(fact["text"] for fact in visible_facts),
+                "metadata": {
+                    "task_definition_id": task["task_definition_id"],
+                    "task_version": task["task_version"],
+                    "candidate_ids": copy.deepcopy(task["candidate_ids"]),
+                    "facts": visible_facts,
+                },
+            }
+        ]
+    return materials
+
+
+def _assignment_event(
+    session: dict[str, Any],
+    event_type: str,
+    participant_id: str,
+    role: str,
+    assignment: dict[str, Any],
+    occurred_at: datetime,
+) -> dict[str, Any]:
+    payload = {
+        key: copy.deepcopy(value)
+        for key, value in assignment.items()
+        if key not in {"session_id", "assigned_at"}
+    }
+    return {
+        "event_id": str(uuid.uuid4()),
+        "session_id": session["session_id"],
+        "participant_id": participant_id,
+        "role": role,
+        "phase": session["phase"],
+        "phase_version": session["phase_version"],
+        "event_type": event_type,
+        "occurred_at": utc_iso(occurred_at),
+        "payload": payload,
+    }
 
 
 def _normalize_materials(
@@ -2844,6 +5563,7 @@ def _validate_artifact(session_id: str, data: dict[str, Any]) -> dict[str, Any]:
         "recording_manifest",
         "agent_log_manifest",
         "transcript_correction",
+        "summary_qa",
     }
     artifact_type = str(data.get("type") or "")
     if artifact_type not in allowed:

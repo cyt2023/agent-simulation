@@ -81,3 +81,29 @@ def test_http_gateway_returns_export_bytes():
         "http://media-service:8000", "service-secret", session=transport
     )
     assert gateway.export_bundle("session-1") == b"PK-media"
+
+
+def test_http_gateway_reports_rtc_metrics_to_b():
+    transport = FakeSession()
+    transport.response = FakeResponse({"accepted": True, "sample_count": 1})
+    gateway = HttpMediaGateway(
+        "http://media-service:8000", "service-secret", session=transport
+    )
+
+    result = gateway.report_rtc_metrics(
+        {
+            "session_id": "session-1",
+            "phase_version": 2,
+            "participant_id": "principal-1",
+            "role": "principal",
+            "samples": [{"rtt_ms": 30}],
+        }
+    )
+
+    method, url, options = transport.calls[0]
+    assert result["accepted"] is True
+    assert (method, url) == (
+        "POST",
+        "http://media-service:8000/internal/rtc-metrics",
+    )
+    assert options["json"]["participant_id"] == "principal-1"

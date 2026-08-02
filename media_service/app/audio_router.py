@@ -4,13 +4,17 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import hashlib
+import inspect
 import json
 from pathlib import Path
+from typing import Any
 import uuid
 import wave
 
 from .audio import PcmWaveRecorder
 from .pipeline import ProxyMediaPipeline
+from .room_policy import stable_room_name
+from .timeline import RoomClock, recording_track_manifest
 from .voice_activity import VoiceActivityBuffer
 
 
@@ -18,6 +22,8 @@ from .voice_activity import VoiceActivityBuffer
 class RouterSession:
     runtime_id: str
     artifact_version: str
+    room_name: str
+    room_clock: RoomClock
     accepting_input: bool = True
 
 
@@ -28,13 +34,21 @@ class AudioPipelineRouter:
         media_root: str | Path,
         *,
         publish_audio: Callable[[str, bytes], Awaitable[None]] | None = None,
+        begin_proxy_audio: Callable[[str, str], Any] | None = None,
+        interrupt_proxy_audio: Callable[[str], Awaitable[Any]] | None = None,
     ):
         self.pipeline = pipeline
         self.media_root = Path(media_root)
         self.publish_audio = publish_audio
+        self.begin_proxy_audio_callback = begin_proxy_audio
+        self.interrupt_proxy_audio_callback = interrupt_proxy_audio
+        self._publish_accepts_generation = _accepts_keyword(
+            publish_audio, "generation"
+        )
         self.sessions: dict[str, RouterSession] = {}
         self.detectors: dict[tuple[str, str, str], VoiceActivityBuffer] = {}
         self.recorders: dict[tuple[str, str, str], PcmWaveRecorder] = {}
+        self.recording_track_starts: dict[tuple[str, str, str], int] = {}
         self.tasks: dict[str, set[asyncio.Task]] = {}
 
     async def start_session(
@@ -53,10 +67,16 @@ class AudioPipelineRouter:
             proxy_enabled=proxy_enabled,
             artifact_version=artifact_version,
         )
+        room_name, room_clock = _resolve_room_timeline(
+            self.pipeline, session_id, runtime_id
+        )
         self.sessions.setdefault(
             session_id,
             RouterSession(
-                runtime_id=runtime_id, artifact_version=artifact_version
+                runtime_id=runtime_id,
+                artifact_version=artifact_version,
+                room_name=room_name,
+                room_clock=room_clock,
             ),
         )
         self.tasks.setdefault(session_id, set())
@@ -75,6 +95,23 @@ class AudioPipelineRouter:
                 sample_rate=sample_rate,
             )
             self.recorders[key] = recorder
+            room_start_ms = state.room_clock.now_room_ms()
+            self.recording_track_starts[key] = room_start_ms
+            self.pipeline.repository.recording_track_started(
+                track_id=recorder.path.name,
+                session_id=session_id,
+                runtime_id=state.runtime_id,
+                participant_id=speaker,
+                role=speaker,
+                room_name=state.room_name,
+                clock_id=state.room_clock.clock_id,
+                room_start_ms=room_start_ms,
+                started_at=state.room_clock.to_utc(room_start_ms),
+                codec="pcm_s16le",
+                sample_rate_hz=sample_rate,
+                content_type="audio/wav",
+                consent_scope="study1_audio_recording_and_research_export",
+            )
         return recorder
 
     async def handle_frame(self, session_id: str, speaker: str, frame) -> None:
@@ -98,7 +135,9 @@ class AudioPipelineRouter:
         if not was_speaking and detector.start_ms is not None:
             interrupt = getattr(self.pipeline, "interrupt", None)
             if interrupt:
-                interrupt(session_id, speaker)
+                interrupted = interrupt(session_id, speaker)
+                if interrupted:
+                    await self.interrupt_proxy_audio(session_id)
         for utterance in utterances:
             task = asyncio.create_task(
                 self.pipeline.process_utterance(
@@ -112,46 +151,118 @@ class AudioPipelineRouter:
             self.tasks[session_id].add(task)
             task.add_done_callback(self.tasks[session_id].discard)
 
-    async def publish_proxy_audio(self, session_id: str, pcm_s16le: bytes) -> None:
+    def begin_proxy_playback(self, session_id: str, turn_id: str):
+        if not self.begin_proxy_audio_callback:
+            return None
+        return self.begin_proxy_audio_callback(session_id, turn_id)
+
+    async def interrupt_proxy_audio(self, session_id: str):
+        if not self.interrupt_proxy_audio_callback:
+            return False
+        return await _maybe_await(self.interrupt_proxy_audio_callback(session_id))
+
+    async def publish_proxy_audio(
+        self, session_id: str, pcm_s16le: bytes, *, generation=None
+    ) -> bool:
         if session_id not in self.sessions:
-            return
-        self._recorder(session_id, "proxy", sample_rate=24000).write(pcm_s16le)
+            return False
         if self.publish_audio:
-            await self.publish_audio(session_id, pcm_s16le)
+            if generation is not None and self._publish_accepts_generation:
+                published = await self.publish_audio(
+                    session_id, pcm_s16le, generation=generation
+                )
+            else:
+                published = await self.publish_audio(session_id, pcm_s16le)
+            if published is False:
+                return False
+        self._recorder(session_id, "proxy", sample_rate=24000).write(pcm_s16le)
+        return True
 
     async def finalize(self, session_id: str, phase_version: int) -> None:
         state = self.sessions.get(session_id)
         if not state:
             return
         state.accepting_input = False
-        for (current_session, runtime_id, speaker), detector in list(
-            self.detectors.items()
-        ):
-            if current_session != session_id or runtime_id != state.runtime_id:
-                continue
-            for utterance in detector.flush():
-                task = asyncio.create_task(
-                    self.pipeline.process_utterance(
-                        session_id,
-                        speaker,
-                        utterance.pcm_s16le,
-                        start_ms=utterance.start_ms,
-                        end_ms=utterance.end_ms,
-                    )
-                )
-                self.tasks.setdefault(session_id, set()).add(task)
-            self.detectors.pop((current_session, runtime_id, speaker), None)
-        pending = list(self.tasks.pop(session_id, set()))
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=False)
-        recording_rows = self._close_recorders(session_id, state.runtime_id)
+        first_error: BaseException | None = None
+        recording_rows: list[dict] = []
+
+        def remember(error: BaseException) -> None:
+            nonlocal first_error
+            if first_error is None:
+                first_error = error
+
         try:
-            await self.pipeline.finalize(session_id, phase_version)
+            for (current_session, runtime_id, speaker), detector in list(
+                self.detectors.items()
+            ):
+                if current_session != session_id or runtime_id != state.runtime_id:
+                    continue
+                try:
+                    for utterance in detector.flush():
+                        task = asyncio.create_task(
+                            self.pipeline.process_utterance(
+                                session_id,
+                                speaker,
+                                utterance.pcm_s16le,
+                                start_ms=utterance.start_ms,
+                                end_ms=utterance.end_ms,
+                            )
+                        )
+                        self.tasks.setdefault(session_id, set()).add(task)
+                except BaseException as error:
+                    remember(error)
+                finally:
+                    self.detectors.pop((current_session, runtime_id, speaker), None)
+
+            pending = list(self.tasks.pop(session_id, set()))
+            if pending:
+                try:
+                    results = await asyncio.gather(*pending, return_exceptions=True)
+                    for result in results:
+                        if isinstance(result, BaseException):
+                            remember(result)
+                except BaseException as error:
+                    remember(error)
+
+            try:
+                recording_rows = self._close_recorders(
+                    session_id, state.runtime_id
+                )
+            except BaseException as error:
+                remember(error)
+
+            try:
+                await self.pipeline.finalize(session_id, phase_version)
+            except BaseException as error:
+                remember(error)
+
+            try:
+                self._create_manifests(
+                    session_id, phase_version, state, recording_rows
+                )
+            except BaseException as error:
+                remember(error)
         finally:
-            self._create_manifests(
-                session_id, phase_version, state, recording_rows
-            )
             self.sessions.pop(session_id, None)
+            self.tasks.pop(session_id, None)
+            for key in [key for key in self.detectors if key[0] == session_id]:
+                self.detectors.pop(key, None)
+            for key, recorder in list(self.recorders.items()):
+                if key[0] != session_id:
+                    continue
+                self.recorders.pop(key, None)
+                self.recording_track_starts.pop(key, None)
+                try:
+                    recorder.close()
+                except BaseException as error:
+                    remember(error)
+            try:
+                self.pipeline.cancel_session(session_id)
+            except BaseException as error:
+                remember(error)
+
+        if first_error is not None:
+            raise first_error
 
     async def cancel(self, session_id: str) -> None:
         state = self.sessions.pop(session_id, None)
@@ -170,25 +281,35 @@ class AudioPipelineRouter:
 
     def _close_recorders(self, session_id: str, runtime_id: str) -> list[dict]:
         rows: list[dict] = []
+        first_error: BaseException | None = None
+        state = self.sessions.get(session_id)
         for key, recorder in list(self.recorders.items()):
             if key[:2] != (session_id, runtime_id):
                 continue
-            recorder.close()
-            payload = recorder.path.read_bytes()
-            rows.append(
-                {
-                    "recording_id": recorder.path.name,
-                    "runtime_id": runtime_id,
-                    "speaker": key[2],
-                    "content_type": "audio/wav",
-                    "size": len(payload),
-                    "checksum": hashlib.sha256(payload).hexdigest(),
-                    "duration_ms": _wave_duration_ms(recorder.path),
-                    "consent_scope": "study1_audio_recording_and_research_export",
-                }
-            )
             self.recorders.pop(key, None)
-        return sorted(rows, key=lambda row: row["speaker"])
+            try:
+                recorder.close()
+                payload = recorder.path.read_bytes()
+                duration_ms = _wave_duration_ms(recorder.path)
+                room_start_ms = self.recording_track_starts.pop(key, 0)
+                room_end_ms = room_start_ms + duration_ms
+                clock = state.room_clock if state else RoomClock.start(session_id)
+                track = self.pipeline.repository.recording_track_finished(
+                    recorder.path.name,
+                    room_end_ms=room_end_ms,
+                    ended_at=clock.to_utc(room_end_ms),
+                    checksum=hashlib.sha256(payload).hexdigest(),
+                    storage_uri=f"{session_id}/{recorder.path.name}",
+                    size_bytes=len(payload),
+                    duration_ms=duration_ms,
+                )
+                rows.append(recording_track_manifest(track))
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+        return sorted(rows, key=lambda row: row["role"])
 
     def _create_manifests(
         self,
@@ -244,3 +365,38 @@ def _wave_duration_ms(path: Path) -> int:
     with wave.open(str(path), "rb") as stream:
         frame_rate = stream.getframerate()
         return round(stream.getnframes() * 1000 / frame_rate) if frame_rate else 0
+
+
+def _resolve_room_timeline(pipeline, session_id: str, runtime_id: str):
+    repository = pipeline.repository
+    runtime = repository.active_runtime(session_id)
+    room_name = runtime.room_name if runtime else stable_room_name(session_id)
+    clock_payload = None
+    if runtime and runtime.runtime_id == runtime_id:
+        clock_payload = (runtime.runtime_config or {}).get("room_clock")
+    if clock_payload:
+        return room_name, RoomClock.from_snapshot(clock_payload)
+    clock = RoomClock.start(session_id)
+    if runtime and runtime.runtime_id == runtime_id:
+        repository.patch_runtime_config(runtime_id, {"room_clock": clock.snapshot()})
+    return room_name, clock
+
+
+def _accepts_keyword(callback, keyword: str) -> bool:
+    if not callback:
+        return False
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == keyword
+        for parameter in signature.parameters.values()
+    )
+
+
+async def _maybe_await(result):
+    if inspect.isawaitable(result):
+        return await result
+    return result

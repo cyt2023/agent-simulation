@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -29,7 +31,17 @@ def test_command_requires_service_bearer(command_payload):
 
 
 def test_command_replay_returns_original_result(command_payload):
-    client = _client()
+    runtime = FakeRuntime()
+    client = _client(runtime_coordinator=runtime)
+    execution_count = 0
+    execute = client.app.state.command_service.execute
+
+    async def counted_execute(command_id):
+        nonlocal execution_count
+        execution_count += 1
+        await execute(command_id)
+
+    client.app.state.command_service.execute = counted_execute
     headers = {"Authorization": "Bearer a-secret"}
     first = client.post("/internal/commands", headers=headers, json=command_payload)
     replay = client.post("/internal/commands", headers=headers, json=command_payload)
@@ -38,6 +50,7 @@ def test_command_replay_returns_original_result(command_payload):
     assert first.json()["duplicate"] is False
     assert replay.json()["duplicate"] is True
     assert replay.json()["command_id"] == command_payload["command_id"]
+    assert execution_count == 1
 
 
 def test_unsupported_command_is_rejected(command_payload):
@@ -76,6 +89,9 @@ class FakeRuntime:
     async def end_current(self, session_id, phase_version):
         self.calls.append(("end", session_id, phase_version))
 
+    async def stop_session(self, session_id, phase_version):
+        self.calls.append(("stop", session_id, phase_version))
+
     async def regenerate_summary(self, session_id, phase_version, payload):
         self.calls.append(("regenerate", session_id, phase_version, payload))
 
@@ -102,6 +118,20 @@ def test_accepted_start_command_runs_after_persistence(command_payload):
 
 
 @pytest.mark.asyncio
+async def test_stop_session_dispatches_dedicated_cleanup(repository, command_payload):
+    command_payload["command"] = "STOP_SESSION"
+    command_payload["payload"] = {}
+    envelope = CommandEnvelope.model_validate(command_payload)
+    runtime = FakeRuntime()
+
+    await CommandService(repository, runtime).dispatch(envelope)
+
+    assert runtime.calls == [
+        ("stop", envelope.session_id, envelope.phase_version)
+    ]
+
+
+@pytest.mark.asyncio
 async def test_restart_dispatches_an_accepted_command(repository, command_payload):
     envelope = CommandEnvelope.model_validate(command_payload)
     accepted = CommandService(repository).accept(envelope)
@@ -117,6 +147,54 @@ async def test_restart_dispatches_an_accepted_command(repository, command_payloa
             envelope.payload["authorized_context"],
         )
     ]
+    assert repository.get_command(accepted.command_id).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_restart_retries_a_failed_command(repository, command_payload):
+    envelope = CommandEnvelope.model_validate(command_payload)
+    accepted = CommandService(repository).accept(envelope)
+    repository.mark_command_status(accepted.command_id, "failed", error_code="Timeout")
+    runtime = FakeRuntime()
+
+    await CommandService(repository, runtime).reconcile_pending()
+
+    assert len(runtime.calls) == 1
+    row = repository.get_command(accepted.command_id)
+    assert row.status == "completed"
+    assert row.error_code is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_execution_claims_persisted_command_once(
+    repository, command_payload
+):
+    class BlockingRuntime(FakeRuntime):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def start_proxy(self, session_id, phase_version, config):
+            self.calls.append(("start_proxy", session_id, phase_version, config))
+            self.started.set()
+            await self.release.wait()
+
+    envelope = CommandEnvelope.model_validate(command_payload)
+    runtime = BlockingRuntime()
+    service = CommandService(repository, runtime)
+    accepted = service.accept(envelope)
+    first = asyncio.create_task(service.execute(accepted.command_id))
+    await runtime.started.wait()
+    second = asyncio.create_task(service.execute(accepted.command_id))
+
+    try:
+        await asyncio.sleep(0)
+        assert len(runtime.calls) == 1
+    finally:
+        runtime.release.set()
+        await asyncio.gather(first, second)
+
     assert repository.get_command(accepted.command_id).status == "completed"
 
 

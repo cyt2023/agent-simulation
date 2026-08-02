@@ -11,10 +11,12 @@ from .models import HUMAN_ROLES, Study1Role
 from .permissions import (
     AuthenticationError,
     Study1TokenManager,
+    require_researcher_scope,
     require_study1_auth,
     require_study1_internal,
     verify_researcher_key,
 )
+from .privacy_routes import register_privacy_routes
 from .services import (
     ActionNotAllowedInPhase,
     SqlAlchemyStudy1Repository,
@@ -24,6 +26,7 @@ from .services import (
 
 study1_bp = Blueprint("study1", __name__)
 _service_override: Study1Service | None = None
+register_privacy_routes(study1_bp)
 
 
 def set_service_for_testing(service: Study1Service | None) -> None:
@@ -52,9 +55,75 @@ def researcher_login():
     try:
         data = request.get_json(silent=True) or {}
         verify_researcher_key(str(data.get("key") or ""))
-        return jsonify({"token": Study1TokenManager().issue_researcher()}), 200
+        return jsonify(
+            {"token": Study1TokenManager().issue_researcher(data.get("scopes"))}
+        ), 200
     except AuthenticationError as error:
         return jsonify({"error": error.code, "message": str(error)}), error.status
+
+
+@study1_bp.post("/api/study1/task-definitions")
+@require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
+def create_study1_task_definition():
+    try:
+        task = get_service().create_task_definition(
+            g.study1_identity.as_actor(), request.get_json(silent=True) or {}
+        )
+        return jsonify(task), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.get("/api/study1/task-definitions")
+@require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
+def list_study1_task_definitions():
+    try:
+        tasks = get_service().list_task_definitions(request.args.get("status"))
+        return jsonify({"tasks": tasks}), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.get("/api/study1/task-definitions/<task_definition_id>")
+@require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
+def get_study1_task_definition(task_definition_id: str):
+    try:
+        return jsonify(
+            get_service().get_task_definition(
+                task_definition_id, request.args.get("version")
+            )
+        ), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.put("/api/study1/task-definitions/<task_definition_id>")
+@require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
+def replace_study1_task_definition(task_definition_id: str):
+    try:
+        task = get_service().replace_task_definition(
+            task_definition_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+            request.args.get("version"),
+        )
+        return jsonify(task), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/task-definitions/<task_definition_id>/validate")
+@require_study1_auth([Study1Role.RESEARCHER], session_argument=None)
+def validate_study1_task_definition(task_definition_id: str):
+    try:
+        task = get_service().validate_task_definition(
+            task_definition_id,
+            g.study1_identity.as_actor(),
+            request.args.get("version"),
+        )
+        return jsonify(task), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
 
 
 @study1_bp.post("/api/study1/sessions")
@@ -68,6 +137,7 @@ def create_study1_session():
             data.get("materials_by_role") or {},
             int(data.get("minimum_review_seconds") or 0),
             data.get("experiment_config") or {},
+            data.get("task_definition_id"),
         )
         return jsonify(result), 201
     except Study1ServiceError as error:
@@ -79,6 +149,20 @@ def create_study1_session():
 def list_study1_sessions():
     try:
         return jsonify({"sessions": get_service().list_sessions()}), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.put("/api/study1/sessions/<session_id>/protocol-config")
+@require_study1_auth([Study1Role.RESEARCHER])
+def update_study1_protocol_config(session_id: str):
+    try:
+        result = get_service().update_protocol_config(
+            session_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+        )
+        return jsonify(result), 200
     except Study1ServiceError as error:
         return _service_error(error)
 
@@ -111,7 +195,9 @@ def get_study1_me(session_id: str):
 def get_my_study1_materials(session_id: str):
     identity = g.study1_identity
     try:
-        materials = get_service().get_materials(session_id, identity.role)
+        materials = get_service().get_materials(
+            session_id, identity.role, enforce_phase=True
+        )
         return jsonify({"materials": materials}), 200
     except Study1ServiceError as error:
         return _service_error(error)
@@ -221,6 +307,115 @@ def _json_submission(value):
     }
 
 
+def _json_domain_record(value):
+    return {
+        key: (
+            item.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if isinstance(item, datetime)
+            else item
+        )
+        for key, item in value.items()
+    }
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/me/instrument")
+@require_study1_auth(HUMAN_ROLES)
+def get_study1_instrument(session_id: str):
+    try:
+        return jsonify(
+            get_service().get_current_instrument(
+                session_id, g.study1_identity.as_actor()
+            )
+        ), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/me/instrument")
+@require_study1_auth(HUMAN_ROLES)
+def submit_study1_instrument(session_id: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().submit_instrument_response(
+            session_id,
+            g.study1_identity.as_actor(),
+            str(data.get("instrument_definition_id") or ""),
+            str(data.get("instrument_version") or ""),
+            data.get("ordered_responses") or [],
+        )
+        return jsonify(_json_domain_record(result)), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/decisions/<decision_kind>")
+@require_study1_auth(HUMAN_ROLES)
+def create_study1_decision(session_id: str, decision_kind: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().create_individual_decision(
+            session_id,
+            g.study1_identity.as_actor(),
+            decision_kind.replace("-", "_"),
+            data.get("payload") or data,
+            str(data.get("instrument_version") or "2.0"),
+        )
+        return jsonify(_json_domain_record(result)), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/shared-artifacts/<kind>")
+@require_study1_auth(HUMAN_ROLES)
+def get_study1_shared_artifact(session_id: str, kind: str):
+    try:
+        return jsonify(
+            get_service().get_shared_artifact(
+                session_id, g.study1_identity.as_actor(), kind.replace("-", "_")
+            )
+        ), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post(
+    "/api/study1/sessions/<session_id>/shared-artifacts/<kind>/revisions"
+)
+@require_study1_auth(HUMAN_ROLES)
+def create_study1_shared_revision(session_id: str, kind: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().create_shared_revision(
+            session_id,
+            g.study1_identity.as_actor(),
+            kind.replace("-", "_"),
+            data.get("parent_revision_id"),
+            data.get("content") or {},
+        )
+        return jsonify(result), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post(
+    "/api/study1/sessions/<session_id>/shared-artifacts/<kind>/revisions/<revision_id>/confirm"
+)
+@require_study1_auth(HUMAN_ROLES)
+def confirm_study1_shared_revision(
+    session_id: str, kind: str, revision_id: str
+):
+    try:
+        result = get_service().confirm_shared_revision(
+            session_id,
+            g.study1_identity.as_actor(),
+            kind.replace("-", "_"),
+            revision_id,
+        )
+        return jsonify(result), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
 @study1_bp.get("/api/study1/sessions/<session_id>/review")
 @require_study1_auth([Study1Role.PRINCIPAL])
 def get_study1_review(session_id: str):
@@ -234,7 +429,9 @@ def get_study1_review(session_id: str):
 
 
 @study1_bp.post("/api/study1/sessions/<session_id>/ui-events")
-@require_study1_auth([Study1Role.PRINCIPAL])
+@require_study1_auth(
+    [Study1Role.PRINCIPAL, Study1Role.TEAMMATE_1, Study1Role.TEAMMATE_2]
+)
 def create_study1_ui_event(session_id: str):
     try:
         data = request.get_json(silent=True) or {}
@@ -280,7 +477,7 @@ def create_study1_incident(session_id: str):
         incident = get_service().add_incident(
             session_id,
             g.study1_identity.as_actor(),
-            str(data.get("category") or "other"),
+            str(data.get("category") or ""),
             str(data.get("severity") or "warning"),
             str(data.get("description") or ""),
             data.get("metadata") or {},
@@ -410,6 +607,33 @@ def report_study1_media_device(session_id: str):
         return _service_error(error)
 
 
+@study1_bp.post("/api/study1/sessions/<session_id>/quality-metrics")
+@require_study1_auth(HUMAN_ROLES)
+def create_study1_quality_metrics(session_id: str):
+    try:
+        event = get_service().record_quality_metrics(
+            session_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+        )
+        return jsonify({"event_id": event["event_id"]}), 202
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/quality")
+@require_study1_auth([Study1Role.RESEARCHER])
+def get_study1_quality(session_id: str):
+    try:
+        return jsonify(
+            get_service().quality_snapshot(
+                session_id, g.study1_identity.as_actor()
+            )
+        ), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
 @study1_bp.get("/api/study1/sessions/<session_id>/media-status")
 @require_study1_auth([Study1Role.RESEARCHER])
 def get_study1_media_status(session_id: str):
@@ -422,9 +646,11 @@ def get_study1_media_status(session_id: str):
 @study1_bp.get(
     "/api/study1/sessions/<session_id>/recordings/<recording_id>"
 )
-@require_study1_auth([Study1Role.PRINCIPAL])
+@require_study1_auth([Study1Role.PRINCIPAL, Study1Role.RESEARCHER])
 def replay_study1_recording(session_id: str, recording_id: str):
     try:
+        if g.study1_identity.role is Study1Role.RESEARCHER:
+            require_researcher_scope(g.study1_identity, "read_raw_media")
         upstream = get_service().get_recording(
             session_id,
             g.study1_identity.as_actor(),
@@ -445,6 +671,108 @@ def replay_study1_recording(session_id: str, recording_id: str):
         )
     except Study1ServiceError as error:
         return _service_error(error)
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/markers")
+@require_study1_auth([*HUMAN_ROLES, Study1Role.RESEARCHER])
+def list_study1_markers(session_id: str):
+    try:
+        markers = get_service().list_markers(
+            session_id, g.study1_identity.as_actor()
+        )
+        return jsonify({"markers": [_json_domain_record(item) for item in markers]}), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/markers")
+@require_study1_auth([*HUMAN_ROLES, Study1Role.RESEARCHER])
+def create_study1_marker(session_id: str):
+    try:
+        marker = get_service().create_marker(
+            session_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+        )
+        return jsonify(_json_domain_record(marker)), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.get("/api/study1/sessions/<session_id>/replay-plans")
+@require_study1_auth([Study1Role.RESEARCHER])
+def list_study1_replay_plans(session_id: str):
+    try:
+        plans = get_service().list_replay_plans(
+            session_id, g.study1_identity.as_actor()
+        )
+        return jsonify({"replay_plans": [_json_domain_record(item) for item in plans]}), 200
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/replay-plans")
+@require_study1_auth([Study1Role.RESEARCHER])
+def create_study1_replay_plan(session_id: str):
+    try:
+        plan = get_service().generate_replay_plan(
+            session_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+        )
+        return jsonify(_json_domain_record(plan)), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/summary-actions")
+@require_study1_auth([Study1Role.RESEARCHER])
+def create_study1_summary_action(session_id: str):
+    try:
+        result = get_service().handle_summary_failure_action(
+            session_id,
+            g.study1_identity.as_actor(),
+            request.get_json(silent=True) or {},
+        )
+        return jsonify(result), 202
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/summary-qa")
+@require_study1_auth([Study1Role.RESEARCHER])
+def create_study1_summary_qa(session_id: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().record_summary_qa(
+            session_id,
+            g.study1_identity.as_actor(),
+            str(data.get("summary_artifact_id") or ""),
+            data.get("ratings") or {},
+        )
+        return jsonify(result), 201
+    except Study1ServiceError as error:
+        return _service_error(error)
+
+
+@study1_bp.post("/api/study1/sessions/<session_id>/review-events/batch")
+@require_study1_auth([Study1Role.PRINCIPAL])
+def create_study1_review_event_batch(session_id: str):
+    try:
+        data = request.get_json(silent=True) or {}
+        result = get_service().record_review_event_batch(
+            session_id,
+            g.study1_identity.as_actor(),
+            str(data.get("visit_id") or ""),
+            data.get("events") or [],
+        )
+        return jsonify(result), 202
+    except ValueError as error:
+        return jsonify({"error": "INVALID_REVIEW_EVENT_BATCH", "message": str(error)}), 400
+    except Study1ServiceError as error:
+        return _service_error(error)
+    except AuthenticationError as error:
+        return jsonify({"error": error.code, "message": str(error)}), error.status
 
 
 @study1_bp.post("/api/study1/sessions/<session_id>/mock-media/complete")

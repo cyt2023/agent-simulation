@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .db import Database
@@ -12,8 +12,15 @@ from .models import (
     MediaArtifactRow,
     MediaCommandRow,
     MediaConnectionRow,
+    MediaAgentTurnRow,
+    MediaConfigRow,
     MediaIncidentRow,
+    MediaComponentHealthRow,
+    MediaRecordingTrackRow,
+    MediaRetentionTombstoneRow,
+    MediaRtcMetricRow,
     MediaRuntimeRow,
+    MediaSummaryAttemptRow,
     OutboxMessageRow,
     TranscriptSegmentRow,
 )
@@ -93,10 +100,33 @@ class MediaRepository:
             return list(
                 session.scalars(
                     select(MediaCommandRow)
-                    .where(MediaCommandRow.status.in_(("accepted", "processing")))
+                    .where(MediaCommandRow.status.in_(("accepted", "failed")))
                     .order_by(MediaCommandRow.received_at)
                 ).all()
             )
+
+    def requeue_interrupted_commands(self) -> int:
+        """Return commands left processing by a previous process to the queue."""
+        with self.database.session_factory.begin() as session:
+            result = session.execute(
+                update(MediaCommandRow)
+                .where(MediaCommandRow.status == "processing")
+                .values(status="accepted", error_code="PROCESS_RESTARTED")
+            )
+            return int(result.rowcount or 0)
+
+    def claim_command(self, command_id: str) -> bool:
+        """Atomically lease an executable command to exactly one worker."""
+        with self.database.session_factory.begin() as session:
+            result = session.execute(
+                update(MediaCommandRow)
+                .where(
+                    MediaCommandRow.command_id == command_id,
+                    MediaCommandRow.status.in_(("accepted", "failed")),
+                )
+                .values(status="processing", error_code=None)
+            )
+            return int(result.rowcount or 0) == 1
 
     def mark_command_status(
         self, command_id: str, status: str, *, error_code: str | None = None
@@ -366,6 +396,52 @@ class MediaRepository:
                 row.ended_at = datetime.now(timezone.utc)
             return row
 
+    def mark_runtime_handoff(
+        self, runtime_id: str, phase_version: int
+    ) -> MediaRuntimeRow:
+        with self.database.session_factory.begin() as session:
+            row = session.get(MediaRuntimeRow, runtime_id)
+            if not row:
+                raise KeyError(runtime_id)
+            row.state = RuntimeState.HANDING_OFF.value
+            row.runtime_config = {
+                **(row.runtime_config or {}),
+                "handoff_phase_version": phase_version,
+                "proxy_stopped_at": (row.runtime_config or {}).get(
+                    "proxy_stopped_at"
+                )
+                or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+            return row
+
+    def patch_runtime_config(
+        self, runtime_id: str, values: dict
+    ) -> MediaRuntimeRow:
+        with self.database.session_factory.begin() as session:
+            row = session.get(MediaRuntimeRow, runtime_id)
+            if not row:
+                raise KeyError(runtime_id)
+            row.runtime_config = {**(row.runtime_config or {}), **values}
+            return row
+
+    def finish_session_runtimes(
+        self, session_id: str, state: RuntimeState = RuntimeState.STOPPED
+    ) -> list[MediaRuntimeRow]:
+        with self.database.session_factory.begin() as session:
+            rows = list(
+                session.scalars(
+                    select(MediaRuntimeRow).where(
+                        MediaRuntimeRow.session_id == session_id,
+                        MediaRuntimeRow.ended_at.is_(None),
+                    )
+                ).all()
+            )
+            ended_at = datetime.now(timezone.utc)
+            for row in rows:
+                row.state = state.value
+                row.ended_at = ended_at
+            return rows
+
     def finish_runtime_with_event(
         self,
         runtime_id: str,
@@ -375,31 +451,94 @@ class MediaRepository:
         phase_version: int,
         event_type: str,
         payload: dict,
+        runtime_config_patch: dict | None = None,
     ) -> MediaRuntimeRow:
-        with self.database.session_factory.begin() as session:
+        return self._write_runtime_event(
+            runtime_id,
+            state=state,
+            session_id=session_id,
+            phase_version=phase_version,
+            event_type=event_type,
+            payload=payload,
+            ended=True,
+            runtime_config_patch=runtime_config_patch,
+        )
+
+    def transition_runtime_with_event(
+        self,
+        runtime_id: str,
+        *,
+        state: RuntimeState,
+        session_id: str,
+        phase_version: int,
+        event_type: str,
+        payload: dict,
+        runtime_config_patch: dict | None = None,
+    ) -> MediaRuntimeRow:
+        return self._write_runtime_event(
+            runtime_id,
+            state=state,
+            session_id=session_id,
+            phase_version=phase_version,
+            event_type=event_type,
+            payload=payload,
+            ended=False,
+            runtime_config_patch=runtime_config_patch,
+        )
+
+    def _write_runtime_event(
+        self,
+        runtime_id: str,
+        *,
+        state: RuntimeState,
+        session_id: str,
+        phase_version: int,
+        event_type: str,
+        payload: dict,
+        ended: bool,
+        runtime_config_patch: dict | None = None,
+    ) -> MediaRuntimeRow:
+        event_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"study1-media:{runtime_id}:{phase_version}:{event_type}",
+            )
+        )
+
+        def update_runtime(session):
             runtime = session.get(MediaRuntimeRow, runtime_id)
             if not runtime:
                 raise KeyError(runtime_id)
             runtime.state = state.value
-            runtime.ended_at = datetime.now(timezone.utc)
-            existing = session.scalars(
-                select(OutboxMessageRow).where(
-                    OutboxMessageRow.session_id == session_id,
-                    OutboxMessageRow.phase_version == phase_version,
-                    OutboxMessageRow.event_type == event_type,
-                )
-            ).all()
-            if not any(row.payload.get("runtime_id") == runtime_id for row in existing):
-                session.add(
-                    OutboxMessageRow(
-                        event_id=str(uuid.uuid4()),
-                        session_id=session_id,
-                        phase_version=phase_version,
-                        event_type=event_type,
-                        payload=payload,
-                    )
-                )
+            if ended:
+                runtime.ended_at = runtime.ended_at or datetime.now(timezone.utc)
+            if runtime_config_patch:
+                runtime.runtime_config = {
+                    **(runtime.runtime_config or {}),
+                    **runtime_config_patch,
+                }
             return runtime
+
+        try:
+            with self.database.session_factory.begin() as session:
+                runtime = update_runtime(session)
+                if session.get(OutboxMessageRow, event_id) is None:
+                    session.add(
+                        OutboxMessageRow(
+                            event_id=event_id,
+                            session_id=session_id,
+                            phase_version=phase_version,
+                            event_type=event_type,
+                            payload=payload,
+                        )
+                    )
+                return runtime
+        except IntegrityError:
+            # A competing process committed the deterministic event first.
+            with self.database.session_factory.begin() as session:
+                if session.get(OutboxMessageRow, event_id) is None:
+                    raise
+                return update_runtime(session)
 
     def mark_outbox_attempt(self, event_id: str, error: str) -> None:
         with self.database.session_factory.begin() as session:
@@ -486,6 +625,21 @@ class MediaRepository:
                 ).all()
             )
 
+    def list_session_recording_tracks(
+        self, session_id: str
+    ) -> list[MediaRecordingTrackRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaRecordingTrackRow)
+                    .where(MediaRecordingTrackRow.session_id == session_id)
+                    .order_by(
+                        MediaRecordingTrackRow.room_start_ms,
+                        MediaRecordingTrackRow.track_id,
+                    )
+                ).all()
+            )
+
     def preflight_ready_roles(self, session_id: str) -> set[str]:
         latest: dict[str, MediaConnectionRow] = {}
         for row in self.list_session_connections(session_id):
@@ -520,5 +674,379 @@ class MediaRepository:
                     select(MediaIncidentRow)
                     .where(MediaIncidentRow.session_id == session_id)
                     .order_by(MediaIncidentRow.created_at)
+                ).all()
+            )
+
+    def store_media_config(
+        self, *, session_id: str, phase_version: int, checksum: str, payload: dict
+    ) -> MediaConfigRow:
+        row = MediaConfigRow(
+            config_id=str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"study1-media-config:{session_id}:{phase_version}:{checksum}",
+                )
+            ),
+            session_id=session_id,
+            phase_version=phase_version,
+            checksum=checksum,
+            config_version=str(payload.get("config_version") or "study1-media-config-v2"),
+            payload=payload,
+        )
+        with self.database.session_factory.begin() as session:
+            existing = session.get(MediaConfigRow, row.config_id)
+            if existing:
+                return existing
+            session.add(row)
+            return row
+
+    def begin_agent_turn(self, payload: dict) -> MediaAgentTurnRow:
+        context_event_ids = list(payload.get("context_event_ids") or [])
+        if not context_event_ids:
+            raise ValueError("Agent turns require context_event_ids before provider attempts")
+        row = MediaAgentTurnRow(
+            turn_id=str(payload.get("turn_id") or uuid.uuid4()),
+            session_id=str(payload["session_id"]),
+            runtime_id=str(payload["runtime_id"]),
+            phase_version=int(payload["phase_version"]),
+            turn_kind=str(payload.get("turn_kind") or "llm_response"),
+            status="started",
+            context_event_ids=context_event_ids,
+            authorized_snapshot=dict(payload.get("authorized_snapshot") or {}),
+            provider_attempt_ids=list(payload.get("provider_attempt_ids") or []),
+        )
+        with self.database.session_factory.begin() as session:
+            existing = session.get(MediaAgentTurnRow, row.turn_id)
+            if existing:
+                return existing
+            session.add(row)
+            return row
+
+    def finish_agent_turn(
+        self,
+        turn_id: str,
+        *,
+        status: str,
+        provider_attempt_id: str | None = None,
+        error_code: str | None = None,
+    ) -> MediaAgentTurnRow:
+        with self.database.session_factory.begin() as session:
+            row = session.get(MediaAgentTurnRow, turn_id)
+            if not row:
+                raise KeyError(turn_id)
+            attempts = list(row.provider_attempt_ids or [])
+            if provider_attempt_id:
+                attempts.append(provider_attempt_id)
+            row.provider_attempt_ids = attempts
+            row.status = status
+            row.error_code = error_code
+            row.ended_at = datetime.now(timezone.utc)
+            return row
+
+    def list_session_agent_turns(self, session_id: str) -> list[MediaAgentTurnRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaAgentTurnRow)
+                    .where(MediaAgentTurnRow.session_id == session_id)
+                    .order_by(MediaAgentTurnRow.started_at)
+                ).all()
+            )
+
+    def begin_summary_attempt(
+        self,
+        *,
+        attempt_id: str,
+        session_id: str,
+        parent_attempt_id: str | None,
+        prompt_version: str,
+        prompt_sha256: str,
+        transcript_checksum: str,
+        config_checksum: str,
+        provider_version: str,
+        sampling: dict,
+        input_text: str,
+        reason: str | None = None,
+    ) -> MediaSummaryAttemptRow:
+        row = MediaSummaryAttemptRow(
+            attempt_id=attempt_id,
+            session_id=session_id,
+            parent_attempt_id=parent_attempt_id,
+            status="started",
+            prompt_version=prompt_version,
+            prompt_sha256=prompt_sha256,
+            transcript_checksum=transcript_checksum,
+            config_checksum=config_checksum,
+            provider_version=provider_version,
+            sampling=sampling,
+            input_text=input_text,
+            reason=reason,
+        )
+        with self.database.session_factory.begin() as session:
+            session.add(row)
+        return row
+
+    def record_rtc_metric(
+        self,
+        *,
+        session_id: str,
+        participant_id: str,
+        role: str,
+        observed_at: datetime,
+        payload: dict,
+    ) -> MediaRtcMetricRow:
+        row = MediaRtcMetricRow(
+            metric_id=str(uuid.uuid4()),
+            session_id=session_id,
+            participant_id=participant_id,
+            role=role,
+            observed_at=observed_at,
+            payload=payload,
+        )
+        with self.database.session_factory.begin() as session:
+            session.add(row)
+        return row
+
+    def list_session_rtc_metrics(self, session_id: str) -> list[MediaRtcMetricRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaRtcMetricRow)
+                    .where(MediaRtcMetricRow.session_id == session_id)
+                    .order_by(MediaRtcMetricRow.observed_at, MediaRtcMetricRow.metric_id)
+                ).all()
+            )
+
+    def record_component_health(
+        self,
+        *,
+        component: str,
+        status: str,
+        latency_ms: float | None = None,
+        error_code: str | None = None,
+        observed_at: datetime | None = None,
+        payload: dict | None = None,
+    ) -> MediaComponentHealthRow:
+        row = MediaComponentHealthRow(
+            health_id=str(uuid.uuid4()),
+            component=component,
+            status=status,
+            latency_ms=latency_ms,
+            error_code=error_code,
+            observed_at=observed_at or datetime.now(timezone.utc),
+            payload=payload or {},
+        )
+        with self.database.session_factory.begin() as session:
+            session.add(row)
+        return row
+
+    def list_component_health(self) -> list[MediaComponentHealthRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaComponentHealthRow).order_by(
+                        MediaComponentHealthRow.observed_at,
+                        MediaComponentHealthRow.health_id,
+                    )
+                ).all()
+            )
+
+    def recording_track_started(
+        self,
+        *,
+        track_id: str,
+        session_id: str,
+        runtime_id: str,
+        participant_id: str,
+        role: str,
+        room_name: str,
+        clock_id: str,
+        room_start_ms: int,
+        started_at: datetime,
+        codec: str,
+        sample_rate_hz: int,
+        content_type: str,
+        consent_scope: str,
+    ) -> MediaRecordingTrackRow:
+        row = MediaRecordingTrackRow(
+            track_id=track_id,
+            session_id=session_id,
+            runtime_id=runtime_id,
+            participant_id=participant_id,
+            role=role,
+            room_name=room_name,
+            clock_id=clock_id,
+            room_start_ms=room_start_ms,
+            started_at=started_at,
+            codec=codec,
+            sample_rate_hz=sample_rate_hz,
+            content_type=content_type,
+            consent_scope=consent_scope,
+            status="recording",
+        )
+        with self.database.session_factory.begin() as session:
+            existing = session.get(MediaRecordingTrackRow, track_id)
+            if existing:
+                return existing
+            session.add(row)
+            return row
+
+    def recording_track_finished(
+        self,
+        track_id: str,
+        *,
+        room_end_ms: int,
+        ended_at: datetime,
+        checksum: str,
+        storage_uri: str,
+        size_bytes: int,
+        duration_ms: int,
+        status: str = "complete",
+    ) -> MediaRecordingTrackRow:
+        with self.database.session_factory.begin() as session:
+            row = session.get(MediaRecordingTrackRow, track_id)
+            if not row:
+                raise KeyError(track_id)
+            row.room_end_ms = room_end_ms
+            row.ended_at = ended_at
+            row.checksum = checksum
+            row.storage_uri = storage_uri
+            row.size_bytes = size_bytes
+            row.duration_ms = duration_ms
+            row.status = status
+            return row
+
+    def finish_summary_attempt(
+        self,
+        attempt_id: str,
+        *,
+        status: str,
+        output_text: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> MediaSummaryAttemptRow:
+        with self.database.session_factory.begin() as session:
+            row = session.get(MediaSummaryAttemptRow, attempt_id)
+            if not row:
+                raise KeyError(attempt_id)
+            row.status = status
+            row.output_text = output_text
+            row.error_code = error_code
+            row.error_message = error_message
+            row.ended_at = datetime.now(timezone.utc)
+            return row
+
+    def get_summary_attempt(self, attempt_id: str) -> MediaSummaryAttemptRow:
+        with self.database.session_factory() as session:
+            row = session.get(MediaSummaryAttemptRow, attempt_id)
+            if not row:
+                raise KeyError(attempt_id)
+            return row
+
+    def list_session_summary_attempts(
+        self, session_id: str
+    ) -> list[MediaSummaryAttemptRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaSummaryAttemptRow)
+                    .where(MediaSummaryAttemptRow.session_id == session_id)
+                    .order_by(MediaSummaryAttemptRow.started_at)
+                ).all()
+            )
+
+    def purge_session_media(
+        self,
+        session_id: str,
+        *,
+        retention_job_id: str,
+        manifest_checksum: str,
+        reason: str,
+        phase_version: int = 1,
+    ) -> MediaRetentionTombstoneRow:
+        tombstone_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"study1-media-retention:{session_id}:{retention_job_id}",
+            )
+        )
+        event_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"study1-media-purged:{session_id}:{retention_job_id}:{manifest_checksum}",
+            )
+        )
+        with self.database.session_factory.begin() as session:
+            existing = session.get(MediaRetentionTombstoneRow, tombstone_id)
+            if existing:
+                return existing
+            purged_counts = {
+                "transcript_segments": len(
+                    session.scalars(
+                        select(TranscriptSegmentRow).where(
+                            TranscriptSegmentRow.session_id == session_id
+                        )
+                    ).all()
+                ),
+                "artifacts": len(
+                    session.scalars(
+                        select(MediaArtifactRow).where(
+                            MediaArtifactRow.session_id == session_id
+                        )
+                    ).all()
+                ),
+                "incidents": len(
+                    session.scalars(
+                        select(MediaIncidentRow).where(
+                            MediaIncidentRow.session_id == session_id
+                        )
+                    ).all()
+                ),
+            }
+            session.execute(
+                delete(TranscriptSegmentRow).where(
+                    TranscriptSegmentRow.session_id == session_id
+                )
+            )
+            session.execute(
+                delete(MediaArtifactRow).where(MediaArtifactRow.session_id == session_id)
+            )
+            session.execute(
+                delete(MediaIncidentRow).where(MediaIncidentRow.session_id == session_id)
+            )
+            tombstone = MediaRetentionTombstoneRow(
+                tombstone_id=tombstone_id,
+                session_id=session_id,
+                retention_job_id=retention_job_id,
+                manifest_checksum=manifest_checksum,
+                reason=reason,
+                purged_counts=purged_counts,
+            )
+            session.add(tombstone)
+            if session.get(OutboxMessageRow, event_id) is None:
+                session.add(
+                    OutboxMessageRow(
+                        event_id=event_id,
+                        session_id=session_id,
+                        phase_version=max(1, int(phase_version or 1)),
+                        event_type="MEDIA_PURGED",
+                        payload={
+                            "retention_job_id": retention_job_id,
+                            "manifest_checksum": manifest_checksum,
+                            "purged_counts": purged_counts,
+                        },
+                    )
+                )
+            return tombstone
+
+    def list_session_retention_tombstones(
+        self, session_id: str
+    ) -> list[MediaRetentionTombstoneRow]:
+        with self.database.session_factory() as session:
+            return list(
+                session.scalars(
+                    select(MediaRetentionTombstoneRow)
+                    .where(MediaRetentionTombstoneRow.session_id == session_id)
+                    .order_by(MediaRetentionTombstoneRow.created_at)
                 ).all()
             )

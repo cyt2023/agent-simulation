@@ -58,7 +58,7 @@ onMounted(checkDevice)
     </div>
     <div>
       <h2 id="device-check-title">Microphone check</h2>
-      <p v-if="state === 'checking'">Checking microphone access…</p>
+      <p v-if="state === 'checking'">Checking microphone access...</p>
       <p v-else-if="state === 'ready'"><strong>{{ displayMicrophoneLabel(deviceLabel, 0) }}</strong> is ready.</p>
       <p v-else>{{ error }}</p>
     </div>

@@ -2,16 +2,26 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import PhaseHeader from '../components/PhaseHeader.vue'
 import Study1FilePicker from '../components/Study1FilePicker.vue'
+import MediaHealthPanel from '../components/MediaHealthPanel.vue'
+import ProtocolIntegrityPanel from '../components/ProtocolIntegrityPanel.vue'
+import ResearcherReplayList from '../components/ResearcherReplayList.vue'
+import SummaryQaPanel from '../components/SummaryQaPanel.vue'
 import {
   addStudy1Incident,
   addTranscriptCorrection,
   controlStudy1Session,
   cloneStudy1Session,
+  createMarker,
+  createReplayPlan,
   createStudy1Session,
+  fetchMarkers,
+  fetchQualitySnapshot,
+  fetchReplayPlans,
   fetchResearcherDashboard,
   getStudy1Identity,
   listStudy1Sessions,
   researcherLogin,
+  submitSummaryQa,
   issueStudy1MediaCommand,
   completeMockMedia,
   exportStudy1Data,
@@ -24,7 +34,6 @@ import {
   canEndMeeting,
   startCommandForPhase,
 } from '../services/mediaControls.js'
-import { displayMicrophoneLabel } from '../services/uiLabels.js'
 import {
   joinStudy1Session,
   leaveStudy1Session,
@@ -52,6 +61,9 @@ const sessionList = ref([])
 const selectedSessionId = ref('')
 const dashboard = ref(null)
 const mediaStatus = ref(null)
+const qualitySnapshot = ref(null)
+const markers = ref([])
+const replayPlans = ref([])
 const invites = ref([])
 const busy = ref(false)
 const error = ref('')
@@ -140,15 +152,35 @@ async function selectSession() {
 async function refreshDashboard() {
   if (!selectedSessionId.value) return
   try {
-    const [dashboardResult, mediaResult] = await Promise.all([
+    const [dashboardResult, mediaResult, qualityResult, markerResult, replayResult] = await Promise.all([
       fetchResearcherDashboard(selectedSessionId.value),
       fetchMediaStatus(selectedSessionId.value).catch(reason => ({
         service_status: 'unavailable',
         error: reason.message,
       })),
+      fetchQualitySnapshot(selectedSessionId.value).catch(reason => ({
+        rtc: {
+          status: 'unknown',
+          fresh_participant_count: 0,
+          stale_participant_count: 0,
+        },
+        components: {},
+        error: reason.message,
+      })),
+      fetchMarkers(selectedSessionId.value).catch(reason => ({
+        markers: [],
+        error: reason.message,
+      })),
+      fetchReplayPlans(selectedSessionId.value).catch(reason => ({
+        replay_plans: [],
+        error: reason.message,
+      })),
     ])
     dashboard.value = dashboardResult
     mediaStatus.value = mediaResult
+    qualitySnapshot.value = qualityResult
+    markers.value = markerResult.markers || []
+    replayPlans.value = replayResult.replay_plans || []
   } catch (reason) {
     error.value = reason.message
   }
@@ -230,6 +262,52 @@ async function addIncident() {
     await refreshDashboard()
   } catch (reason) {
     error.value = reason.message
+  }
+}
+
+async function submitResearcherMarker(payload) {
+  if (!selectedSessionId.value) return
+  busy.value = true
+  error.value = ''
+  try {
+    await createMarker(selectedSessionId.value, payload)
+    await refreshDashboard()
+  } catch (failure) {
+    error.value = failure.message
+  } finally {
+    busy.value = false
+  }
+}
+
+async function submitReplayPlan(payload) {
+  if (!selectedSessionId.value) return
+  busy.value = true
+  error.value = ''
+  try {
+    await createReplayPlan(selectedSessionId.value, payload)
+    await refreshDashboard()
+  } catch (failure) {
+    error.value = failure.message
+  } finally {
+    busy.value = false
+  }
+}
+
+async function submitSummaryQaForm(payload) {
+  if (!selectedSessionId.value) return
+  busy.value = true
+  error.value = ''
+  try {
+    await submitSummaryQa(
+      selectedSessionId.value,
+      payload.summary_artifact_id,
+      payload.ratings,
+    )
+    await refreshDashboard()
+  } catch (failure) {
+    error.value = failure.message
+  } finally {
+    busy.value = false
   }
 }
 
@@ -397,9 +475,9 @@ onUnmounted(() => {
         <label>
           Load session
           <select v-model="selectedSessionId" @change="selectSession">
-            <option value="">Select…</option>
+            <option value="">Select...</option>
             <option v-for="item in sessionList" :key="item.session_id" :value="item.session_id">
-              {{ item.session_name }} — {{ item.phase }}
+              {{ item.session_name }} - {{ item.phase }}
             </option>
           </select>
         </label>
@@ -429,41 +507,28 @@ onUnmounted(() => {
               <tr v-for="participant in dashboard.participants" :key="participant.participant_id">
                 <td>{{ participant.role }}</td>
                 <td>{{ participant.online ? 'online' : 'offline' }}</td>
-                <td>{{ participant.completed_actions.join(', ') || '—' }}</td>
+                <td>{{ participant.completed_actions.join(', ') || 'none' }}</td>
               </tr>
             </tbody>
           </table>
           <p><strong>Not submitted:</strong> {{ dashboard.not_submitted.join(', ') || 'none' }}</p>
         </section>
-        <section class="panel media-operations">
-          <div class="panel-heading">
-            <div>
-              <h2>Meeting and Proxy service</h2>
-              <p>{{ mediaStatus?.service_status || 'checking' }}</p>
-            </div>
-            <span class="service-state" :data-state="mediaStatus?.service_status">
-              {{ mediaStatus?.runtime_state || 'IDLE' }}
-            </span>
-          </div>
-          <dl class="media-grid">
-            <div><dt>Room</dt><dd>{{ mediaStatus?.room_kind || 'none' }}<small>{{ mediaStatus?.room_name || '—' }}</small></dd></div>
-            <div><dt>ASR</dt><dd>{{ mediaStatus?.asr?.status || '—' }}<small>{{ mediaStatus?.asr?.provider || '—' }}</small></dd></div>
-            <div><dt>Proxy</dt><dd>{{ mediaStatus?.proxy?.active ? 'active' : 'inactive' }}<small>{{ mediaStatus?.proxy?.prompt_version || '—' }}</small></dd></div>
-            <div><dt>Recording</dt><dd>{{ mediaStatus?.recording?.status || '—' }}<small>{{ mediaStatus?.pending_callback_count || 0 }} callbacks pending</small></dd></div>
-          </dl>
-          <table v-if="mediaStatus?.connections?.length">
-            <thead><tr><th>Media participant</th><th>Role</th><th>Connection</th><th>Device</th></tr></thead>
-            <tbody>
-              <tr v-for="(connection, index) in mediaStatus.connections" :key="connection.participant_id">
-                <td>{{ connection.participant_id }}</td>
-                <td>{{ connection.role }}</td>
-                <td>{{ connection.state }}</td>
-                <td>{{ displayMicrophoneLabel(connection.device?.label, index) }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <p v-if="mediaStatus?.error" class="error">{{ mediaStatus.error }}</p>
-        </section>
+        <MediaHealthPanel
+          :media-status="mediaStatus"
+          :quality-snapshot="qualitySnapshot"
+        />
+        <ResearcherReplayList
+          :busy="busy"
+          :markers="markers"
+          :replay-plans="replayPlans"
+          @create-marker="submitResearcherMarker"
+          @create-replay-plan="submitReplayPlan"
+        />
+        <SummaryQaPanel
+          :busy="busy"
+          @submit="submitSummaryQaForm"
+        />
+        <ProtocolIntegrityPanel :dashboard="dashboard" />
         <section class="controls" aria-label="Session controls">
           <div class="primary-controls">
             <button
@@ -578,18 +643,7 @@ th,td { text-align:left; border-bottom:1px solid #dde4ea; padding:.65rem; }
 .control-button--media:not(:disabled):hover { background:#493b78; }
 .supporting-controls { display:flex; align-items:center; justify-content:space-between; gap:.85rem; padding-top:.85rem; border-top:1px solid #dce3e9; }
 .secondary-controls button,.safety-controls button { padding:.48rem .7rem; font-size:.86rem; font-weight:650; }
-.panel-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; }
-.panel-heading h2,.panel-heading p { margin:0; }
-.panel-heading p { margin-top:.25rem; color:#667786; text-transform:capitalize; }
-.service-state { padding:.35rem .55rem; border:1px solid #c6d0d8; border-radius:6px; color:#536471; font-size:.78rem; }
-.service-state[data-state="ok"] { border-color:#70a883; background:#edf8f1; color:#17633c; }
-.media-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1rem; margin:1.25rem 0; }
-.media-grid div { min-width:0; border-left:3px solid #cad5dc; padding-left:.75rem; }
-.media-grid dt { color:#667786; font-size:.75rem; font-weight:700; text-transform:uppercase; }
-.media-grid dd { margin:.25rem 0 0; font-weight:700; overflow-wrap:anywhere; }
-.media-grid small { display:block; margin-top:.2rem; color:#70808c; font-weight:400; }
 @media (max-width:720px) {
-  .media-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
   .primary-controls { display:grid; grid-template-columns:1fr; }
   .control-button--major { width:100%; }
   .supporting-controls { align-items:flex-start; flex-direction:column; }

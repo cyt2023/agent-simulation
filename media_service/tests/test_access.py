@@ -1,5 +1,6 @@
-import pytest
 import jwt
+import pytest
+import re
 
 from media_service.app.access import AccessDenied, MediaAccessService
 from media_service.app.config import Settings
@@ -44,11 +45,13 @@ def test_access_matrix(access_service, phase, role, allowed):
     result = access_service.issue_access(
         "session-1", phase, 7, role, f"id-{role}"
     )
-    assert result.room_name.endswith("proxy-v7" if phase == "PROXY_MEETING" else "sync")
+    assert result.room_name == "study1-session-1-audio"
     assert result.captions_enabled is False
     assert result.token
     claims = jwt.decode(result.token, options={"verify_signature": False})
-    assert claims["video"]["canPublishSources"] == ["microphone"]
+    expected_sources = [] if phase == "HANDOFF" else ["microphone"]
+    assert claims["video"]["canPublishSources"] == expected_sources
+    assert claims["video"]["canPublish"] is (phase != "HANDOFF")
     assert claims["video"]["canPublishData"] is False
 
 
@@ -64,6 +67,17 @@ def test_sync_recorder_token_is_subscribe_only(access_service):
 
     claims = jwt.decode(result.token, options={"verify_signature": False})
     assert claims["name"] == "recorder"
-    assert claims["video"]["room"] == "study1-session-1-sync"
+    assert claims["video"]["room"] == "study1-session-1-audio"
     assert claims["video"]["canSubscribe"] is True
     assert claims["video"]["canPublish"] is False
+
+
+def test_recorder_identity_is_sanitized_and_bounded(access_service):
+    result = access_service.issue_recorder_access(
+        "unsafe session/../" + "x" * 200, 10
+    )
+
+    claims = jwt.decode(result.token, options={"verify_signature": False})
+    identity = claims["sub"]
+    assert re.fullmatch(r"recorder-[A-Za-z0-9_-]+", identity)
+    assert len(identity) <= len("recorder-") + 96

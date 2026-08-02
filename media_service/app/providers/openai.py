@@ -9,6 +9,13 @@ from openai import AsyncOpenAI
 from .base import AsrResult
 
 
+def _openai_client(api_key: str, base_url: str | None = None):
+    arguments = {"api_key": api_key}
+    if base_url:
+        arguments["base_url"] = base_url
+    return AsyncOpenAI(**arguments)
+
+
 def _wav_file(pcm_s16le: bytes, sample_rate: int = 48000) -> io.BytesIO:
     output = io.BytesIO()
     with wave.open(output, "wb") as value:
@@ -22,10 +29,12 @@ def _wav_file(pcm_s16le: bytes, sample_rate: int = 48000) -> io.BytesIO:
 
 
 class OpenAIAsrProvider:
-    def __init__(self, model: str, api_key: str, *, client=None):
+    def __init__(
+        self, model: str, api_key: str, *, base_url: str | None = None, client=None
+    ):
         self.model = model
         self.version = f"openai:{model}"
-        self.client = client or AsyncOpenAI(api_key=api_key)
+        self.client = client or _openai_client(api_key, base_url)
 
     async def transcribe(self, audio: AsyncIterator[bytes], *, speaker: str):
         pcm = b""
@@ -56,10 +65,10 @@ class OpenAIAsrProvider:
 
 
 class OpenAILanguageModelProvider:
-    def __init__(self, model: str, api_key: str):
+    def __init__(self, model: str, api_key: str, *, base_url: str | None = None):
         self.model = model
         self.version = f"openai:{model}"
-        self.client = AsyncOpenAI(api_key=api_key)
+        self.client = _openai_client(api_key, base_url)
 
     async def complete(self, *, system_prompt: str, input_text: str) -> str:
         response = await self.client.chat.completions.create(
@@ -74,11 +83,13 @@ class OpenAILanguageModelProvider:
 
 
 class OpenAITtsProvider:
-    def __init__(self, model: str, voice: str, api_key: str):
+    def __init__(
+        self, model: str, voice: str, api_key: str, *, base_url: str | None = None
+    ):
         self.model = model
         self.voice = voice
         self.version = f"openai:{model}:{voice}"
-        self.client = AsyncOpenAI(api_key=api_key)
+        self.client = _openai_client(api_key, base_url)
 
     async def synthesize(self, text: str) -> AsyncIterator[bytes]:
         async with self.client.audio.speech.with_streaming_response.create(

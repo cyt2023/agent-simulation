@@ -4,15 +4,18 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import re
 import time
+from typing import Any
 import uuid
 
 from .providers.base import LanguageModelProvider, StreamingAsrProvider, StreamingTtsProvider
 from .repository import MediaRepository
-from .summary import NeutralityError, SummaryService, validate_neutral_language
+from .summary import NeutralityError, validate_neutral_language
+from .summary_attempts import SummaryAttemptService, SummaryPolicyError
 from .transcript import TranscriptSegment
 
 
@@ -67,6 +70,7 @@ class ProxyMediaPipeline:
         self.summary_prompt_version = summary_prompt_version
         self.sessions: dict[str, PipelineSession] = {}
         self.completed_agent_logs: dict[tuple[str, str], list[dict]] = {}
+        self.begin_proxy_playback: Callable[[str, str], Any] | None = None
 
     def start_session(
         self,
@@ -194,8 +198,10 @@ class ProxyMediaPipeline:
             response_text = (
                 await self.llm.complete(system_prompt=system_prompt, input_text=llm_input)
             ).strip()
+            turn_id = str(uuid.uuid4())
             log_entry = {
                 "event": "proxy_generation",
+                "turn_id": turn_id,
                 "speaker_trigger": speaker,
                 "authority_level": authority_level,
                 "prompt_version": self.proxy_prompt_version,
@@ -234,10 +240,20 @@ class ProxyMediaPipeline:
                     },
                 )
                 return
+            generation = (
+                self.begin_proxy_playback(session_id, turn_id)
+                if self.begin_proxy_playback
+                else None
+            )
             async def stream_tts() -> None:
                 async for chunk in self.tts.synthesize(response_text):
                     if chunk:
-                        await self.publish_audio(session_id, chunk)
+                        await _publish_audio_chunk(
+                            self.publish_audio,
+                            session_id,
+                            chunk,
+                            generation=generation,
+                        )
 
             state.tts_task = asyncio.create_task(stream_tts())
             try:
@@ -316,11 +332,17 @@ class ProxyMediaPipeline:
             )
             for row in rows
         ]
-        summary_result = await SummaryService(
-            self.llm, prompt_version=self.summary_prompt_version
-        ).generate(summary_segments)
+        summary_attempt = await SummaryAttemptService(
+            self.repository,
+            self.llm,
+            prompt_version=self.summary_prompt_version,
+        ).generate(session_id, summary_segments)
+        if summary_attempt.status != "succeeded":
+            raise RuntimeError(
+                f"Summary generation failed: {summary_attempt.error_code}"
+            )
         summary_checksum = hashlib.sha256(
-            summary_result.content.encode("utf-8")
+            summary_attempt.output_text.encode("utf-8")
         ).hexdigest()
         self.repository.create_artifact_and_enqueue(
             phase_version=phase_version,
@@ -328,11 +350,15 @@ class ProxyMediaPipeline:
             session_id=session_id,
             kind="summary",
             version=state.artifact_version,
-            content=summary_result.content,
+            content=summary_attempt.output_text,
             storage_uri=None,
             checksum=summary_checksum,
             generator_version=f"{self.llm.version}:{self.summary_prompt_version}",
-            metadata={"source_transcript_checksum": transcript_checksum},
+            metadata={
+                "source_transcript_checksum": transcript_checksum,
+                "summary_attempt_id": summary_attempt.attempt_id,
+                "summary_config_checksum": summary_attempt.config_checksum,
+            },
         )
 
     async def regenerate_summary(
@@ -384,17 +410,44 @@ class ProxyMediaPipeline:
             )
             for row in rows
         ]
-        result = await SummaryService(
-            self.llm, prompt_version=self.summary_prompt_version
-        ).generate(segments)
-        checksum = hashlib.sha256(result.content.encode("utf-8")).hexdigest()
+        attempt_service = SummaryAttemptService(
+            self.repository,
+            self.llm,
+            prompt_version=self.summary_prompt_version,
+        )
+        parent_attempt_id = (source_summary.metadata_json or {}).get(
+            "summary_attempt_id"
+        )
+        if parent_attempt_id:
+            try:
+                summary_attempt = await attempt_service.retry_same_config(
+                    session_id,
+                    parent_attempt_id,
+                    reason=reason,
+                )
+            except (KeyError, SummaryPolicyError):
+                summary_attempt = await attempt_service.generate(
+                    session_id,
+                    segments,
+                    reason=reason,
+                    parent_attempt_id=parent_attempt_id,
+                )
+        else:
+            summary_attempt = await attempt_service.generate(
+                session_id, segments, reason=reason
+            )
+        if summary_attempt.status != "succeeded":
+            raise RuntimeError(
+                f"Summary regeneration failed: {summary_attempt.error_code}"
+            )
+        checksum = hashlib.sha256(summary_attempt.output_text.encode("utf-8")).hexdigest()
         self.repository.create_artifact_and_enqueue(
             phase_version=phase_version,
             artifact_id=str(uuid.uuid4()),
             session_id=session_id,
             kind="summary",
             version=target_version,
-            content=result.content,
+            content=summary_attempt.output_text,
             storage_uri=None,
             checksum=checksum,
             generator_version=f"{self.llm.version}:{self.summary_prompt_version}",
@@ -402,6 +455,9 @@ class ProxyMediaPipeline:
                 "source_transcript_checksum": source_transcript_checksum,
                 "source_summary_version": source_summary_version,
                 "regeneration_reason": reason,
+                "summary_attempt_id": summary_attempt.attempt_id,
+                "parent_summary_attempt_id": summary_attempt.parent_attempt_id,
+                "summary_config_checksum": summary_attempt.config_checksum,
             },
         )
 
@@ -432,3 +488,28 @@ def _validate_proxy_authority(text: str, authority_level: str) -> None:
         re.IGNORECASE,
     ):
         raise NeutralityError("Proxy response exceeded suggest authority")
+
+
+async def _publish_audio_chunk(
+    callback,
+    session_id: str,
+    chunk: bytes,
+    *,
+    generation,
+) -> None:
+    if generation is not None and _accepts_keyword(callback, "generation"):
+        await callback(session_id, chunk, generation=generation)
+        return
+    await callback(session_id, chunk)
+
+
+def _accepts_keyword(callback, keyword: str) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == keyword
+        for parameter in signature.parameters.values()
+    )

@@ -21,6 +21,7 @@ COMMANDS = {
     "START_SYNC_MEETING",
     "REGENERATE_SUMMARY",
     "STOP_SESSION",
+    "PURGE_SESSION_MEDIA",
 }
 
 EVENT_TYPES = {
@@ -30,6 +31,14 @@ EVENT_TYPES = {
     "HANDOFF_COMPLETE",
     "MEDIA_ERROR",
     "MEETING_ENDED",
+    "MEDIA_PURGED",
+    "MEDIA_CONFIG_FROZEN",
+    "AGENT_TURN_STARTED",
+    "AGENT_TURN_COMPLETED",
+    "AGENT_TURN_FAILED",
+    "RTC_METRIC_BATCH",
+    "COMPONENT_HEALTH",
+    "RECORDING_TRACK_FINALIZED",
 }
 
 
@@ -50,6 +59,8 @@ class MediaGateway(Protocol):
     ): ...
 
     def report_device(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    def report_rtc_metrics(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class MediaGatewayError(RuntimeError):
@@ -102,6 +113,9 @@ class HttpMediaGateway:
     def report_device(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/internal/device-status", json=payload).json()
 
+    def report_rtc_metrics(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/internal/rtc-metrics", json=payload).json()
+
     def export_bundle(self, session_id: str) -> bytes:
         return self._request("GET", f"/internal/sessions/{session_id}/export").content
 
@@ -122,6 +136,7 @@ class MockMediaGateway:
     def __init__(self):
         self.mode = "mock"
         self._commands: dict[str, dict[str, Any]] = {}
+        self._rtc_metric_batches: list[dict[str, Any]] = []
         self._lock = threading.RLock()
 
     def send_command(self, envelope: dict[str, Any]) -> dict[str, Any]:
@@ -156,6 +171,13 @@ class MockMediaGateway:
             "service_status": "mock",
             "runtime_state": "IDLE",
             "mode": "mock",
+            "components": {
+                "recorder": {"status": "unknown"},
+                "asr": {"status": "unknown"},
+                "llm": {"status": "unknown"},
+                "tts": {"status": "unknown"},
+                "proxy": {"status": "unknown"},
+            },
         }
 
     def export_bundle(self, session_id: str) -> None:
@@ -173,10 +195,25 @@ class MockMediaGateway:
             "session_id": payload["session_id"],
         }
 
+    def report_rtc_metrics(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self._rtc_metric_batches.append(copy.deepcopy(payload))
+        return {
+            "accepted": True,
+            "mode": "mock",
+            "session_id": payload["session_id"],
+            "sample_count": len(payload.get("samples") or []),
+        }
+
     @property
     def commands(self) -> list[dict[str, Any]]:
         with self._lock:
             return [copy.deepcopy(item) for item in self._commands.values()]
+
+    @property
+    def rtc_metric_batches(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return copy.deepcopy(self._rtc_metric_batches)
 
 
 def create_media_gateway_from_env() -> MediaGateway:
