@@ -105,7 +105,13 @@ class CommandService:
     async def reconcile_pending(self) -> None:
         self.repository.requeue_interrupted_commands()
         for row in self.repository.pending_commands():
-            await self.execute(row.command_id)
+            try:
+                await self.execute(row.command_id)
+            except Exception:
+                # A rejected operational command (for example, handoff before
+                # device readiness) must remain retryable without preventing the
+                # media service from starting and processing other sessions.
+                continue
 
     async def dispatch(self, envelope: CommandEnvelope) -> None:
         if not self.runtime:

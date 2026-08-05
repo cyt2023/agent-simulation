@@ -190,6 +190,24 @@ async def test_restart_retries_a_failed_command(repository, command_payload):
 
 
 @pytest.mark.asyncio
+async def test_restart_keeps_rejected_command_retryable_without_aborting_startup(
+    repository, command_payload
+):
+    class RejectingRuntime(FakeRuntime):
+        async def start_proxy(self, session_id, phase_version, config):
+            raise RuntimeError("not ready")
+
+    envelope = CommandEnvelope.model_validate(command_payload)
+    accepted = CommandService(repository).accept(envelope)
+
+    await CommandService(repository, RejectingRuntime()).reconcile_pending()
+
+    row = repository.get_command(accepted.command_id)
+    assert row.status == "failed"
+    assert row.error_code == "RuntimeError"
+
+
+@pytest.mark.asyncio
 async def test_concurrent_execution_claims_persisted_command_once(
     repository, command_payload
 ):
