@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from typing import Protocol
@@ -74,6 +75,7 @@ class CommandService:
     ):
         self.repository = repository
         self.runtime = runtime
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     def accept(self, envelope: CommandEnvelope) -> CommandAcceptance:
         result = self.repository.accept_command(
@@ -85,17 +87,20 @@ class CommandService:
         row = self.repository.get_command(command_id)
         if row.status == "completed":
             return
-        if not self.repository.claim_command(command_id):
-            return
         envelope = CommandEnvelope.model_validate(row.envelope)
-        try:
-            await self.dispatch(envelope)
-        except Exception as error:
-            self.repository.mark_command_status(
-                command_id, "failed", error_code=type(error).__name__
-            )
-            raise
-        self.repository.mark_command_status(command_id, "completed")
+        lock = self._session_locks.setdefault(envelope.session_id, asyncio.Lock())
+        async with lock:
+            row = self.repository.get_command(command_id)
+            if row.status == "completed" or not self.repository.claim_command(command_id):
+                return
+            try:
+                await self.dispatch(envelope)
+            except Exception as error:
+                self.repository.mark_command_status(
+                    command_id, "failed", error_code=type(error).__name__
+                )
+                raise
+            self.repository.mark_command_status(command_id, "completed")
 
     async def reconcile_pending(self) -> None:
         self.repository.requeue_interrupted_commands()

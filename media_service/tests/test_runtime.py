@@ -318,6 +318,23 @@ async def test_proxy_end_removes_x_but_preserves_recorder_and_room(repository):
 
 
 @pytest.mark.asyncio
+async def test_future_sync_end_is_retryable_while_proxy_handoff_is_still_active(
+    repository,
+):
+    livekit = FakeLiveKit()
+    coordinator = RuntimeCoordinator(repository, livekit, FakeLifecycle(livekit.calls))
+    await coordinator.start_proxy("session-1", 5, {})
+    await coordinator.end_current("session-1", 5)
+
+    with pytest.raises(RuntimeError, match="Sync meeting is not active"):
+        await coordinator.end_current("session-1", 11)
+
+    runtime = repository.active_runtime("session-1")
+    assert runtime.room_kind == "proxy"
+    assert runtime.state == "HANDING_OFF"
+
+
+@pytest.mark.asyncio
 async def test_handoff_waits_for_all_human_device_checks(repository):
     livekit = FakeLiveKit()
     coordinator = RuntimeCoordinator(repository, livekit)

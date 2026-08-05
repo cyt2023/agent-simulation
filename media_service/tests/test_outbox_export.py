@@ -112,6 +112,10 @@ def test_export_contains_proxy_agent_log(repository):
 
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         agent_log = archive.read("agent_log.jsonl").decode("utf-8")
+        minutes = archive.read("meeting_minutes.md").decode("utf-8")
     assert "proxy-1" in agent_log
     assert "Proxy response" in agent_log
     assert "human-1" not in agent_log
+    assert "Human · Teammate 1 (T1)" in minutes
+    assert "AI Proxy (X)" in minutes
+    assert minutes.index("Human statement") < minutes.index("Proxy response")

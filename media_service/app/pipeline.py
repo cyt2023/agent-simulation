@@ -140,6 +140,7 @@ class ProxyMediaPipeline:
         *,
         start_ms: int,
         end_ms: int,
+        generate_proxy: bool = True,
     ) -> None:
         state = self.sessions[session_id]
         if speaker not in ("principal", "teammate_1", "teammate_2"):
@@ -174,7 +175,7 @@ class ProxyMediaPipeline:
                 final_text = result.text.strip()
             if not final_text:
                 return
-            if not state.proxy_enabled:
+            if not state.proxy_enabled or not generate_proxy:
                 return
             history = self.repository.list_session_segments(session_id)[-20:]
             llm_input = json.dumps(

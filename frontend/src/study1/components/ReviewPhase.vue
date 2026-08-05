@@ -61,10 +61,10 @@ function formatTime(value) {
 
 function roleLabel(role) {
   return {
-    principal: 'P',
-    teammate_1: 'T1',
-    teammate_2: 'T2',
-    proxy: 'X',
+    principal: 'Human - Principal (P)',
+    teammate_1: 'Human - Teammate 1 (T1)',
+    teammate_2: 'Human - Teammate 2 (T2)',
+    proxy: 'AI Proxy (X)',
   }[role] || role || 'Unknown'
 }
 
@@ -200,7 +200,7 @@ onUnmounted(() => {
       <section v-if="recordings.length" class="recordings">
         <h3>Audio replay</h3>
         <button v-for="recording in recordings" :key="recording.recording_id" @click="replay(recording.recording_id)">
-          Replay {{ recording.speaker }} ({{ Math.round((recording.duration_ms || 0) / 1000) }}s)
+          Replay {{ roleLabel(recording.role || recording.speaker || recording.participant_id) }} ({{ Math.round((recording.duration_ms || 0) / 1000) }}s)
         </button>
         <audio
           v-if="replayUrl"

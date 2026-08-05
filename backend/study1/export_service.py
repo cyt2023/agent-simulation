@@ -65,6 +65,89 @@ def _latest_artifact(artifacts: list[dict[str, Any]], artifact_type: str) -> dic
     return matches[-1] if matches else None
 
 
+def _speaker_details(speaker: str) -> tuple[str, str, str]:
+    return {
+        "principal": ("human", "principal", "Human · Principal (P)"),
+        "teammate_1": ("human", "teammate_1", "Human · Teammate 1 (T1)"),
+        "teammate_2": ("human", "teammate_2", "Human · Teammate 2 (T2)"),
+        "proxy": ("proxy", "proxy", "AI Proxy (X)"),
+    }.get(speaker, ("unknown", speaker or "unknown", f"Unknown speaker ({speaker or 'unknown'})"))
+
+
+def _format_timestamp(milliseconds: Any) -> str:
+    try:
+        value = max(0, int(milliseconds))
+    except (TypeError, ValueError):
+        return "--:--.---"
+    minutes, remainder = divmod(value, 60_000)
+    seconds, millis = divmod(remainder, 1_000)
+    return f"{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
+def _meeting_minutes_rows(utterances: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for utterance in sorted(
+        utterances,
+        key=lambda item: (
+            item.get("start_ms") is None,
+            item.get("start_ms") or 0,
+            str(item.get("utterance_id") or ""),
+        ),
+    ):
+        speaker_type, speaker_role, speaker_label = _speaker_details(
+            str(utterance.get("speaker") or "unknown")
+        )
+        rows.append(
+            {
+                "start_time": _format_timestamp(utterance.get("start_ms")),
+                "end_time": _format_timestamp(utterance.get("end_ms")),
+                "speaker_type": speaker_type,
+                "speaker_role": speaker_role,
+                "speaker_label": speaker_label,
+                "text": str(utterance.get("text") or "").strip(),
+                "segment_id": utterance.get("segment_id") or utterance.get("utterance_id"),
+            }
+        )
+    return rows
+
+
+def _meeting_minutes_markdown(
+    session: dict[str, Any], artifacts: list[dict[str, Any]], utterances: list[dict[str, Any]]
+) -> bytes:
+    summary = _latest_artifact(artifacts, "summary")
+    lines = [
+        "# Meeting minutes / 会议纪要",
+        "",
+        f"- Session: {session.get('session_name') or session.get('session_id') or 'unknown'}",
+        f"- Session ID: {session.get('session_id') or 'unknown'}",
+        "- Speaker legend: `Human` = real participant; `AI Proxy (X)` = server-side proxy agent.",
+        "",
+        "## Neutral summary / 中性摘要",
+        "",
+        str(summary.get("content") or "Summary unavailable.") if summary else "Summary unavailable.",
+        "",
+        "## Attributed transcript / 逐条发言",
+        "",
+    ]
+    rows = _meeting_minutes_rows(utterances)
+    if not rows:
+        lines.append("No transcript-supported utterances were available.")
+    else:
+        for row in rows:
+            text = row["text"].replace("\r", " ").replace("\n", " ")
+            lines.append(
+                f"- `[{row['start_time']}–{row['end_time']}]` **{row['speaker_label']}**: {text}"
+            )
+    lines.extend(
+        [
+            "",
+            "_Generated from final attributed transcript segments. The AI Proxy is never labelled as a human participant._",
+            "",
+        ]
+    )
+    return "\n".join(lines).encode("utf-8")
+
+
 def _normalized_utterances(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     transcript = _latest_artifact(artifacts, "transcript")
     if not transcript:
@@ -147,6 +230,13 @@ def _media_manifest(
     transcript = _latest_artifact(artifacts, "transcript") or {}
     metadata = transcript.get("metadata") or {}
     manifest = metadata.get("recording_manifest")
+    if not (isinstance(manifest, list) and manifest):
+        recording_artifact = _latest_artifact(artifacts, "recording_manifest")
+        parsed_manifest = (
+            _artifact_content_json(recording_artifact) if recording_artifact else None
+        )
+        if isinstance(parsed_manifest, list):
+            manifest = parsed_manifest
     if isinstance(manifest, list) and manifest:
         recordings = manifest
     else:
@@ -371,6 +461,19 @@ def build_study1_export(data: dict[str, Any]) -> io.BytesIO:
         if event.get("event_type") in ("participant_disconnected", "media_disconnected")
     ]
     canonical_files = {
+        "meeting_minutes.md": _meeting_minutes_markdown(session, artifacts, utterances),
+        "meeting_minutes.csv": _csv_bytes(
+            [
+                "start_time",
+                "end_time",
+                "speaker_type",
+                "speaker_role",
+                "speaker_label",
+                "text",
+                "segment_id",
+            ],
+            _meeting_minutes_rows(utterances),
+        ),
         "media_manifest.json": _json_bytes(media_manifest),
         "normalized/events.jsonl": _jsonl_bytes(events),
         "normalized/utterances.jsonl": _jsonl_bytes(utterances),

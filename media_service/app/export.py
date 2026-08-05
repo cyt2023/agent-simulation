@@ -37,6 +37,54 @@ def _jsonl_bytes(rows) -> bytes:
     return (content + ("\n" if content else "")).encode("utf-8")
 
 
+def _speaker_label(speaker: str) -> str:
+    return {
+        "principal": "Human · Principal (P)",
+        "teammate_1": "Human · Teammate 1 (T1)",
+        "teammate_2": "Human · Teammate 2 (T2)",
+        "proxy": "AI Proxy (X)",
+    }.get(speaker, f"Unknown speaker ({speaker or 'unknown'})")
+
+
+def _format_timestamp(milliseconds) -> str:
+    value = max(0, int(milliseconds or 0))
+    minutes, remainder = divmod(value, 60_000)
+    seconds, millis = divmod(remainder, 1_000)
+    return f"{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
+def _meeting_minutes(session_id: str, segments, summaries) -> bytes:
+    lines = [
+        "# Meeting minutes / 会议纪要",
+        "",
+        f"- Session ID: {session_id}",
+        "- Speaker legend: `Human` = real participant; `AI Proxy (X)` = server-side proxy agent.",
+        "",
+        "## Neutral summary / 中性摘要",
+        "",
+        str(summaries[-1].content or "Summary unavailable.") if summaries else "Summary unavailable.",
+        "",
+        "## Attributed transcript / 逐条发言",
+        "",
+    ]
+    if not segments:
+        lines.append("No transcript-supported utterances were available.")
+    for segment in sorted(segments, key=lambda row: (row.start_ms, row.segment_id)):
+        text = str(segment.text or "").replace("\r", " ").replace("\n", " ")
+        lines.append(
+            f"- `[{_format_timestamp(segment.start_ms)}–{_format_timestamp(segment.end_ms)}]` "
+            f"**{_speaker_label(segment.speaker)}**: {text}"
+        )
+    lines.extend(
+        [
+            "",
+            "_Generated from final attributed transcript segments. The AI Proxy is never labelled as a human participant._",
+            "",
+        ]
+    )
+    return "\n".join(lines).encode("utf-8")
+
+
 def build_media_export(
     repository: MediaRepository,
     session_id: str,
@@ -100,6 +148,9 @@ def build_media_export(
                 )
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "meeting_minutes.md", _meeting_minutes(session_id, segments, summaries)
+        )
         archive.writestr("media_status.json", _json_bytes(status))
         archive.writestr("commands.jsonl", _jsonl_bytes(commands))
         archive.writestr("runtime_events.jsonl", _jsonl_bytes(outbox))

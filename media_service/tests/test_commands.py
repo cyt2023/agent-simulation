@@ -53,6 +53,30 @@ def test_command_replay_returns_original_result(command_payload):
     assert execution_count == 1
 
 
+def test_failed_semantic_command_is_reexecuted_when_retried(command_payload):
+    runtime = FakeRuntime()
+    client = _client(runtime_coordinator=runtime)
+    envelope = CommandEnvelope.model_validate(command_payload)
+    accepted = client.app.state.command_service.accept(envelope)
+    client.app.state.repository.mark_command_status(
+        accepted.command_id, "failed", error_code="RuntimeError"
+    )
+    retried_payload = dict(command_payload)
+    retried_payload["command_id"] = "retry-command-id"
+
+    response = client.post(
+        "/internal/commands",
+        headers={"Authorization": "Bearer a-secret"},
+        json=retried_payload,
+    )
+
+    assert response.status_code == 202
+    assert response.json()["duplicate"] is True
+    assert response.json()["command_id"] == accepted.command_id
+    assert client.app.state.repository.get_command(accepted.command_id).status == "completed"
+    assert len(runtime.calls) == 1
+
+
 def test_unsupported_command_is_rejected(command_payload):
     command_payload["command"] = "AUTO_START_SESSION"
     response = _client().post(

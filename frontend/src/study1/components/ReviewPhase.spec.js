@@ -39,6 +39,7 @@ it('renders B transcript JSON as timestamped attributed segments', async () => {
 
   expect(wrapper.get('#segment-seg-9').text()).toContain('00:00.100')
   expect(wrapper.get('#segment-seg-9').text()).toContain('T1')
+  expect(wrapper.get('#segment-seg-9').text()).toContain('Human')
   expect(wrapper.get('#segment-seg-9').text()).toContain('The north route is shorter.')
 })
 

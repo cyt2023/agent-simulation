@@ -174,7 +174,8 @@ def create_app(
                 expected_checksum=resolved_settings.study1_release_checksum,
             )
             result = app.state.command_service.accept(envelope)
-            if not result.duplicate:
+            persisted = repository.get_command(result.command_id)
+            if not result.duplicate or persisted.status == "failed":
                 background_tasks.add_task(
                     dispatch_with_error_event, result.command_id
                 )

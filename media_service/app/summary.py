@@ -107,10 +107,10 @@ def _grounding_terms(value: str) -> set[str]:
 
 def _speaker_label(speaker: str) -> str:
     return {
-        "principal": "P",
-        "teammate_1": "T1",
-        "teammate_2": "T2",
-        "proxy": "X",
+        "principal": "Human P",
+        "teammate_1": "Human T1",
+        "teammate_2": "Human T2",
+        "proxy": "AI Proxy X",
     }.get(speaker, speaker)
 
 

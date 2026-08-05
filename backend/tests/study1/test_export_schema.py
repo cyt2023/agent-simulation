@@ -134,6 +134,8 @@ def test_export_contains_canonical_manifest_and_joinable_records():
         names = set(archive.namelist())
         assert {
             "export_manifest.json",
+            "meeting_minutes.md",
+            "meeting_minutes.csv",
             "media_manifest.json",
             "normalized/events.jsonl",
             "normalized/utterances.jsonl",
@@ -150,6 +152,8 @@ def test_export_contains_canonical_manifest_and_joinable_records():
         summary = _jsonl(archive, "normalized/summaries.jsonl")[0]
         marker = _jsonl(archive, "normalized/markers.jsonl")[0]
         media_manifest = json.loads(archive.read("media_manifest.json"))
+        minutes = archive.read("meeting_minutes.md").decode("utf-8")
+        minutes_csv = archive.read("meeting_minutes.csv").decode("utf-8-sig")
 
     assert manifest["schema_version"] == "study1-export-v2"
     assert manifest["build_versions"]["backend"] != ""
@@ -157,6 +161,40 @@ def test_export_contains_canonical_manifest_and_joinable_records():
     assert transcript["content"][0]["segment_id"] == utterance["utterance_id"]
     assert summary["content"] == "Neutral summary text with no recommendation."
     assert marker["segment_ids"] == [utterance["utterance_id"]]
+    assert "Human · Teammate 1 (T1)" in minutes
+    assert "AI Proxy (X)" in minutes
+    assert "speaker_type" in minutes_csv
+    assert "human" in minutes_csv
+
+
+def test_integrity_uses_standalone_recording_manifest_artifact():
+    data = _data()
+    transcript = next(
+        artifact for artifact in data["artifacts"] if artifact["type"] == "transcript"
+    )
+    transcript["metadata"] = {}
+    data["artifacts"].append(
+        {
+            "artifact_id": "recordings-1",
+            "session_id": "s-export",
+            "type": "recording_manifest",
+            "version": "1",
+            "content": json.dumps(
+                [{"recording_id": "rec-1", "clock_id": "room-clock-1"}]
+            ),
+            "checksum": "recordings-checksum",
+            "created_at": "2026-07-31T00:00:01Z",
+            "generator_version": "test",
+            "metadata": {},
+        }
+    )
+
+    with zipfile.ZipFile(build_study1_export(data)) as archive:
+        report = json.loads(archive.read("integrity_report.json"))
+        manifest = json.loads(archive.read("media_manifest.json"))
+
+    assert "MEDIA_EXPORT_UNAVAILABLE" not in report["errors"]
+    assert manifest["recordings"][0]["recording_id"] == "rec-1"
 
 
 def test_export_integrity_reports_missing_media_bundle():

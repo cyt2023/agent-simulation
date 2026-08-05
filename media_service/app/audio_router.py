@@ -232,6 +232,13 @@ class AudioPipelineRouter:
                 remember(error)
 
             try:
+                await self._recover_missing_human_transcripts(
+                    session_id, state.runtime_id, recording_rows
+                )
+            except BaseException as error:
+                remember(error)
+
+            try:
                 await self.pipeline.finalize(session_id, phase_version)
             except BaseException as error:
                 remember(error)
@@ -263,6 +270,41 @@ class AudioPipelineRouter:
 
         if first_error is not None:
             raise first_error
+
+    async def _recover_missing_human_transcripts(
+        self, session_id: str, runtime_id: str, recordings: list[dict]
+    ) -> None:
+        """Transcribe complete human tracks when realtime VAD produced no segments.
+
+        This is deliberately a finalize-time fallback: it preserves the low-latency VAD
+        path, but prevents quiet microphones or a missing silence tail from producing an
+        empty transcript. Fallback transcription never generates a late Proxy response.
+        """
+        existing_speakers = {
+            row.speaker
+            for row in self.pipeline.repository.list_session_segments(session_id)
+            if row.runtime_id == runtime_id and row.is_final and row.text.strip()
+        }
+        for recording in recordings:
+            speaker = str(recording.get("role") or "")
+            if (
+                speaker not in ("principal", "teammate_1", "teammate_2")
+                or speaker in existing_speakers
+            ):
+                continue
+            storage_uri = str(recording.get("storage_uri") or "")
+            path = (self.media_root / storage_uri).resolve()
+            if not storage_uri or self.media_root.resolve() not in path.parents:
+                continue
+            for pcm, start_ms, end_ms in _wave_chunks(path):
+                await self.pipeline.process_utterance(
+                    session_id,
+                    speaker,
+                    pcm,
+                    start_ms=int(recording.get("room_start_ms") or 0) + start_ms,
+                    end_ms=int(recording.get("room_start_ms") or 0) + end_ms,
+                    generate_proxy=False,
+                )
 
     async def cancel(self, session_id: str) -> None:
         state = self.sessions.pop(session_id, None)
@@ -365,6 +407,27 @@ def _wave_duration_ms(path: Path) -> int:
     with wave.open(str(path), "rb") as stream:
         frame_rate = stream.getframerate()
         return round(stream.getnframes() * 1000 / frame_rate) if frame_rate else 0
+
+
+def _wave_chunks(path: Path, *, max_chunk_ms: int = 240_000):
+    """Yield bounded mono PCM chunks so fallback ASR stays below provider limits."""
+    with wave.open(str(path), "rb") as stream:
+        if stream.getnchannels() != 1 or stream.getsampwidth() != 2:
+            return
+        frame_rate = stream.getframerate()
+        if frame_rate <= 0:
+            return
+        frames_per_chunk = max(1, frame_rate * max_chunk_ms // 1000)
+        start_frame = 0
+        while True:
+            pcm = stream.readframes(frames_per_chunk)
+            if not pcm:
+                return
+            frame_count = len(pcm) // 2
+            start_ms = round(start_frame * 1000 / frame_rate)
+            end_ms = max(start_ms + 1, round((start_frame + frame_count) * 1000 / frame_rate))
+            yield pcm, start_ms, end_ms
+            start_frame += frame_count
 
 
 def _resolve_room_timeline(pipeline, session_id: str, runtime_id: str):

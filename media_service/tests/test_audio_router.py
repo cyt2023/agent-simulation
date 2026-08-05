@@ -151,6 +151,36 @@ async def test_router_records_human_and_proxy_tracks_and_emits_manifests(
 
 
 @pytest.mark.asyncio
+async def test_finalize_falls_back_to_whole_track_asr_without_late_proxy_reply(
+    repository, tmp_path
+):
+    recovered = []
+
+    class RecoveringPipeline(StubPipeline):
+        async def process_utterance(self, session_id, speaker, pcm, **kwargs):
+            recovered.append((session_id, speaker, pcm, kwargs))
+
+    pipeline = RecoveringPipeline(repository)
+    router = AudioPipelineRouter(pipeline, tmp_path)
+    await router.start_session(
+        "session-1",
+        "runtime-1",
+        {},
+        proxy_enabled=True,
+        artifact_version="1",
+    )
+    quiet_frame = SimpleNamespace(data=b"\x01\x00" * 4800, sample_rate=48000)
+    await router.handle_frame("session-1", "teammate_1", quiet_frame)
+
+    await router.finalize("session-1", phase_version=5)
+
+    assert len(recovered) == 1
+    assert recovered[0][0:2] == ("session-1", "teammate_1")
+    assert recovered[0][3]["generate_proxy"] is False
+    assert recovered[0][3]["end_ms"] > recovered[0][3]["start_ms"]
+
+
+@pytest.mark.asyncio
 async def test_router_cancel_stops_session_before_proxy_disconnect(repository, tmp_path):
     pipeline = StubPipeline(repository)
     router = AudioPipelineRouter(pipeline, tmp_path, publish_audio=None)

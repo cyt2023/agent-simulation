@@ -271,7 +271,11 @@ class RuntimeCoordinator:
             runtime.room_kind == "proxy"
             and runtime.state == RuntimeState.HANDING_OFF.value
         ):
-            return
+            if runtime.phase_version == phase_version:
+                return
+            raise RuntimeError(
+                "Sync meeting is not active yet; retry END_CURRENT_MEETING after START_SYNC_MEETING"
+            )
         self.repository.update_runtime_state(runtime.runtime_id, RuntimeState.ENDING)
         try:
             if self.lifecycle:
